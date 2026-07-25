@@ -1,0 +1,9 @@
+streamlit==1.41.1
+pandas==2.2.3
+psycopg[binary]==3.2.3
+supabase==2.11.0
+httpx==0.28.1
+anthropic==0.42.0
+fpdf2==2.8.2
+matplotlib==3.10.0
+qrcode[pil]==8.0

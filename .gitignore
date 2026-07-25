@@ -1,0 +1,13 @@
+.env
+.env.*
+!.env.example
+__pycache__/
+*.pyc
+node_modules/
+auth/
+data/
+.venv/
+.DS_Store
+.pytest_cache/
+.claude/
+.gemini/
