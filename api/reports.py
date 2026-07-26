@@ -485,6 +485,131 @@ def build_receipt_pdf(order_id: str) -> tuple[str, str]:
     return path, fname
 
 
+def build_po_pdf(po_id: str) -> tuple[str, str]:
+    """A purchase order a wholesaler will actually act on.
+
+    Until now the order reached the distributor as a WhatsApp text listing items.
+    That works for a rep who knows you, and fails for anyone in a warehouse who needs
+    a document with a reference number to pick against and file.
+
+    Two deliberate omissions:
+      * NO per-line rationale. `po_lines.rationale` says things like "20 pcs on hand,
+        7.6/day, 3d cover" — that is the pharmacy's demand data and its negotiating
+        position. It belongs in the owner's approval message, not in the supplier's
+        copy.
+      * NO sell prices. Only what the pharmacy expects to pay.
+    """
+    po = q1("""select po.*, s.name as supplier, s.phone as sup_phone, s.email,
+                      s.rep_name, s.address,
+                      st.name as approved_by_name, st.ppb_reg_no
+                 from purchase_orders po
+                 join suppliers s on s.id = po.supplier_id
+                 left join staff st on st.id = po.approved_by
+                where po.id = %s""", (po_id,))
+    if not po:
+        raise ValueError(f"no purchase order {po_id}")
+
+    lines = q("""select p.name, p.legacy_code, p.pack_size, l.qty_pieces, l.unit_cost
+                   from po_lines l join products p on p.id = l.product_id
+                  where l.po_id = %s order by p.name""", (po_id,))
+    ph = q1("""select name, ppb_licence, mpesa_paybill, wa_number
+                 from pharmacies where id=%s""", (PID,))
+
+    ref = str(po_id)[:8].upper()
+    contact = " · ".join(x for x in [
+        f"PPB licence {ph['ppb_licence']}" if ph and ph.get("ppb_licence") else None,
+        f"Tel {ph['wa_number']}" if ph and ph.get("wa_number") else None,
+    ] if x)
+
+    doc = Doc(ph["name"] if ph else "Pharmacy", f"Purchase Order {ref}",
+              contact=contact or None)
+    doc.add_page()
+
+    # --- who it is for
+    doc.h2("To")
+    doc.set_font("Helvetica", "B", 10)
+    doc.cell(0, 5, po["supplier"], new_x="LMARGIN", new_y="NEXT")
+    doc.set_font("Helvetica", "", 9)
+    for bit in [po.get("rep_name") and f"Attn: {po['rep_name']}",
+                po.get("sup_phone"), po.get("email"), po.get("address")]:
+        if bit:
+            doc.cell(0, 5, str(bit), new_x="LMARGIN", new_y="NEXT")
+    doc.ln(2)
+
+    doc.set_font("Helvetica", "", 9)
+    doc.set_text_color(*MUTED_TXT)
+    doc.cell(0, 5, f"Order reference: {ref}    Raised: "
+                   f"{po['created_at']:%d %b %Y}", new_x="LMARGIN", new_y="NEXT")
+    doc.set_text_color(23, 37, 42)
+    doc.ln(2)
+
+    # --- what we want
+    doc.h2("Items requested")
+    total = 0.0
+    rows = []
+    for l in lines:
+        line_total = float(l["qty_pieces"] or 0) * float(l["unit_cost"] or 0)
+        total += line_total
+        rows.append([
+            l["name"],
+            l["legacy_code"] or "-",
+            from_pieces(l["qty_pieces"], l["pack_size"]),
+            str(l["qty_pieces"]),
+            kes(l["unit_cost"]),
+            kes(line_total),
+        ])
+    doc.table(["Item", "Code", "Packs", "Pieces", "Unit cost", "Line total"],
+              rows, [64, 22, 22, 20, 26, 26], ["L", "L", "R", "R", "R", "R"])
+
+    doc.set_font("Helvetica", "B", 11)
+    doc.cell(0, 7, f"ESTIMATED TOTAL  {kes(total)}", align="R",
+             new_x="LMARGIN", new_y="NEXT")
+    doc.set_font("Helvetica", "", 8)
+    doc.set_text_color(*MUTED_TXT)
+    doc.cell(0, 5, "Estimate based on our last purchase price. Please confirm current "
+                   "pricing before dispatch.", align="R", new_x="LMARGIN", new_y="NEXT")
+    doc.set_text_color(23, 37, 42)
+    doc.ln(3)
+
+    # --- what we need back. These are the two fields Loop A cannot recover later.
+    doc.h2("Delivery requirements")
+    doc.set_font("Helvetica", "", 9)
+    for req in [
+        f"Quote order reference {ref} on the delivery note and invoice.",
+        "BATCH NUMBER and EXPIRY DATE must appear against every line on the invoice.",
+        f"We do not accept stock with less than "
+        f"{settings.MIN_SHELF_LIFE_DAYS} days of shelf life remaining.",
+        "Short or partial deliveries: note them on the delivery note so our "
+        "goods-received record matches yours.",
+    ]:
+        doc.multi_cell(0, 5, f"-  {req}", new_x="LMARGIN", new_y="NEXT")
+    doc.ln(3)
+
+    # --- attribution
+    doc.h2("Authorised by")
+    doc.set_font("Helvetica", "", 9)
+    who = po.get("approved_by_name")
+    if who:
+        doc.cell(0, 5, f"{who}"
+                       + (f" (PPB {po['ppb_reg_no']})" if po.get("ppb_reg_no") else "")
+                       + (f", {po['approved_at']:%d %b %Y %H:%M}"
+                          if po.get("approved_at") else ""),
+                 new_x="LMARGIN", new_y="NEXT")
+    else:
+        # Should not happen: the PDF is generated on approval. Say so rather than
+        # shipping a document that looks authorised and is not.
+        doc.cell(0, 5, "DRAFT — not yet authorised.", new_x="LMARGIN", new_y="NEXT")
+
+    data = bytes(doc.output())
+    fname = f"PO-{ref}.pdf"
+    path = f"purchase-orders/{po_id}/{fname}"
+    upload(settings.BUCKET_DOCS, path, data, "application/pdf")
+    return path, fname
+
+
+MUTED_TXT = (110, 122, 128)
+
+
 # ============================================================ dispatcher
 TOOL_IMPLS = {
     "get_stock": get_stock,

@@ -31,7 +31,7 @@ from config import settings
 from db import ex, ex1, q, q1, signed_url
 from state import clear_state, get_state, set_state
 from utils import from_pieces, kes
-from wa import send_image, send_text
+from wa import send_document, send_image, send_text
 
 log = logging.getLogger(__name__)
 PID = settings.PHARMACY_ID
@@ -401,6 +401,12 @@ def handle_po_reply(phone: str, staff: dict, text: str) -> bool:
         lines = q("""select p.name, p.pack_size, l.qty_pieces
                        from po_lines l join products p on p.id=l.product_id
                       where l.po_id=%s""", (po_id,))
+        # Record the approval BEFORE building the PDF: the document prints
+        # "Authorised by <name>" from these columns, so generating it first would send
+        # the supplier a PO stamped DRAFT.
+        ex("""update purchase_orders set status='sent', approved_by=%s,
+                  approved_at=now(), sent_at=now() where id=%s""", (staff["id"], po_id))
+
         if po["sup_phone"]:
             send_text(po["sup_phone"],
                       "Good day. Purchase order from our pharmacy:\n\n"
@@ -408,8 +414,18 @@ def handle_po_reply(phone: str, staff: dict, text: str) -> bool:
                                   f"{from_pieces(l['qty_pieces'], l['pack_size'])}"
                                   for l in lines)
                       + "\n\nPlease confirm availability and delivery date. Thank you.")
-        ex("""update purchase_orders set status='sent', approved_by=%s,
-                  approved_at=now(), sent_at=now() where id=%s""", (staff["id"], po_id))
+            # The text is readable on a phone; the PDF is what a warehouse can pick
+            # against and file. Send both, and never let a PDF failure block the
+            # order — the text alone is already a valid order.
+            try:
+                from reports import build_po_pdf
+                path, fname = build_po_pdf(str(po_id))
+                url = signed_url(settings.BUCKET_DOCS, path, 7 * 86400)
+                send_document(po["sup_phone"], url, fname,
+                              f"Purchase order {str(po_id)[:8].upper()}")
+            except Exception:
+                log.exception("PO pdf failed for %s; the text order was still sent",
+                              po_id)
         clear_state(phone)
         send_text(phone, f"✅ Sent to {po['supplier']}"
                          + (f" on {po['sup_phone']}" if po["sup_phone"] else

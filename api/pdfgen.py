@@ -24,19 +24,69 @@ ACCENT = (13, 124, 102)
 MUTED = (110, 122, 128)
 RULE = (222, 228, 230)
 
+# fpdf2's built-in Helvetica is latin-1 only, so ANY of these raises
+# FPDFUnicodeEncodingException at render time and takes the whole document with it.
+# They arrive constantly: em/en dashes and bullets from our own copy, smart quotes from
+# a pasted supplier name, a non-breaking space from a spreadsheet.
+#
+# This is not cosmetic. `build_report_pdf` shipped with an en-dash in its title and
+# em-dashes in two headings, so "report for july" raised instead of returning a PDF.
+# Registering a Unicode TTF is the prettier fix but means shipping a font file (fpdf2
+# no longer bundles DejaVu); folding to latin-1 keeps deploys dependency-free.
+_TYPO = {
+    "—": "-", "–": "-", "−": "-",     # em / en dash, minus
+    "•": "-", "·": "-",                     # bullet, middle dot
+    "‘": "'", "’": "'", "‚": ",",      # single quotes
+    "“": '"', "”": '"', "„": '"',      # double quotes
+    "…": "...", "′": "'", "″": '"',
+    " ": " ", " ": " ", "​": "",       # spaces
+    "→": "->", "←": "<-",
+    "€": "EUR", "£": "GBP",
+}
+
+
+def latin1(text: str) -> str:
+    """Make any string safe for the core PDF fonts, losing nothing that matters."""
+    s = str(text)
+    for bad, good in _TYPO.items():
+        s = s.replace(bad, good)
+    # Anything still unencodable (emoji in a product name, Kanji in a supplier) is
+    # dropped rather than allowed to abort the document.
+    return s.encode("latin-1", "ignore").decode("latin-1")
+
 
 class Doc(FPDF):
-    def __init__(self, pharmacy_name: str, doc_title: str):
+    def __init__(self, pharmacy_name: str, doc_title: str, contact: str | None = None):
+        """`contact` turns the header into a real letterhead.
+
+        Internal reports do not need it. A document that LEAVES the pharmacy — a
+        purchase order to a distributor — does: a wholesaler will not act on an order
+        with no licence number and no phone number to call back.
+        """
         super().__init__(orientation="P", unit="mm", format="A4")
         self.pharmacy_name = pharmacy_name
         self.doc_title = doc_title
+        self.contact = contact
         self.set_auto_page_break(auto=True, margin=18)
         self.set_margins(15, 15, 15)
+
+    def normalize_text(self, text):
+        """One chokepoint for every string fpdf2 renders.
+
+        Overriding here rather than sanitising at each call site means cell(),
+        multi_cell(), table() and any future helper are all covered, and a stray
+        smart quote in a supplier name can never abort a document again.
+        """
+        return super().normalize_text(latin1(text))
 
     def header(self):
         self.set_font("Helvetica", "B", 15)
         self.set_text_color(*INK)
         self.cell(0, 8, self.pharmacy_name, new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+        if self.contact:
+            self.set_font("Helvetica", "", 9)
+            self.set_text_color(*MUTED)
+            self.cell(0, 4, self.contact, new_x=XPos.LMARGIN, new_y=YPos.NEXT)
         self.set_font("Helvetica", "", 10)
         self.set_text_color(*MUTED)
         self.cell(0, 5, f"{self.doc_title}  ·  generated {date.today():%d %b %Y}  ·  Dishii",
