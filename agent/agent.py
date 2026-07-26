@@ -1,4 +1,4 @@
-"""Dishii bridge agent — runs on the pharmacy's own Windows PC.
+"""Pharma OS bridge agent — runs on the pharmacy's own Windows PC.
 
 Three jobs, in order of business value:
 
@@ -699,7 +699,7 @@ def main() -> None:
         format="%(asctime)s %(levelname)s: %(message)s",
         handlers=[
             logging.FileHandler(cfg.get("agent", "log_file",
-                                        fallback="dishii-agent.log"), encoding="utf-8"),
+                                        fallback="pharmaos-agent.log"), encoding="utf-8"),
             logging.StreamHandler(sys.stdout),
         ],
     )

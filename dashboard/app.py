@@ -1,4 +1,4 @@
-"""Dishii dashboard — for staff with a screen.
+"""Pharma OS dashboard — for staff with a screen.
 
 Deliberately secondary to WhatsApp. The manager should never *need* to open this;
 it exists for the three jobs a chat window is genuinely bad at:
@@ -739,7 +739,7 @@ else:
     ag = q("""select machine_name, agent_version, ingest_mode, db_engine,
                      last_seen_at, suspended from agents where pharmacy_id=%s""", (PID,))
     if not ag:
-        st.warning("No agent enrolled. Stock reflects only what Dishii received and "
+        st.warning("No agent enrolled. Stock reflects only what Pharma OS received and "
                    "sold — not the till. Create an enrolment token below.")
         if st.button("Generate enrolment token"):
             import secrets as _s

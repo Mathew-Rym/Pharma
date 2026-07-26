@@ -429,7 +429,7 @@ def build_report_pdf(period: str = "month") -> tuple[str, str]:
                   [140, 40], ["L", "R"])
 
     data = bytes(doc.output())
-    fname = f"dishii-{period}-{date.today():%Y-%m-%d}.pdf"
+    fname = f"pharmaos-{period}-{date.today():%Y-%m-%d}.pdf"
     path = f"reports/{uuid.uuid4().hex[:8]}/{fname}"
     upload(settings.BUCKET_DOCS, path, data, "application/pdf")
     return path, fname
@@ -627,7 +627,7 @@ def run_tool(name: str, args: dict, phone: str) -> str:
         from wa import send_document
         path, fname = build_report_pdf(args.get("period", "month"))
         url = signed_url(settings.BUCKET_DOCS, path, 86400)
-        send_document(phone, url, fname, "Your Dishii report")
+        send_document(phone, url, fname, "Your Pharma OS report")
         return "Report PDF generated and sent to the user as a WhatsApp document."
     fn = TOOL_IMPLS.get(name)
     if not fn:

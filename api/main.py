@@ -23,9 +23,9 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
 )
-log = logging.getLogger("dishii")
+log = logging.getLogger("pharmaos")
 
-app = FastAPI(title="Dishii Pharmacy API", version="0.2.0")
+app = FastAPI(title="Pharma OS Pharmacy API", version="0.2.0")
 
 from agent_api import router as agent_router  # noqa: E402
 
@@ -43,7 +43,7 @@ def _startup() -> None:
         ensure_buckets()
     except Exception:
         log.warning("bucket check skipped", exc_info=True)
-    log.info("dishii api up · pharmacy=%s · model=%s",
+    log.info("pharmaos api up · pharmacy=%s · model=%s",
              settings.PHARMACY_ID, settings.MODEL_VISION)
 
 
@@ -56,9 +56,9 @@ def health():
 # ============================================================ WhatsApp webhook
 @app.post("/webhook")
 async def webhook(request: Request, background: BackgroundTasks,
-                  x_dishii_secret: str | None = Header(None)):
+                  x_pharmaos_secret: str | None = Header(None)):
     """Text messages from the gateway. Returns immediately."""
-    _auth(x_dishii_secret)
+    _auth(x_pharmaos_secret)
     body = await request.json()
     log.info("inbound text from=%s", body.get("from"))
     background.add_task(handle_inbound, body)
@@ -67,14 +67,14 @@ async def webhook(request: Request, background: BackgroundTasks,
 
 @app.post("/webhook/media")
 async def webhook_media(background: BackgroundTasks,
-                        x_dishii_secret: str | None = Header(None),
+                        x_pharmaos_secret: str | None = Header(None),
                         wa_id: str = Form(...),
                         sender: str = Form(...),
                         msg_type: str = Form("image"),
                         caption: str = Form(""),
                         file: UploadFile = File(...)):
     """Images arrive as multipart so Supabase credentials stay in one service."""
-    _auth(x_dishii_secret)
+    _auth(x_pharmaos_secret)
     phone = norm_phone(sender)
     data = await file.read()
 
@@ -219,8 +219,8 @@ async def mpesa_callback(request: Request):
 
 # ============================================================ cron jobs
 @app.post("/jobs/{name}")
-def run_job(name: str, x_dishii_secret: str | None = Header(None)):
-    _auth(x_dishii_secret)
+def run_job(name: str, x_pharmaos_secret: str | None = Header(None)):
+    _auth(x_pharmaos_secret)
     fn = JOBS.get(name)
     if not fn:
         raise HTTPException(404, f"unknown job. available: {list(JOBS)}")
@@ -276,21 +276,21 @@ def verify(token: str):
  <div class=m>Order {str(o['id'])[:8].upper()} · {o['created_at']:%d %b %Y %H:%M}</div>
  <div class=ok>✓ Genuine · {o['status']}</div>
  <table><tr><th>Item</th><th>Batch</th><th>Expiry</th><th>Qty</th></tr>{rows}</table>
- <div class=m style="margin-top:16px">Total {kes(o['total'])} · verified by Dishii</div>
+ <div class=m style="margin-top:16px">Total {kes(o['total'])} · verified by Pharma OS</div>
 </div>"""
 
 
 # ============================================================ dev helper
 @app.post("/dev/simulate")
 async def simulate(request: Request, background: BackgroundTasks,
-                   x_dishii_secret: str | None = Header(None)):
+                   x_pharmaos_secret: str | None = Header(None)):
     """Fire a fake inbound message without WhatsApp. Invaluable for testing.
 
-    curl -X POST $API/dev/simulate -H "x-dishii-secret: $S" \
+    curl -X POST $API/dev/simulate -H "x-pharmaos-secret: $S" \
          -H 'content-type: application/json' \
          -d '{"from":"254700000001","text":"EXPIRY"}'
     """
-    _auth(x_dishii_secret)
+    _auth(x_pharmaos_secret)
     body = await request.json()
     body.setdefault("wa_id", f"sim-{uuid.uuid4().hex[:12]}")
     body.setdefault("type", "text")

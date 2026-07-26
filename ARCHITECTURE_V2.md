@@ -1,4 +1,4 @@
-# Dishii v2 — reconciled architecture
+# Pharma OS v2 — reconciled architecture
 
 Reconciles: the v1 cloud build, the on-premises agent spec, the two open sync questions,
 and the code review. One system, three tiers, one WhatsApp surface.
@@ -15,7 +15,7 @@ document read *`git HEAD`*. Verified:
 
 ```
 working tree  dashboard/app.py:29  APP_PASSWORD = os.getenv("DASHBOARD_PASSWORD", "pharma123")
-working tree  dashboard/app.py:83  if pw == APP_PASSWORD or pw in ("pharma123", "dishii-admin"):
+working tree  dashboard/app.py:83  if pw == APP_PASSWORD or pw in ("pharma123", "pharmaos-admin"):
 working tree  dashboard/app.py:87  st.error("Wrong password. Default password is 'pharma123'")
 git HEAD      dashboard/app.py:26  APP_PASSWORD = os.getenv("DASHBOARD_PASSWORD", "")
 
@@ -30,7 +30,7 @@ real:
 
 | Blocker | Status |
 |---|---|
-| `pw in ("pharma123", "dishii-admin")` backdoor — accepted regardless of configured password | Fixed |
+| `pw in ("pharma123", "pharmaos-admin")` backdoor — accepted regardless of configured password | Fixed |
 | Error message printed the working password to unauthenticated visitors | Fixed |
 | `DASHBOARD_PASSWORD` defaulted to `pharma123` | Fixed — no default, fails closed |
 | Empty `DASHBOARD_PASSWORD` skipped the gate entirely (`if APP_PASSWORD:`) | Fixed — refuses to start |
@@ -56,7 +56,7 @@ corrected instead.
 │  phAMACore (unchanged — still the till)           │
 │      │ read-only                                  │
 │      ▼                                            │
-│  dishii-agent  (Python, their PC)                 │
+│  pharmaos-agent  (Python, their PC)                 │
 │   • probes for the DB, downgrades to folder watch  │
 │   • backfills 24 months of history ONCE           │
 │   • ingests sales every 15 min                    │
@@ -96,10 +96,10 @@ Up to 60 seconds of latency. For "resync now" that's invisible.
 You are not replacing phAMACore. That means **stock has two writers who don't know
 about each other**:
 
-- Dishii receives goods → `+150 pieces`
-- phAMACore's till sells them → `-30 pieces`, and Dishii never hears about it
+- Pharma OS receives goods → `+150 pieces`
+- phAMACore's till sells them → `-30 pieces`, and Pharma OS never hears about it
 
-Within one day Dishii's stock number is fiction. Every downstream feature — expiry
+Within one day Pharma OS's stock number is fiction. Every downstream feature — expiry
 value at risk, reorder suggestions, FEFO allocation for a patient order — is computed
 off a number that's drifting. **This is the single biggest correctness risk in the
 whole "make it smarter, don't replace it" strategy**, and it's why the agent isn't
@@ -390,7 +390,7 @@ and they will ask who's responsible.
 
 **Monday — on-site, highest value day of the week**
 8. `python agent/agent.py --probe-only` on their PC — paste output back
-9. Whatever export buttons exist — run them — drop into `C:\Dishii\exports`
+9. Whatever export buttons exist — run them — drop into `C:\PharmaOS\exports`
 10. Watch the history land, then `WHY <product>` on WhatsApp
 11. **Confirm whether export quantities are packs or pieces** (see §2 caveat)
 12. Ask about vendor contract terms on third-party DB access, in writing

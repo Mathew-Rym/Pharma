@@ -1,4 +1,4 @@
-name: dishii-cron
+name: pharmaos-cron
 
 # All times are UTC. Nairobi (EAT) is UTC+3.
 #   07:00 EAT = 04:00 UTC
@@ -59,7 +59,7 @@ jobs:
           echo "Running $JOB"
           code=$(curl -sS -o /tmp/out.json -w '%{http_code}' \
             -X POST "${{ secrets.API_URL }}/jobs/$JOB" \
-            -H "x-dishii-secret: ${{ secrets.SHARED_SECRET }}" \
+            -H "x-pharmaos-secret: ${{ secrets.SHARED_SECRET }}" \
             --max-time 300)
           echo "HTTP $code"
           cat /tmp/out.json

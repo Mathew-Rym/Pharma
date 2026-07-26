@@ -1,5 +1,5 @@
 -- ============================================================
--- DISHII PHARMACY OS — Supabase / Postgres schema (MVP)
+-- PHARMA OS PHARMACY OS — Supabase / Postgres schema (MVP)
 -- Design rules:
 --   1. Stock truth lives in BATCHES (qty in pieces) + an append-only
 --      MOVEMENTS ledger. Never UPDATE a quantity without a movement row.
@@ -18,7 +18,7 @@ create table pharmacies (
   name          text not null,
   ppb_licence   text,
   mpesa_paybill text,
-  wa_number     text,                        -- the pharmacy's Dishii WhatsApp line
+  wa_number     text,                        -- the pharmacy's Pharma OS WhatsApp line
   timezone      text default 'Africa/Nairobi',
   created_at    timestamptz default now()
 );

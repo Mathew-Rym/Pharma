@@ -125,11 +125,24 @@ def handle_goods_reply(phone: str, staff: dict, text: str) -> bool:
     if up in ("COUNT", "DONE", "OK") and goods:
         send_text(phone, f"Counting {len(goods)} photo(s)…")
         try:
-            note = apply_vision_count(grn_id, goods)
+            note, needs_more = apply_vision_count(grn_id, goods, return_flag=True)
         except Exception as e:
             log.exception("vision count failed")
-            note = (f"Could not count the photos ({type(e).__name__}). "
-                    f"Check the quantities by hand below.")
+            note, needs_more = (f"Could not count the photos ({type(e).__name__}). "
+                                f"Check the quantities by hand below."), False
+
+        # When something was cut off or hidden, one more photo is far cheaper than a
+        # wrong count -- and much cheaper than the pharmacist hand-counting 40 boxes.
+        # Offer it once, then stop asking: a loop that keeps demanding photos is the
+        # blocking behaviour SKIP exists to prevent.
+        if needs_more and not st["context"].get("recounted"):
+            set_state(phone, "grn_goods",
+                      {"grn_id": grn_id, "goods": goods, "recounted": True})
+            send_text(phone, note + "\n\n📷 *Send another photo* covering the items "
+                                    "above and reply *COUNT* again, or reply *SKIP* to "
+                                    "move on and check them by hand.")
+            return True
+
         _to_review(phone, grn_id, note)
         return True
 
@@ -147,8 +160,13 @@ def _to_review(phone: str, grn_id: str, note: str) -> None:
     send_text(phone, note + "\n\n" + render_summary(grn_id))
 
 
-def apply_vision_count(grn_id: str, goods_paths: list[str]) -> str:
-    """Count the goods photos and record the machine's opinion. Returns a summary.
+def apply_vision_count(grn_id: str, goods_paths: list[str], return_flag: bool = False):
+    """Count the goods photos and record the machine's opinion.
+
+    Returns the pharmacist-facing summary, or (summary, needs_more_photos) when
+    `return_flag` is set. `needs_more_photos` is True when at least one line could not
+    be counted because something was hidden or out of frame — the one case where
+    another photo actually fixes the problem.
 
     Writes vision_* columns only. It does NOT write qty_counted_pieces: that column
     means a human stands behind the number, and nothing here has been seen by a human
@@ -228,7 +246,8 @@ def apply_vision_count(grn_id: str, goods_paths: list[str]) -> str:
         parts.append("_Correct a count with_ *line:packs* _— e.g._ *5:2W* _for 2 packs, "
                      "or_ *5:2W5P* _for 2 packs and 5 loose. The invoice figure is used "
                      "for any line you do not correct._")
-    return "\n\n".join(parts) or "Counted, nothing to flag."
+    summary = "\n\n".join(parts) or "Counted, nothing to flag."
+    return (summary, bool(unsure)) if return_flag else summary
 
 
 def _add_flag(grn_id: str, line_no: int, flag: str) -> None:
@@ -661,11 +680,28 @@ def approve(grn_id: str, staff: dict, phone: str) -> None:
                     (g["supplier_id"], l["product_id"]),
                 )
 
+        # Lines where the machine disagreed with the invoice and NOBODY answered.
+        # Receiving still proceeds on the invoice quantity -- blocking is worse -- but
+        # the disagreement must survive approval. Otherwise the sequence "vision says
+        # 3 packs, invoice says 6, pharmacist just replies OK" books 6 as though the
+        # question was never raised, and the ledger is knowingly wrong with no trace.
+        unresolved = [
+            f"{l['line_no']}. {l['product_name'] or l['raw_description']}: invoice "
+            f"{from_pieces(l['qty_invoiced_pieces'] or 0, l['pack_size'])}, counted "
+            f"{from_pieces((l['vision_packs'] or 0) * (l['pack_size'] or 1) + (l['vision_loose'] or 0), l['pack_size'])} "
+            f"by photo, never confirmed"
+            for l in lines
+            if l.get("vision_packs") is not None
+            and l.get("qty_counted_pieces") is None
+            and "count_mismatch" in set(l["flags"] or [])
+        ]
+
         cur.execute(
             """update grns set status='approved', approved_by=%s, approved_at=now(),
-                               discrepancy_note=%s
+                               discrepancy_note=%s, unresolved_count_note=%s
                 where id=%s""",
-            (staff["id"], "; ".join(short_lines) or None, grn_id),
+            (staff["id"], "; ".join(short_lines) or None,
+             "; ".join(unresolved) or None, grn_id),
         )
 
     clear_state(phone)
@@ -673,6 +709,10 @@ def approve(grn_id: str, staff: dict, phone: str) -> None:
     if short_lines:
         msg.append("📋 Discrepancies recorded (claim within 48 hours):\n" +
                    "\n".join(short_lines))
+    if unresolved:
+        msg.append("⚠️ *Received on invoice quantities, count never confirmed:*\n"
+                   + "\n".join(unresolved)
+                   + "\n_Left open on the dashboard so it can still be claimed._")
     if no_expiry:
         msg.append(f"⚠️ {no_expiry} line(s) saved without an expiry date. "
                    "Add them on the dashboard when you can.")

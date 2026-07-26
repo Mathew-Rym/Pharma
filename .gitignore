@@ -13,3 +13,6 @@ data/
 .gemini/
 .mcp.json
 .agents/
+
+# run.sh background logs
+.run/

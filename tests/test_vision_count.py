@@ -255,3 +255,111 @@ def test_vision_failure_still_reaches_the_review_step():
     import grn as grnmod
     src = inspect.getsource(grnmod.handle_goods_reply)
     assert "except Exception" in src and "_to_review" in src
+
+
+# ============================================================ unresolved discrepancies
+@db
+def test_unconfirmed_discrepancy_survives_approval(grn, monkeypatch):
+    """REGRESSION. Vision says 3 packs, invoice says 6, the pharmacist just replies OK.
+
+    Receiving must still proceed -- blocking is worse -- but booking 6 as though the
+    question was never raised leaves the ledger knowingly wrong with no trace. The
+    disagreement has to remain answerable afterwards.
+    """
+    from db import q1
+    grn_id, _, _ = grn
+    _stub(monkeypatch, [{"line_no": 2, "packs": 3, "loose": 0, "confidence": 0.97,
+                         "fully_visible": True}])
+    import grn as grnmod
+    grnmod.apply_vision_count(grn_id, ["p.jpg"])
+
+    staff = q1("select * from staff where pharmacy_id=%s limit 1",
+               (os.environ["PHARMACY_ID"],))
+    monkeypatch.setattr(grnmod, "send_text", lambda *a, **k: None)
+    grnmod.approve(grn_id, staff, staff["phone"])
+
+    g = q1("""select status, unresolved_count_note from grns where id=%s""", (grn_id,))
+    assert g["status"] == "approved", "receiving must not be blocked"
+    assert g["unresolved_count_note"], "the unanswered discrepancy vanished"
+    assert "never confirmed" in g["unresolved_count_note"]
+
+    # and it is visible for a later supplier claim
+    open_rows = q1("""select grn_id from v_open_receiving_discrepancies
+                       where grn_id=%s""", (grn_id,))
+    assert open_rows, "not surfaced in v_open_receiving_discrepancies"
+
+
+@db
+def test_a_confirmed_count_is_not_logged_as_unresolved(grn, monkeypatch):
+    """Once a human answers, it is resolved -- it belongs in discrepancy_note, not the
+    unanswered list."""
+    from db import q1
+    grn_id, _, _ = grn
+    _stub(monkeypatch, [{"line_no": 2, "packs": 3, "loose": 0, "confidence": 0.97,
+                         "fully_visible": True}])
+    import grn as grnmod
+    grnmod.apply_vision_count(grn_id, ["p.jpg"])
+    grnmod._set_counted(grn_id, 2, (3, 0))          # pharmacist confirms
+
+    staff = q1("select * from staff where pharmacy_id=%s limit 1",
+               (os.environ["PHARMACY_ID"],))
+    monkeypatch.setattr(grnmod, "send_text", lambda *a, **k: None)
+    grnmod.approve(grn_id, staff, staff["phone"])
+
+    g = q1("select discrepancy_note, unresolved_count_note from grns where id=%s",
+           (grn_id,))
+    assert g["unresolved_count_note"] is None
+    assert g["discrepancy_note"], "a confirmed short delivery must still be recorded"
+
+
+@db
+def test_agreeing_count_leaves_nothing_open(grn, monkeypatch):
+    from db import q1
+    grn_id, _, _ = grn
+    _stub(monkeypatch, [
+        {"line_no": 1, "packs": 5, "loose": 0, "confidence": 1.0, "fully_visible": True},
+        {"line_no": 2, "packs": 6, "loose": 0, "confidence": 1.0, "fully_visible": True},
+    ])
+    import grn as grnmod
+    grnmod.apply_vision_count(grn_id, ["p.jpg"])
+    staff = q1("select * from staff where pharmacy_id=%s limit 1",
+               (os.environ["PHARMACY_ID"],))
+    monkeypatch.setattr(grnmod, "send_text", lambda *a, **k: None)
+    grnmod.approve(grn_id, staff, staff["phone"])
+    g = q1("select unresolved_count_note from grns where id=%s", (grn_id,))
+    assert g["unresolved_count_note"] is None
+
+
+# ============================================================ ask for another photo
+@db
+def test_hidden_stock_triggers_a_request_for_another_photo(grn, monkeypatch):
+    """One more photo is cheaper than a wrong count, and far cheaper than hand-counting
+    40 boxes."""
+    grn_id, _, _ = grn
+    _stub(monkeypatch, [{"line_no": 2, "packs": 3, "loose": 0, "confidence": 1.0,
+                         "fully_visible": False, "note": "back of the pile hidden"}])
+    import grn as grnmod
+    summary, needs_more = grnmod.apply_vision_count(grn_id, ["p.jpg"], return_flag=True)
+    assert needs_more is True
+
+
+@db
+def test_a_clean_count_does_not_ask_for_more_photos(grn, monkeypatch):
+    grn_id, _, _ = grn
+    _stub(monkeypatch, [
+        {"line_no": 1, "packs": 5, "loose": 0, "confidence": 1.0, "fully_visible": True},
+        {"line_no": 2, "packs": 6, "loose": 0, "confidence": 1.0, "fully_visible": True},
+    ])
+    import grn as grnmod
+    _, needs_more = grnmod.apply_vision_count(grn_id, ["p.jpg"], return_flag=True)
+    assert needs_more is False
+
+
+def test_the_extra_photo_request_is_asked_once_not_in_a_loop():
+    """A loop that keeps demanding photos is the blocking behaviour SKIP exists to
+    prevent."""
+    import inspect
+
+    import grn as grnmod
+    src = inspect.getsource(grnmod.handle_goods_reply)
+    assert "recounted" in src, "no guard against re-asking forever"

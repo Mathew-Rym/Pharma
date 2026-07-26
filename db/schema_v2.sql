@@ -1,5 +1,5 @@
 -- ============================================================
--- DISHII schema v2 — additive migration. Safe to run on top of v1.
+-- PHARMA OS schema v2 — additive migration. Safe to run on top of v1.
 --
 -- What this adds and why:
 --   1. AGENT PROTOCOL. The pharmacy PC runs an agent. It polls us; we never
@@ -116,9 +116,9 @@ create table if not exists stock_reconciliation (
   ran_at         timestamptz default now(),
   product_id     uuid references products(id),
   legacy_code    text,
-  dishii_pieces  int,                          -- received - sold, per our ledger
+  ledger_pieces  int,                          -- received - sold, per our ledger
   pos_pieces     int,                          -- what phAMACore says is on the shelf
-  variance       int,                          -- pos - dishii
+  variance       int,                          -- pos - pharmaos
   variance_value numeric(14,2),
   status         text default 'open'
                  check (status in ('open','explained','written_off','ignored')),
@@ -171,7 +171,7 @@ alter table job_runs add column if not exists pharmacy_id uuid references pharma
 
 -- ---------- allow POS-ingested sales in the ledger ----------
 -- v1's CHECK constraint rejects 'pos_sale', so every agent ingest would fail.
--- Kept as a distinct reason from 'sale' on purpose: 'sale' means Dishii took the
+-- Kept as a distinct reason from 'sale' on purpose: 'sale' means Pharma OS took the
 -- order, 'pos_sale' means phAMACore's till did. You need to tell them apart to
 -- know which channel is growing.
 alter table stock_movements drop constraint if exists stock_movements_reason_check;
@@ -258,7 +258,7 @@ select m.product_id, m.mo,
 
 -- The reconciliation the owner actually wants to see
 create or replace view v_stock_variance as
-select r.pharmacy_id, p.name, r.legacy_code, r.dishii_pieces, r.pos_pieces,
+select r.pharmacy_id, p.name, r.legacy_code, r.ledger_pieces, r.pos_pieces,
        r.variance, r.variance_value, r.status, r.ran_at
   from stock_reconciliation r
   left join products p on p.id = r.product_id

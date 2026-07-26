@@ -115,7 +115,7 @@ def _snapshot(rows: list[dict], pid: str) -> str:
             continue
         value = variance * float(product["cost_price"] or 0)
         ex("""insert into stock_reconciliation (pharmacy_id, product_id, legacy_code,
-                    dishii_pieces, pos_pieces, variance, variance_value, status)
+                    ledger_pieces, pos_pieces, variance, variance_value, status)
               values (%s,%s,%s,%s,%s,%s,%s,'open')""",
            (pid, product["id"], r["legacy_code"], ours["n"], pos_pieces, variance,
             value))

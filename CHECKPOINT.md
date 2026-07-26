@@ -5,7 +5,7 @@ approvals). Read this first if you come back cold.
 
 ## Where the repo was when v2 work started
 
-- **Commit:** `5d76f5a` — "scaffold: Dishii Pharmacy OS — WhatsApp-first operations layer"
+- **Commit:** `5d76f5a` — "scaffold: Pharma OS Pharmacy OS — WhatsApp-first operations layer"
   (the single commit; it contains the entire v1 system, ~5,085 lines)
 - **Branch:** `main`, no remote pushes
 - **Uncommitted v1 drift** (6 files, +206/−66) — this was already dirty *before* v2:
@@ -15,7 +15,7 @@ approvals). Read this first if you come back cold.
   | `api/llm.py` | +225/−66 — the Anthropic→Gemini dual-provider port |
   | `api/config.py` | `load_dotenv()`, `LLM_PROVIDER`, Anthropic key made optional |
   | `.env.example` | Anthropic block → `AI / LLM` block, defaults to `gemini-3.6-flash` |
-  | `api/router.py` | one line: `"You are Dishii"` → `"You are Pharma OS"` |
+  | `api/router.py` | one line: `"You are Pharma OS"` → `"You are Pharma OS"` |
   | `dashboard/app.py` | rebrand + **a password backdoor** (see below) |
   | `.gitignore` | added `.mcp.json`, `.agents/` |
 
@@ -36,7 +36,7 @@ git checkout 5d76f5a -- <file> # to reset any single file to the scaffold
 
 ```
 working tree  dashboard/app.py:29  APP_PASSWORD = os.getenv("DASHBOARD_PASSWORD", "pharma123")
-working tree  dashboard/app.py:83  if pw == APP_PASSWORD or pw in ("pharma123", "dishii-admin"):
+working tree  dashboard/app.py:83  if pw == APP_PASSWORD or pw in ("pharma123", "pharmaos-admin"):
 working tree  dashboard/app.py:87  st.error("Wrong password. Default password is 'pharma123'")
 git HEAD      dashboard/app.py:26  APP_PASSWORD = os.getenv("DASHBOARD_PASSWORD", "")
 
@@ -55,7 +55,7 @@ going, so an unretargeted anchor is a silent no-op.
 
 ## v1 blockers that v2 fixes
 
-1. **Dashboard password backdoor** — `pw in ("pharma123", "dishii-admin")` accepted
+1. **Dashboard password backdoor** — `pw in ("pharma123", "pharmaos-admin")` accepted
    regardless of configured password; error message printed the password.
 2. **`google-genai` missing from `api/requirements.txt`** while `api/llm.py` imports it
    and `.env` sets `GEMINI_API_KEY`. The import sits in a `try/except` that only logs,
@@ -72,8 +72,8 @@ going, so an unretargeted anchor is a silent no-op.
 
 ## The correctness risk v2 exists to fix
 
-Dishii does not replace phAMACore, so **stock has two writers that don't know about
-each other**: Dishii receives (`+150`), phAMACore's till sells (`−30`), and Dishii
+Pharma OS does not replace phAMACore, so **stock has two writers that don't know about
+each other**: Pharma OS receives (`+150`), phAMACore's till sells (`−30`), and Pharma OS
 never hears about the sale. Within a day the stock number is fiction, and expiry
 value-at-risk, reorder suggestions and FEFO allocation are all computed off it.
 

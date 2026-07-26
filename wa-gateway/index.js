@@ -1,5 +1,5 @@
 /**
- * Dishii WhatsApp gateway.
+ * Pharma OS WhatsApp gateway.
  *
  * THIS FILE CONTAINS NO BUSINESS LOGIC AND MUST NEVER CONTAIN ANY.
  * It does exactly three things:
@@ -59,7 +59,7 @@ async function start() {
     const { connection, lastDisconnect, qr } = u;
     if (qr) {
       lastQR = qr;
-      console.log('\n=== SCAN THIS QR WITH THE DISHII WHATSAPP NUMBER ===\n');
+      console.log('\n=== SCAN THIS QR WITH THE PHARMA OS WHATSAPP NUMBER ===\n');
       qrcodeTerminal.generate(qr, { small: true });
     }
     if (connection === 'open') {
@@ -123,7 +123,7 @@ async function forward(m) {
     );
     const r = await fetch(`${API_URL}/webhook/media`, {
       method: 'POST',
-      headers: { 'x-dishii-secret': SECRET },
+      headers: { 'x-pharmaos-secret': SECRET },
       body: form,
     });
     log.info({ from, status: r.status }, 'media forwarded');
@@ -134,7 +134,7 @@ async function forward(m) {
   if (!text.trim()) return;
   const r = await fetch(`${API_URL}/webhook`, {
     method: 'POST',
-    headers: { 'content-type': 'application/json', 'x-dishii-secret': SECRET },
+    headers: { 'content-type': 'application/json', 'x-pharmaos-secret': SECRET },
     body: JSON.stringify({ wa_id: waId, from, type: 'text', text }),
   });
   log.info({ from, status: r.status }, 'text forwarded');
@@ -146,7 +146,7 @@ app.use(express.json({ limit: '2mb' }));
 
 app.use((req, res, next) => {
   if (req.path === '/health' || req.path === '/qr') return next();
-  if (req.headers['x-dishii-secret'] !== SECRET) {
+  if (req.headers['x-pharmaos-secret'] !== SECRET) {
     return res.status(401).json({ error: 'bad secret' });
   }
   next();
@@ -160,7 +160,7 @@ app.get('/qr', (_req, res) => {
   res.send(
     `<body style="display:grid;place-items:center;height:100vh;font-family:sans-serif">
        <div style="text-align:center">
-         <h3>Scan with the Dishii WhatsApp number</h3>
+         <h3>Scan with the Pharma OS WhatsApp number</h3>
          <img src="https://api.qrserver.com/v1/create-qr-code/?size=320x320&data=${encodeURIComponent(lastQR)}"/>
        </div>
      </body>`,

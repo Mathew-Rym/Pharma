@@ -89,7 +89,7 @@ class Doc(FPDF):
             self.cell(0, 4, self.contact, new_x=XPos.LMARGIN, new_y=YPos.NEXT)
         self.set_font("Helvetica", "", 10)
         self.set_text_color(*MUTED)
-        self.cell(0, 5, f"{self.doc_title}  ·  generated {date.today():%d %b %Y}  ·  Dishii",
+        self.cell(0, 5, f"{self.doc_title}  ·  generated {date.today():%d %b %Y}  ·  Pharma OS",
                   new_x=XPos.LMARGIN, new_y=YPos.NEXT)
         self.set_draw_color(*RULE)
         self.line(15, self.get_y() + 2, 195, self.get_y() + 2)

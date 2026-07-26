@@ -24,7 +24,7 @@ from db import ex
 from utils import norm_phone
 
 log = logging.getLogger(__name__)
-_HEADERS = {"x-dishii-secret": settings.SHARED_SECRET}
+_HEADERS = {"x-pharmaos-secret": settings.SHARED_SECRET}
 _GOWA = settings.WA_BACKEND == "gowa"
 
 

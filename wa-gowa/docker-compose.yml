@@ -1,4 +1,4 @@
-# GOWA — go-whatsapp-web-multidevice — as Dishii's WhatsApp transport.
+# GOWA — go-whatsapp-web-multidevice — as Pharma OS's WhatsApp transport.
 #
 # WHY THIS AND NOT wa-gateway/: GOWA is multi-device, so ONE server holds a separate
 # WhatsApp account per pharmacy (scoped by X-Device-Id). wa-gateway/ is one device per
@@ -17,7 +17,7 @@
 services:
   gowa:
     image: aldinokemal2104/go-whatsapp-web-multidevice:latest
-    container_name: dishii-gowa
+    container_name: pharmaos-gowa
     restart: unless-stopped
     command: rest
     ports:
@@ -29,9 +29,9 @@ services:
       APP_DEBUG: "false"
       # Shows as the linked-device name on the pharmacy's phone. Make it recognisable
       # so nobody unlinks it wondering what it is.
-      APP_OS: Dishii
+      APP_OS: Pharma OS
       # Protects /send/* and /statics/*. MUST match GOWA_USER / GOWA_PASS in ../.env.
-      APP_BASIC_AUTH: "${GOWA_USER:-dishii}:${GOWA_PASS:?set GOWA_PASS in .env}"
+      APP_BASIC_AUTH: "${GOWA_USER:-pharmaos}:${GOWA_PASS:?set GOWA_PASS in .env}"
 
       # --- where inbound messages go ---
       # host.docker.internal reaches the API running on your laptop. On Linux this

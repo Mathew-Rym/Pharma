@@ -187,7 +187,7 @@ def _handle_staff(phone: str, staff: dict, msg: dict, text: str) -> None:
                              "minute — I will message you when it is done.")
         else:
             send_text(phone, "No agent is installed on the pharmacy PC yet, so I can "
-                             "only see stock that Dishii itself received.")
+                             "only see stock that Pharma OS itself received.")
         return
 
     if up in ("PC", "AGENT", "PC STATUS"):
@@ -219,7 +219,7 @@ def _handle_staff(phone: str, staff: dict, msg: dict, text: str) -> None:
 
 def _staff_help(role: str) -> str:
     base = (
-        "*Dishii commands*\n"
+        "*Pharma OS commands*\n"
         "📸 Send a photo of a supplier invoice → I receive the stock (batch + expiry)\n"
         "• *EXPIRY* — what is expiring in 90 days\n"
         "• *LOW* — what is below reorder level\n"

@@ -1,4 +1,4 @@
-# Dishii — Pharmacy OS
+# Pharma OS — Pharmacy OS
 
 WhatsApp-first operations layer for Kenyan retail pharmacies. Sits **on top of** an
 existing POS (phAMACore), it does not replace it.
@@ -26,7 +26,7 @@ WhatsApp ──▶ wa-gateway (Node/Baileys, zero logic) ──▶ api (FastAPI,
 ## Repository layout — what goes where
 
 ```
-dishii/
+pharmaos/
 ├── db/schema.sql                 ← run this in Supabase FIRST
 ├── api/                          ← ALL business logic lives here
 │   ├── config.py                 env vars, business thresholds
@@ -83,12 +83,12 @@ Total time if nothing fights you: about 90 minutes to a working WhatsApp bot.
 ## Step 1 — Create the repo (5 min)
 
 ```bash
-mkdir dishii && cd dishii
+mkdir pharmaos && cd pharmaos
 git init
 # copy the contents of this repository in, then:
 cp .env.example .env
 git add -A && git commit -m "scaffold"
-gh repo create dishii --private --source=. --push
+gh repo create pharmaos --private --source=. --push
 ```
 
 `.env` is gitignored. Confirm with `git status` that it is **not** staged before pushing.
@@ -179,11 +179,11 @@ habit for the next four days:
 ```bash
 S=$(grep ^SHARED_SECRET .env | cut -d= -f2)
 
-curl -X POST localhost:8000/dev/simulate -H "x-dishii-secret: $S" \
+curl -X POST localhost:8000/dev/simulate -H "x-pharmaos-secret: $S" \
   -H 'content-type: application/json' \
   -d '{"from":"254700000001","text":"EXPIRY"}'
 
-curl -X POST localhost:8000/dev/simulate -H "x-dishii-secret: $S" \
+curl -X POST localhost:8000/dev/simulate -H "x-pharmaos-secret: $S" \
   -H 'content-type: application/json' \
   -d '{"from":"254700000001","text":"who supplies prenor"}'
 ```
@@ -235,7 +235,7 @@ Railway, two services in one project.
 - New Service → GitHub repo → **Root directory: `/api`**
 - It will detect the Dockerfile
 - Variables: every line from `.env` except `WA_GATEWAY_URL`
-- Generate a domain → note it, e.g. `https://dishii-api.up.railway.app`
+- Generate a domain → note it, e.g. `https://pharmaos-api.up.railway.app`
 - Set `PUBLIC_BASE_URL` and `MPESA_CALLBACK_URL=<domain>/mpesa/callback`
 
 **Service 2 — wa-gateway**
@@ -250,7 +250,7 @@ Railway, two services in one project.
 env vars into Secrets, set `DASHBOARD_PASSWORD`.
 
 **Cron** — repo Settings → Secrets and variables → Actions → add `API_URL` and
-`SHARED_SECRET`. Then Actions → dishii-cron → Run workflow → pick `expiry_sweep` to
+`SHARED_SECRET`. Then Actions → pharmaos-cron → Run workflow → pick `expiry_sweep` to
 verify it fires before you trust the schedule.
 
 Pay the $5/month. A free tier that sleeps drops the WhatsApp socket and you will spend
@@ -262,7 +262,7 @@ Sandbox first. Daraja test credentials go in `.env`; the sandbox passkey in
 `.env.example` is Safaricom's public test value.
 
 ```bash
-curl -X POST localhost:8000/dev/simulate -H "x-dishii-secret: $S" \
+curl -X POST localhost:8000/dev/simulate -H "x-pharmaos-secret: $S" \
   -H 'content-type: application/json' \
   -d '{"from":"254799999999","text":"YES"}'      # consent as a customer
 ```

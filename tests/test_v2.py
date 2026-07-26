@@ -200,7 +200,7 @@ def test_unparseable_date_is_none_rather_than_today():
 # ============================================================ M-Pesa SMS
 # Three real Safaricom wordings. The format has drifted over the years, so the
 # parser matches loosely on what has stayed stable: receipt code, amount, keyword.
-PAYBILL_SMS = ("QGH7XYZ12K Confirmed. Ksh1,500.00 sent to DISHII PHARMACY for account "
+PAYBILL_SMS = ("QGH7XYZ12K Confirmed. Ksh1,500.00 sent to PHARMA OS PHARMACY for account "
                "4A7B2C91 on 26/7/26 at 10:14 AM. New M-PESA balance is Ksh3,240.00.")
 RECEIVED_SMS = ("SFJ4K2L9MN Confirmed. You have received Ksh450.00 from JOHN DOE "
                 "254712345678 on 26/7/26 at 9:02 AM.")

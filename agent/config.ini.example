@@ -1,4 +1,4 @@
-; Dishii bridge agent — copy to config.ini on the pharmacy PC and fill in.
+; Pharma OS bridge agent — copy to config.ini on the pharmacy PC and fill in.
 ; Nothing here is a secret except enrolment_token, which is single-use.
 
 [cloud]
@@ -12,8 +12,8 @@ enrolment_token =
 
 [agent]
 ; Where agent.db (the offline outbox) and the log file live.
-data_dir = C:\Dishii\data
-log_file = C:\Dishii\dishii-agent.log
+data_dir = C:\PharmaOS\data
+log_file = C:\PharmaOS\pharmaos-agent.log
 
 [ingest]
 ; Leave mode blank to let the probe decide (db_poll if it finds a readable DB,
@@ -22,7 +22,7 @@ mode =
 ; phAMACore exports get saved here. The agent creates processed\ and rejected\
 ; subfolders itself. Files it cannot classify land in rejected\ with a .reason.txt
 ; rather than disappearing.
-watch_dir = C:\Dishii\exports
+watch_dir = C:\PharmaOS\exports
 
 [phamacore]
 ; Optional hint for the probe. If blank it still checks the usual install paths.

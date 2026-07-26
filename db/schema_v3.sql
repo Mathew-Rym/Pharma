@@ -1,5 +1,5 @@
 -- ============================================================
--- DISHII schema v3 — additive. Safe on top of v1 + v2.
+-- PHARMA OS schema v3 — additive. Safe on top of v1 + v2.
 --
 -- PHYSICAL DELIVERY VERIFICATION for Loop A.
 --

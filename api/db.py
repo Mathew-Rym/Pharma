@@ -3,6 +3,7 @@
 Raw SQL on purpose. An ORM buys you nothing here and hides the ledger invariants
 that actually matter in this system.
 """
+import atexit
 import logging
 from contextlib import contextmanager
 from typing import Any
@@ -24,6 +25,12 @@ pool = ConnectionPool(
     open=True,
     kwargs={"row_factory": dict_row, "prepare_threshold": None},
 )
+
+# Close the pool on the way out. Without this every short-lived process -- a cron job,
+# a CLI script, the test suite -- exits with four "couldn't stop thread ... within 5.0
+# seconds" warnings on stderr. Harmless, but they make a successful run look like a
+# failed one, and warnings people learn to ignore are how real ones get missed.
+atexit.register(lambda: pool.close())
 
 sb = create_client(settings.SUPABASE_URL, settings.SUPABASE_SERVICE_KEY)
 

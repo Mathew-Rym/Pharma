@@ -165,7 +165,7 @@ def agent_status() -> str:
                order by last_seen_at desc nulls last limit 1""", (PID,))
     if not a:
         return ("No agent is installed on the pharmacy PC yet. Stock levels reflect "
-                "only what Dishii has received and sold, not the till.")
+                "only what Pharma OS has received and sold, not the till.")
     if not a["last_seen_at"]:
         return "Agent is registered but has never connected."
     age = datetime.now(a["last_seen_at"].tzinfo) - a["last_seen_at"]
@@ -397,7 +397,7 @@ async def snapshot(request: Request, x_agent_token: str | None = Header(None)):
             continue
         value = variance * float(product["cost_price"] or 0)
         ex("""insert into stock_reconciliation (pharmacy_id, product_id, legacy_code,
-                    dishii_pieces, pos_pieces, variance, variance_value, status)
+                    ledger_pieces, pos_pieces, variance, variance_value, status)
               values (%s,%s,%s,%s,%s,%s,%s,'open')""",
            (PID, product["id"], r.get("legacy_code"), ours["n"], pos_pieces,
             variance, value))
@@ -408,15 +408,15 @@ async def snapshot(request: Request, x_agent_token: str | None = Header(None)):
 
 
 def reconciliation_summary(limit: int = 12) -> str:
-    rows = q("""select name, legacy_code, dishii_pieces, pos_pieces, variance,
+    rows = q("""select name, legacy_code, ledger_pieces, pos_pieces, variance,
                        variance_value
                   from v_stock_variance where pharmacy_id=%s limit %s""", (PID, limit))
     if not rows:
-        return "No stock variances open. Dishii and phAMACore agree."
+        return "No stock variances open. Pharma OS and phAMACore agree."
     total = sum(abs(float(r["variance_value"] or 0)) for r in rows)
     lines = "\n".join(
         f"• {r['name']} — till says {r['pos_pieces']}, we calculate "
-        f"{r['dishii_pieces']} ({r['variance']:+d} pcs, {kes(abs(r['variance_value']))})"
+        f"{r['ledger_pieces']} ({r['variance']:+d} pcs, {kes(abs(r['variance_value']))})"
         for r in rows
     )
     return (f"⚖️ *Stock variance* — {len(rows)} item(s), {kes(total)} unexplained\n\n"
