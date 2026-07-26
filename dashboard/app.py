@@ -8,8 +8,13 @@ it exists for the three jobs a chat window is genuinely bad at:
 
 Run:  streamlit run app.py
 """
+import hmac
 import os
-from datetime import date, datetime, timedelta
+from datetime import datetime
+
+from dotenv import load_dotenv
+
+load_dotenv()
 
 import pandas as pd
 import psycopg
@@ -17,12 +22,15 @@ import streamlit as st
 from psycopg.rows import dict_row
 from supabase import create_client
 
-st.set_page_config(page_title="Dishii", page_icon="💊", layout="wide")
+st.set_page_config(page_title="Pharma OS", page_icon="💊", layout="wide")
 
 DATABASE_URL = os.environ["DATABASE_URL"]
 PID = os.environ["PHARMACY_ID"]
 SB_URL = os.environ["SUPABASE_URL"]
 SB_KEY = os.environ["SUPABASE_SERVICE_KEY"]
+# No default, and no "empty means no gate". This surface holds prescription images,
+# patient names and the service_role key. An unconfigured deploy must refuse to run,
+# not silently open — that is the failure mode you never notice.
 APP_PASSWORD = os.getenv("DASHBOARD_PASSWORD", "")
 BUCKET_RX = os.getenv("BUCKET_RX", "prescriptions")
 BUCKET_INV = os.getenv("BUCKET_INVOICES", "invoices")
@@ -70,18 +78,111 @@ def kes(v) -> str:
         return "KES 0"
 
 
+def _api():
+    """Import the api/ package so mutations go through business logic rather than
+    raw UPDATEs. A bare UPDATE from the UI notifies nobody and records no actor."""
+    import sys
+    api_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "api")
+    if api_dir not in sys.path:
+        sys.path.insert(0, api_dir)
+
+
+def _set_order_status(order_id, new_status: str, actor: dict,
+                      phone: str | None, code: str | None):
+    """Status change + customer notification + who did it."""
+    _api()
+    from wa import send_text
+    ex("update orders set status=%s where id=%s", (new_status, order_id))
+    # A zero-delta movement is an audit breadcrumb, not a stock change: it records
+    # who moved the order and when without touching batch quantities, so the
+    # ledger-vs-batches invariant still holds.
+    ex("""insert into stock_movements (pharmacy_id, batch_id, delta_pieces, reason,
+                actor_staff, ref_table, ref_id, note)
+          select %s, l.batch_id, 0, 'adjust', %s, 'orders', %s, %s
+            from order_lines l where l.order_id = %s and l.batch_id is not null
+            limit 1""",
+       (PID, actor["id"], order_id, f"status -> {new_status} by {actor['name']}",
+        order_id))
+    if phone:
+        if new_status == "dispatched":
+            send_text(phone, "🛵 Your order is on the way."
+                             + (f" Give the rider code *{code}*." if code else ""))
+        elif new_status == "delivered":
+            send_text(phone, "✅ Delivered. Thank you for choosing us. "
+                             "Reply *POINTS* to see your loyalty balance.")
+
+
+def zoomable(url: str, height: int = 460):
+    """Pinch/scroll-zoom + drag for prescription images.
+
+    Streamlit's st.image has no zoom, and zoom is the single most important control
+    when reading a handwritten script. 30 lines of HTML beats rejecting a whole
+    prescription because one dose was unreadable.
+    """
+    import streamlit.components.v1 as components
+    components.html(f"""
+    <div style="position:relative;overflow:hidden;height:{height}px;
+                background:#111;border-radius:10px;cursor:grab" id="vp">
+      <img id="im" src="{url}" style="position:absolute;transform-origin:0 0;
+           max-width:none;user-select:none" draggable="false"/>
+      <div style="position:absolute;bottom:8px;right:10px;background:rgba(0,0,0,.65);
+                  color:#fff;font:11px system-ui;padding:4px 9px;border-radius:12px">
+        scroll to zoom · drag to pan · double-click to reset
+      </div>
+    </div>
+    <script>
+    (function(){{
+      const vp=document.getElementById('vp'), im=document.getElementById('im');
+      let s=1,x=0,y=0,drag=false,px=0,py=0;
+      function fit(){{ s=Math.min(vp.clientWidth/im.naturalWidth,
+                                 vp.clientHeight/im.naturalHeight)||1;
+                       x=(vp.clientWidth-im.naturalWidth*s)/2; y=0; draw(); }}
+      function draw(){{ im.style.transform=`translate(${{x}}px,${{y}}px) scale(${{s}})`; }}
+      im.onload=fit;
+      vp.addEventListener('wheel',e=>{{ e.preventDefault();
+        const r=vp.getBoundingClientRect(), mx=e.clientX-r.left, my=e.clientY-r.top;
+        const f=e.deltaY<0?1.15:1/1.15, ns=Math.max(.1,Math.min(s*f,12));
+        x=mx-(mx-x)*(ns/s); y=my-(my-y)*(ns/s); s=ns; draw(); }},{{passive:false}});
+      vp.addEventListener('mousedown',e=>{{drag=true;px=e.clientX;py=e.clientY;
+        vp.style.cursor='grabbing';}});
+      window.addEventListener('mouseup',()=>{{drag=false;vp.style.cursor='grab';}});
+      window.addEventListener('mousemove',e=>{{ if(!drag)return;
+        x+=e.clientX-px; y+=e.clientY-py; px=e.clientX; py=e.clientY; draw(); }});
+      vp.addEventListener('dblclick',fit);
+      let d0=null;
+      vp.addEventListener('touchstart',e=>{{ if(e.touches.length===2)
+        d0=Math.hypot(e.touches[0].clientX-e.touches[1].clientX,
+                      e.touches[0].clientY-e.touches[1].clientY); }});
+      vp.addEventListener('touchmove',e=>{{ if(e.touches.length===2&&d0){{
+        e.preventDefault();
+        const d=Math.hypot(e.touches[0].clientX-e.touches[1].clientX,
+                           e.touches[0].clientY-e.touches[1].clientY);
+        s=Math.max(.1,Math.min(s*(d/d0),12)); d0=d; draw(); }} }},{{passive:false}});
+    }})();
+    </script>
+    """, height=height + 10)
+
+
 # ------------------------------------------------------------------ auth
-if APP_PASSWORD:
-    if not st.session_state.get("authed"):
-        st.title("💊 Dishii")
-        pw = st.text_input("Password", type="password")
-        if st.button("Enter"):
-            if pw == APP_PASSWORD:
-                st.session_state["authed"] = True
-                st.rerun()
-            else:
-                st.error("Wrong password")
-        st.stop()
+if not APP_PASSWORD:
+    st.error("DASHBOARD_PASSWORD is not set. Refusing to start without a gate.")
+    st.stop()
+
+if not st.session_state.get("authed"):
+    st.title("💊 Pharma OS")
+    st.caption("Sign in to access the pharmacy operations dashboard.")
+    pw = st.text_input("Password", type="password")
+    if st.button("Enter"):
+        # hmac.compare_digest, not ==, so a wrong password cannot be recovered a
+        # character at a time from response timing.
+        if hmac.compare_digest(pw, APP_PASSWORD):
+            st.session_state["authed"] = True
+            st.rerun()
+        else:
+            # Never echo the expected value, or any hint about it, to someone who
+            # has not authenticated.
+            st.error("Wrong password.")
+    st.stop()
 
 # Acting user — every clinical approval must be attributable to a real person
 staff = q("""select id, name, role, ppb_reg_no from staff
@@ -93,7 +194,7 @@ if not staff:
     st.stop()
 
 with st.sidebar:
-    st.title("💊 Dishii")
+    st.title("💊 Pharma OS")
     labels = {f"{s['name']} · {s['role']}": s for s in staff}
     me = labels[st.selectbox("Signed in as", list(labels))]
     st.caption(f"PPB reg: {me['ppb_reg_no'] or '—'}")
@@ -121,7 +222,8 @@ if page == "Verification queue":
             with left:
                 url = img_url(BUCKET_RX, r["image_path"])
                 if url:
-                    st.image(url, caption="Original prescription", use_container_width=True)
+                    zoomable(url)
+                    st.caption("Zoom in and read every line before approving.")
                 else:
                     st.warning("Image unavailable")
             with right:
@@ -361,13 +463,27 @@ elif page == "Orders":
         c1.write(f"**{str(r['id'])[:8].upper()}** · {r['name'] or r['phone']}")
         c2.write(kes(r["total"]))
         c3.write(r["status"])
+        # Status changes go through api/ so the customer is notified and the change
+        # is attributable. A bare UPDATE from the UI notifies nobody and leaves no
+        # record of who dispatched.
         if r["status"] == "paid":
             if c4.button("Mark dispatched", key=f"d{r['id']}"):
-                ex("update orders set status='dispatched' where id=%s", (r["id"],))
+                with st.spinner("Dispatching..."):
+                    try:
+                        _set_order_status(r["id"], "dispatched", me, r["phone"],
+                                          r["delivery_code"])
+                        st.success("Dispatched and customer notified.")
+                    except Exception as e:
+                        st.error(f"Failed: {e}")
                 st.rerun()
         elif r["status"] == "dispatched":
             if c4.button("Mark delivered", key=f"dl{r['id']}"):
-                ex("update orders set status='delivered' where id=%s", (r["id"],))
+                with st.spinner("Confirming..."):
+                    try:
+                        _set_order_status(r["id"], "delivered", me, r["phone"], None)
+                        st.success("Marked delivered.")
+                    except Exception as e:
+                        st.error(f"Failed: {e}")
                 st.rerun()
 
 
@@ -426,15 +542,97 @@ else:
 
     st.subheader("Recent cron runs")
     st.dataframe(pd.DataFrame(q(
-        "select job, status, detail, started_at, ended_at from job_runs "
-        "order by started_at desc limit 30")), use_container_width=True, hide_index=True)
+        """select job, status, detail, started_at, ended_at from job_runs
+            where pharmacy_id = %s or pharmacy_id is null
+            order by started_at desc limit 30""", (PID,))),
+        use_container_width=True, hide_index=True)
 
     st.subheader("Unhandled messages")
+    st.caption("Phone and error only. Message bodies are patient-identifiable under "
+               "the Data Protection Act 2019 and are deliberately not rendered here.")
     st.dataframe(pd.DataFrame(q(
-        """select from_phone, msg_type, body, error, created_at from wa_messages
-            where direction='in' and (handled=false or error is not null)
-            order by created_at desc limit 30""")),
+        """select from_phone, msg_type, error, created_at from wa_messages
+            where pharmacy_id = %s and direction='in'
+              and (handled=false or error is not null)
+            order by created_at desc limit 30""", (PID,))),
         use_container_width=True, hide_index=True)
+
+    st.subheader("Approval PINs")
+    st.caption("A pharmacist needs a PIN to approve prescriptions over WhatsApp. "
+               "Without one they cannot approve at all. 4 digits, not a birthday.")
+    pin_staff = q("""select id, name, role, approval_pin, pin_locked_until
+                       from staff where pharmacy_id=%s and is_active
+                        and role in ('pharmacist','owner','manager')
+                      order by name""", (PID,))
+    for ps in pin_staff:
+        c1, c2, c3 = st.columns([3, 2, 1])
+        locked = bool(ps["pin_locked_until"]) and ps["pin_locked_until"] > datetime.now(
+            ps["pin_locked_until"].tzinfo)
+        c1.write(f"**{ps['name']}** · {ps['role']}" + ("  🔒 locked" if locked else ""))
+        newpin = c2.text_input("New PIN", key=f"pin{ps['id']}", max_chars=6,
+                               type="password",
+                               placeholder="set" if ps["approval_pin"] else "not set")
+        if c3.button("Save", key=f"sp{ps['id']}"):
+            if not newpin.isdigit() or len(newpin) < 4:
+                st.error("PIN must be at least 4 digits.")
+            else:
+                ex("""update staff set approval_pin=%s, pin_failed_count=0,
+                          pin_locked_until=null where id=%s""", (newpin, ps["id"]))
+                st.success(f"PIN set for {ps['name']}.")
+                st.rerun()
+
+    st.subheader("Duty roster")
+    st.caption("Who is on duty each weekday. Prescriptions and the morning briefing go "
+               "to the person on shift, not to five phones at once.")
+    _WEEKDAYS = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday",
+                 "Saturday", "Sunday"]
+    roster = q("""select r.weekday, s.name, s.id as staff_id
+                    from duty_roster r join staff s on s.id = r.staff_id
+                   where r.pharmacy_id=%s and r.on_date is null
+                   order by r.weekday""", (PID,))
+    by_day = {}
+    for row in roster:
+        by_day.setdefault(row["weekday"], []).append(row["name"])
+    staff_pick = {s["name"]: s["id"] for s in staff}
+    rc1, rc2, rc3 = st.columns([2, 2, 1])
+    day_label = rc1.selectbox("Weekday", _WEEKDAYS, key="rota_day")
+    who = rc2.selectbox("On duty", list(staff_pick), key="rota_who")
+    if rc3.button("Add", key="rota_add"):
+        ex("""insert into duty_roster (pharmacy_id, staff_id, weekday)
+              values (%s,%s,%s)
+              on conflict do nothing""",
+           (PID, staff_pick[who], _WEEKDAYS.index(day_label)))
+        st.success(f"{who} added to {day_label}.")
+        st.rerun()
+    st.dataframe(pd.DataFrame([{"Weekday": _WEEKDAYS[d],
+                                "On duty": ", ".join(names)}
+                               for d, names in sorted(by_day.items())])
+                 if by_day else pd.DataFrame([{"Weekday": "—", "On duty": "nobody set"}]),
+                 use_container_width=True, hide_index=True)
+
+    st.subheader("Pharmacy PC agent")
+    ag = q("""select machine_name, agent_version, ingest_mode, db_engine,
+                     last_seen_at, suspended from agents where pharmacy_id=%s""", (PID,))
+    if not ag:
+        st.warning("No agent enrolled. Stock reflects only what Dishii received and "
+                   "sold — not the till. Create an enrolment token below.")
+        if st.button("Generate enrolment token"):
+            import secrets as _s
+            tok = _s.token_urlsafe(12)
+            ex("""insert into agents (pharmacy_id, enrolment_token, ingest_mode)
+                  values (%s,%s,'unknown')""", (PID, tok))
+            st.code(tok, language=None)
+            st.caption("Paste this into config.ini on the pharmacy PC. One-time use.")
+    else:
+        st.dataframe(pd.DataFrame(ag), use_container_width=True, hide_index=True)
+
+    st.subheader("Unmatched payments")
+    st.caption("Money received that we could not tie to an order. Never leave these.")
+    st.dataframe(pd.DataFrame(q("""select amount, phone, mpesa_receipt, created_at
+                                    from payments where pharmacy_id=%s
+                                     and order_id is null and status='success'
+                                    order by created_at desc limit 20""", (PID,))),
+                 use_container_width=True, hide_index=True)
 
     st.subheader("Staff (WhatsApp access)")
     sdf = st.data_editor(pd.DataFrame(q(

@@ -11,3 +11,5 @@ data/
 .pytest_cache/
 .claude/
 .gemini/
+.mcp.json
+.agents/

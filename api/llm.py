@@ -1,21 +1,48 @@
 """All LLM calls. Strict JSON, temperature 0, per-field confidence.
 
-Rules encoded here that you should not relax:
-  - the model reports, it never normalises (it returns expiry_raw AND expiry_date)
-  - the model echoes the printed totals so our code can cross-check its own line items
-  - the model may say "unreadable"; a confident wrong batch number is far worse
+Supports both Gemini (Google GenAI) and Anthropic models seamlessly.
 """
 import base64
 import json
 import logging
 import re
-
-from anthropic import Anthropic
+from dataclasses import dataclass, field
 
 from config import settings
 
 log = logging.getLogger(__name__)
-client = Anthropic(api_key=settings.ANTHROPIC_API_KEY)
+
+
+@dataclass
+class ContentBlock:
+    type: str
+    text: str = ""
+    id: str = ""
+    name: str = ""
+    input: dict = field(default_factory=dict)
+
+
+@dataclass
+class ChatResponse:
+    content: list[ContentBlock]
+
+
+gemini_client = None
+anthropic_client = None
+
+if settings.GEMINI_API_KEY:
+    try:
+        from google import genai
+        gemini_client = genai.Client(api_key=settings.GEMINI_API_KEY)
+    except Exception as e:
+        log.warning("Could not initialize Gemini client: %s", e)
+
+if settings.ANTHROPIC_API_KEY:
+    try:
+        from anthropic import Anthropic
+        anthropic_client = Anthropic(api_key=settings.ANTHROPIC_API_KEY)
+    except Exception as e:
+        log.warning("Could not initialize Anthropic client: %s", e)
 
 
 # ============================================================== prompts
@@ -121,39 +148,55 @@ def _extract_json(text: str) -> dict:
 
 def vision_json(system: str, images: list[bytes], instruction: str,
                 media_types: list[str] | None = None) -> dict:
-    """Send N images in ONE request and get strict JSON back.
+    provider = settings.LLM_PROVIDER
+    if provider == "gemini" and gemini_client:
+        from google.genai import types
+        contents = []
+        for i, img in enumerate(images):
+            mt = (media_types[i] if media_types and i < len(media_types) else "image/jpeg")
+            contents.append(types.Part.from_bytes(data=img, mime_type=mt))
+        contents.append(instruction)
 
-    One request matters: the MedTrack invoice splits its table across two pages with
-    the totals on page 2. Two separate calls produce two half-parsed documents.
-    """
-    content: list[dict] = []
-    for i, img in enumerate(images):
-        mt = (media_types[i] if media_types and i < len(media_types) else "image/jpeg")
-        content.append({"type": "text", "text": f"--- page {i + 1} ---"})
-        content.append({
-            "type": "image",
-            "source": {
-                "type": "base64",
-                "media_type": mt,
-                "data": base64.b64encode(img).decode(),
-            },
-        })
-    content.append({"type": "text", "text": instruction})
+        res = gemini_client.models.generate_content(
+            model=settings.MODEL_VISION,
+            contents=contents,
+            config=types.GenerateContentConfig(
+                system_instruction=system,
+                response_mime_type="application/json",
+                temperature=0.0,
+            )
+        )
+        return _extract_json(res.text)
 
-    resp = client.messages.create(
-        model=settings.MODEL_VISION,
-        max_tokens=8000,
-        temperature=0,
-        system=system,
-        messages=[
-            {"role": "user", "content": content},
-            {"role": "assistant", "content": "{"},   # prefill kills any preamble
-        ],
-    )
-    raw = "{" + "".join(b.text for b in resp.content if b.type == "text")
-    log.info("vision_json in=%s out=%s tokens",
-             resp.usage.input_tokens, resp.usage.output_tokens)
-    return _extract_json(raw)
+    elif anthropic_client:
+        content: list[dict] = []
+        for i, img in enumerate(images):
+            mt = (media_types[i] if media_types and i < len(media_types) else "image/jpeg")
+            content.append({"type": "text", "text": f"--- page {i + 1} ---"})
+            content.append({
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": mt,
+                    "data": base64.b64encode(img).decode(),
+                },
+            })
+        content.append({"type": "text", "text": instruction})
+
+        resp = anthropic_client.messages.create(
+            model=settings.MODEL_VISION,
+            max_tokens=8000,
+            temperature=0,
+            system=system,
+            messages=[
+                {"role": "user", "content": content},
+                {"role": "assistant", "content": "{"},
+            ],
+        )
+        raw = "{" + "".join(b.text for b in resp.content if b.type == "text")
+        return _extract_json(raw)
+    else:
+        raise RuntimeError("No configured LLM client available.")
 
 
 def extract_invoice(images: list[bytes], media_types: list[str] | None = None) -> dict:
@@ -174,14 +217,94 @@ def extract_prescription(images: list[bytes], media_types: list[str] | None = No
 
 def chat(system: str, messages: list[dict], tools: list[dict] | None = None,
          max_tokens: int = 2000):
-    """Plain chat / tool-calling on the cheaper model."""
-    kwargs: dict = {
-        "model": settings.MODEL_CHAT,
-        "max_tokens": max_tokens,
-        "temperature": 0,
-        "system": system,
-        "messages": messages,
-    }
-    if tools:
-        kwargs["tools"] = tools
-    return client.messages.create(**kwargs)
+    provider = settings.LLM_PROVIDER
+
+    if provider == "gemini" and gemini_client:
+        from google.genai import types
+
+        # Build Gemini tools if provided
+        g_tools = None
+        if tools:
+            func_decls = []
+            for t in tools:
+                schema_props = {}
+                props = t.get("input_schema", {}).get("properties", {})
+                for p_name, p_info in props.items():
+                    t_type = "STRING"
+                    if p_info.get("type") == "boolean":
+                        t_type = "BOOLEAN"
+                    elif p_info.get("type") == "integer":
+                        t_type = "INTEGER"
+                    schema_props[p_name] = types.Schema(
+                        type=t_type,
+                        description=p_info.get("description", "")
+                    )
+                func_decls.append(types.FunctionDeclaration(
+                    name=t["name"],
+                    description=t.get("description", ""),
+                    parameters=types.Schema(type="OBJECT", properties=schema_props)
+                ))
+            g_tools = [types.Tool(function_declarations=func_decls)]
+
+        # Check if messages contains tool execution results from prior turn
+        prompt_text = ""
+        tool_results_text = ""
+        for m in messages:
+            role = m.get("role")
+            content = m.get("content")
+            if role == "user":
+                if isinstance(content, str):
+                    prompt_text = content
+                elif isinstance(content, list):
+                    for item in content:
+                        if isinstance(item, dict) and item.get("type") == "tool_result":
+                            tool_results_text += f"\nTool output: {item.get('content', '')}"
+
+        if tool_results_text:
+            combined_prompt = f"Tool Execution Output:\n{tool_results_text}\n\nOriginal Question: {prompt_text}\nProvide the final answer based on the tool output."
+            res = gemini_client.models.generate_content(
+                model=settings.MODEL_CHAT,
+                contents=combined_prompt,
+                config=types.GenerateContentConfig(
+                    system_instruction=system,
+                    temperature=0.0,
+                )
+            )
+        else:
+            res = gemini_client.models.generate_content(
+                model=settings.MODEL_CHAT,
+                contents=prompt_text,
+                config=types.GenerateContentConfig(
+                    tools=g_tools,
+                    system_instruction=system,
+                    temperature=0.0,
+                )
+            )
+
+        blocks = []
+        if getattr(res, "function_calls", None):
+            for fc in res.function_calls:
+                blocks.append(ContentBlock(
+                    type="tool_use",
+                    id=fc.name,
+                    name=fc.name,
+                    input=dict(fc.args or {})
+                ))
+        if getattr(res, "text", None):
+            blocks.append(ContentBlock(type="text", text=res.text))
+
+        return ChatResponse(content=blocks)
+
+    elif anthropic_client:
+        kwargs: dict = {
+            "model": settings.MODEL_CHAT,
+            "max_tokens": max_tokens,
+            "temperature": 0,
+            "system": system,
+            "messages": messages,
+        }
+        if tools:
+            kwargs["tools"] = tools
+        return anthropic_client.messages.create(**kwargs)
+    else:
+        raise RuntimeError("No configured LLM client available.")

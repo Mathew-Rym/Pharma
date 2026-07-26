@@ -1,0 +1,5 @@
+requests==2.32.3
+openpyxl==3.1.5
+# Only needed if [database] is configured after the probe identifies the engine:
+# pyodbc==5.2.0        # MSSQL / Access / any ODBC DSN
+# fdb==2.0.2           # Firebird

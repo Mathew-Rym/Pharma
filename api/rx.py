@@ -106,22 +106,15 @@ def receive_prescription(phone: str, storage_path: str) -> None:
          __import__("json").dumps(drugs), data.get("overall_confidence"), flags),
     )
 
-    # Build a draft order so the pharmacist reviews a priced basket, not raw text
-    order_id, avail, missing = _build_quote(cust["id"], rx["id"], drugs)
+    # v2: the PATIENT picks which items by number first, then a pharmacist verifies
+    # the basket they actually chose. Ordering is deliberate — verifying a basket the
+    # patient has already narrowed means the pharmacist checks one thing, not two.
+    #
+    # present_numbered_list -> approvals.handle_selection (creates the order, FEFO)
+    #   -> approvals.notify_pharmacist (forwards the image + asks for APPROVE <PIN>)
+    from approvals import present_numbered_list
 
-    set_state(phone, "rx_pending", {"order_id": str(order_id), "rx_id": str(rx["id"])})
-    lines = "\n".join(f"• {a['name']} — {a['qty_text']} — {kes(a['line_total'])}"
-                      for a in avail)
-    msg = ["*Prescription received.* Our pharmacist is checking it now."]
-    if lines:
-        msg.append("Available:\n" + lines)
-    if missing:
-        msg.append("Not in stock right now:\n" + "\n".join(f"• {m}" for m in missing))
-    msg.append("You will get a confirmed price in a few minutes. "
-               "Nothing is charged until you approve.")
-    send_text(phone, "\n\n".join(msg))
-
-    _notify_pharmacists(rx["id"], cust, drugs, flags)
+    present_numbered_list(phone, str(rx["id"]), drugs)
 
 
 def _build_quote(customer_id: str, rx_id: str, drugs: list[dict]):

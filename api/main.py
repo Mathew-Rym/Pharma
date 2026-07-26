@@ -22,7 +22,11 @@ logging.basicConfig(
 )
 log = logging.getLogger("dishii")
 
-app = FastAPI(title="Dishii Pharmacy API", version="0.1.0")
+app = FastAPI(title="Dishii Pharmacy API", version="0.2.0")
+
+from agent_api import router as agent_router  # noqa: E402
+
+app.include_router(agent_router)
 
 
 def _auth(secret: str | None) -> None:

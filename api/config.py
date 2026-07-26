@@ -1,6 +1,9 @@
 """Central config. Everything comes from environment variables — no secrets in git."""
 import os
 from functools import lru_cache
+from dotenv import load_dotenv
+
+load_dotenv()
 
 
 def _req(key: str) -> str:
@@ -21,10 +24,16 @@ class Settings:
     BUCKET_RX = os.getenv("BUCKET_RX", "prescriptions")
     BUCKET_DOCS = os.getenv("BUCKET_DOCS", "docs")
 
-    # --- anthropic ---
-    ANTHROPIC_API_KEY = _req("ANTHROPIC_API_KEY")
-    MODEL_VISION = os.getenv("MODEL_VISION", "claude-opus-5")     # expensive errors -> best model
-    MODEL_CHAT = os.getenv("MODEL_CHAT", "claude-sonnet-5")       # routing / drafting
+    # --- LLM credentials & models ---
+    GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+    ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
+    
+    if not GEMINI_API_KEY and not ANTHROPIC_API_KEY:
+        raise RuntimeError("Missing required env var: Either GEMINI_API_KEY or ANTHROPIC_API_KEY must be set.")
+
+    LLM_PROVIDER = os.getenv("LLM_PROVIDER", "gemini" if GEMINI_API_KEY else "anthropic")
+    MODEL_VISION = os.getenv("MODEL_VISION", "gemini-3.6-flash" if GEMINI_API_KEY else "claude-opus-5")
+    MODEL_CHAT = os.getenv("MODEL_CHAT", "gemini-3.6-flash" if GEMINI_API_KEY else "claude-sonnet-5")
 
     # --- whatsapp gateway ---
     WA_GATEWAY_URL = os.getenv("WA_GATEWAY_URL", "http://localhost:3000")

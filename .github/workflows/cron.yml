@@ -10,7 +10,9 @@ name: dishii-cron
 on:
   schedule:
     - cron: '0 4 * * *'      # 07:00 EAT daily  — expiry sweep
+    - cron: '3 4 * * *'      # 07:03 EAT daily  — forecast refresh (BEFORE reorder)
     - cron: '5 4 * * *'      # 07:05 EAT daily  — low stock / draft POs
+    - cron: '10 4 * * *'     # 07:10 EAT daily  — stock variance to the owner
     - cron: '0 17 * * *'     # 20:00 EAT daily  — evening digest
     - cron: '0 5 * * 1'      # 08:00 EAT Monday — weekly PDF
     - cron: '30 5 * * *'     # 08:30 EAT daily  — refill reminders
@@ -24,7 +26,9 @@ on:
         type: choice
         options:
           - expiry_sweep
+          - forecast_refresh
           - low_stock_check
+          - variance_report
           - daily_digest
           - weekly_report
           - refill_reminders
@@ -39,7 +43,9 @@ jobs:
         run: |
           case "${{ github.event.schedule }}" in
             "0 4 * * *")    echo "job=expiry_sweep"     >> $GITHUB_OUTPUT ;;
+            "3 4 * * *")    echo "job=forecast_refresh" >> $GITHUB_OUTPUT ;;
             "5 4 * * *")    echo "job=low_stock_check"  >> $GITHUB_OUTPUT ;;
+            "10 4 * * *")   echo "job=variance_report"  >> $GITHUB_OUTPUT ;;
             "0 17 * * *")   echo "job=daily_digest"     >> $GITHUB_OUTPUT ;;
             "0 5 * * 1")    echo "job=weekly_report"    >> $GITHUB_OUTPUT ;;
             "30 5 * * *")   echo "job=refill_reminders" >> $GITHUB_OUTPUT ;;

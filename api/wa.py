@@ -52,6 +52,26 @@ def send_document(phone: str, url: str, filename: str, caption: str = "") -> Non
         _log_out(phone, "document", filename, str(e))
 
 
+def send_image(phone: str, url: str, caption: str = "") -> None:
+    """Used to forward a prescription photo to the pharmacist's own phone, where
+    native pinch-zoom beats anything we would build in a dashboard."""
+    phone = norm_phone(phone)
+    if not phone:
+        return
+    try:
+        r = httpx.post(
+            f"{settings.WA_GATEWAY_URL}/send-image",
+            json={"to": phone, "url": url, "caption": caption},
+            headers=_HEADERS,
+            timeout=120,
+        )
+        r.raise_for_status()
+        _log_out(phone, "image", caption, None)
+    except Exception as e:
+        log.exception("send_image failed to %s", phone)
+        _log_out(phone, "image", caption, str(e))
+
+
 def broadcast(phones: list[str], body: str) -> None:
     """Deliberately sequential and unthrottled-by-design-choice.
 

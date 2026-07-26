@@ -18,7 +18,7 @@ from wa import send_text
 log = logging.getLogger(__name__)
 PID = settings.PHARMACY_ID
 
-STAFF_SYSTEM = """You are Dishii, the operations assistant for a Kenyan retail pharmacy.
+STAFF_SYSTEM = """You are Pharma OS, the operations assistant for a Kenyan retail pharmacy.
 You are talking to a staff member on WhatsApp.
 
 Use the provided tools to answer from live pharmacy data. Never invent stock figures,
@@ -140,7 +140,62 @@ def _handle_staff(phone: str, staff: dict, msg: dict, text: str) -> None:
         run_tool("generate_report_pdf", {"period": "week"}, phone)
         return
     if up in ("ORDER", "REORDER"):
-        send_text(phone, run_tool("get_reorder_suggestions", {}, phone))
+        from forecast import reorder_message
+        send_text(phone, reorder_message())
+        return
+
+    # --- approvals with a PIN (prescription, then purchase order)
+    from approvals import handle_pharmacist_reply, handle_po_reply
+    if handle_pharmacist_reply(phone, staff, text):
+        return
+    if handle_po_reply(phone, staff, text):
+        return
+
+    # --- draft purchase orders from the forecast
+    if up == "PO" or up.startswith("PO "):
+        from approvals import send_po_for_approval
+        from forecast import create_draft_pos
+        filt = text[3:].strip() or None
+        created = create_draft_pos(str(staff["id"]), filt)
+        if not created:
+            send_text(phone, "Nothing to order right now.")
+            return
+        for c in created:
+            send_po_for_approval(c["po_id"])
+        return
+
+    # --- talk to the agent on the pharmacy PC
+    if up in ("SYNC", "RESYNC", "SYNC NOW"):
+        from agent_api import queue_command
+        if queue_command("resync", reply_to=phone, requested_by=str(staff["id"])):
+            send_text(phone, "Asking the pharmacy PC to sync now. This takes up to a "
+                             "minute — I will message you when it is done.")
+        else:
+            send_text(phone, "No agent is installed on the pharmacy PC yet, so I can "
+                             "only see stock that Dishii itself received.")
+        return
+
+    if up in ("PC", "AGENT", "PC STATUS"):
+        from agent_api import agent_status
+        send_text(phone, agent_status())
+        return
+
+    if up == "PROBE":
+        from agent_api import queue_command
+        if queue_command("probe", reply_to=phone, requested_by=str(staff["id"])):
+            send_text(phone, "Scanning the pharmacy PC for the phAMACore database...")
+        else:
+            send_text(phone, "No agent installed yet.")
+        return
+
+    if up in ("VARIANCE", "RECON", "SHRINKAGE"):
+        from agent_api import reconciliation_summary
+        send_text(phone, reconciliation_summary())
+        return
+
+    if up.startswith("WHY "):
+        from forecast import forecast_explain
+        send_text(phone, forecast_explain(text[4:].strip()))
         return
 
     # --- everything else: let the model pick a tool
@@ -158,6 +213,11 @@ def _staff_help(role: str) -> str:
         "• *REPORT* — full PDF report\n"
         "• *who supplies prenor* — supplier contact\n"
         "• *do we have amoxil* — stock check\n"
+        "• *PO* — draft purchase orders from the forecast\n"
+        "• *WHY prenor* — why the system suggests ordering it\n"
+        "• *VARIANCE* — where the till and our stock disagree\n"
+        "• *SYNC* — pull fresh data from the pharmacy PC\n"
+        "• *PC* — is the pharmacy PC online\n"
         "Or just ask me in your own words."
     )
     return base
@@ -190,7 +250,21 @@ def _handle_customer(phone: str, msg: dict, text: str) -> None:
         rx.receive_prescription(phone, msg["media_path"])
         return
 
-    if up in ("CONFIRM", "PAY", "YES") and st["flow"] == "awaiting_confirm":
+    # A forwarded M-Pesa confirmation SMS beats every other interpretation. Checked
+    # before the keyword shortcuts because the SMS body contains words like "SENT"
+    # and "PAID" that would otherwise be read as commands.
+    from payments_sms import handle_forwarded_sms
+    if handle_forwarded_sms(phone, text):
+        return
+
+    # Patient is choosing items by number from their own prescription
+    if st["flow"] == "rx_select":
+        from approvals import handle_selection
+        handle_selection(phone, text)
+        return
+
+    if up in ("CONFIRM", "PAY", "YES") and st["flow"] in ("awaiting_confirm",
+                                                          "awaiting_payment"):
         rx.customer_confirm(phone)
         return
 

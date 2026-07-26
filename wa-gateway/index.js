@@ -180,6 +180,24 @@ app.post('/send', async (req, res) => {
   }
 });
 
+// Forwards a prescription image to the pharmacist's own phone. Their native
+// WhatsApp viewer has pinch-zoom, rotate and fullscreen — better than anything
+// we would build, and they can verify from the dispensing bench.
+app.post('/send-image', async (req, res) => {
+  const { to, url, caption } = req.body || {};
+  if (!ready) return res.status(503).json({ error: 'whatsapp not connected' });
+  try {
+    const resp = await fetch(url);
+    if (!resp.ok) throw new Error(`fetch ${resp.status}`);
+    const buffer = Buffer.from(await resp.arrayBuffer());
+    await sock.sendMessage(jid(to), { image: buffer, caption: caption || '' });
+    res.json({ ok: true });
+  } catch (e) {
+    log.error({ err: e.message, to }, 'send-image failed');
+    res.status(500).json({ error: e.message });
+  }
+});
+
 app.post('/send-document', async (req, res) => {
   const { to, url, filename, caption } = req.body || {};
   if (!ready) return res.status(503).json({ error: 'whatsapp not connected' });

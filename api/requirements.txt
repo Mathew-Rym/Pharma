@@ -4,6 +4,11 @@ python-multipart==0.0.20
 httpx==0.28.1
 psycopg[binary,pool]==3.2.3
 supabase==2.11.0
+# BOTH providers are installed on purpose. api/llm.py picks one at runtime from
+# LLM_PROVIDER / whichever key is set, and its client init is wrapped in a
+# try/except that only logs. Omit either package and the image builds green, then
+# every LLM call raises "No configured LLM client available." at runtime.
+google-genai==2.14.0
 anthropic==0.42.0
 fpdf2==2.8.2
 matplotlib==3.10.0

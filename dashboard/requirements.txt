@@ -3,7 +3,17 @@ pandas==2.2.3
 psycopg[binary]==3.2.3
 supabase==2.11.0
 httpx==0.28.1
-anthropic==0.42.0
+python-dotenv==1.0.1
 fpdf2==2.8.2
 matplotlib==3.10.0
 qrcode[pil]==8.0
+
+# The dashboard imports api/ modules at runtime (rx.pharmacist_approve,
+# grn.approve, wa.send_text) so that mutations go through business logic instead
+# of raw UPDATEs. That pulls in api/config.py, which raises at import unless ALL
+# of these are present in the dashboard's environment too:
+#   DATABASE_URL, SUPABASE_URL, SUPABASE_SERVICE_KEY, SHARED_SECRET, PHARMACY_ID,
+#   DASHBOARD_PASSWORD, and one of GEMINI_API_KEY / ANTHROPIC_API_KEY
+# The LLM key is only needed to satisfy that import check — the dashboard never
+# calls a model, so no provider SDK is listed here.
+

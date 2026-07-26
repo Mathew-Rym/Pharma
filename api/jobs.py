@@ -290,8 +290,36 @@ def reconcile() -> dict:
     return _run("reconcile", _go)
 
 
+def forecast_refresh() -> dict:
+    """Rebuild the seasonal demand baseline. Runs before the reorder digest so the
+    numbers the owner sees at 07:06 were computed minutes earlier, not yesterday."""
+    def _go():
+        from forecast import recompute_all
+        return recompute_all()
+    return _run("forecast_refresh", _go)
+
+
+def variance_report() -> dict:
+    """Received-minus-sold vs what the till says is on the shelf. The gap is
+    miscounts, unrecorded sales and shrinkage — the number an owner acts on."""
+    def _go():
+        from agent_api import reconciliation_summary
+        rows = q("""select count(*) as n, coalesce(sum(abs(variance_value)),0) as v
+                      from stock_reconciliation
+                     where pharmacy_id=%s and status='open' and variance <> 0""", (PID,))
+        if not rows or rows[0]["n"] == 0:
+            return {"variances": 0}
+        summary = reconciliation_summary()
+        for s in _staff(("owner",)):
+            send_text(s["phone"], summary)
+        return {"variances": rows[0]["n"], "value": float(rows[0]["v"])}
+    return _run("variance_report", _go)
+
+
 JOBS = {
     "expiry_sweep": expiry_sweep,
+    "forecast_refresh": forecast_refresh,
+    "variance_report": variance_report,
     "low_stock_check": low_stock_check,
     "daily_digest": daily_digest,
     "weekly_report": weekly_report,
