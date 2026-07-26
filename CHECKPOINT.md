@@ -184,6 +184,91 @@ Steps 3–4 of the Saturday plan need the real world: Flow A end-to-end on the M
 invoice, then set PINs and populate `duty_roster` from the dashboard. Nothing is
 committed to git yet — the whole v2 body of work is still uncommitted.
 
+## Session 2 — GOWA, onboarding, PO documents, physical count
+
+### Reconciling four external design reviews on "add vision counting to Loop A"
+
+All four (Gemini, Kimi, ChatGPT, DeepSeek) independently reached the same correct
+conclusion: **Loop A trusted the invoice for quantity and never verified what
+physically arrived.** That was right and is now fixed.
+
+Where they were wrong, and it matters:
+
+1. **They proposed columns and tables that already existed.** Suggestions included
+   `invoice_qty`, `actual_received_qty`, `staff_confirmed_count`, `physical_count`,
+   plus new tables (`Delivery`, `DeliveryImages`, `VisionDetection`,
+   `VisionVerification`, `ReceivingSession`). But v1 already shipped
+   `grn_lines.qty_invoiced_pieces`, `grn_lines.qty_counted_pieces` ("what staff
+   physically counted"), a `short_delivery` flag, `grns.discrepancy_note`, and an
+   `approve()` that already prefers counted over invoiced and records the difference.
+   Staff could already correct a count by replying `5:2W`. `grns` already IS the
+   receiving session — it holds images, raw_extract, approved_by, approved_at.
+   Adding parallel columns would have created two sources of truth for the same
+   number. The real gap was far smaller: **nobody was asked to count, and nothing
+   pre-filled it.**
+
+2. **All four proposed per-line photos.** An 18-line invoice would mean 18 photos.
+   Vivian will not do that, and a feature nobody uses is worse than none. Built as
+   one photo (or several) of the whole delivery, with the invoice lines passed into
+   the model as a reference manifest — which is also more accurate, because "how many
+   AMOXIL 500MG 21S can you see" is a far easier question than "count the boxes" when
+   every box is small white cardboard.
+
+3. **None of them separated packs from pieces.** Vision cannot see 100 tablets inside
+   a sealed carton; it counts cartons. Storing a piece count from vision would have
+   repeated the exact 30x understatement that `2W0P` read as 2 pieces already caused
+   in Loop B. `vision_packs`/`vision_loose` are stored, and pieces are derived with
+   `pack_size` in the one place that conversion already lives.
+
+4. **DeepSeek's `staff_confirmed_count int not null`** would fail on an existing table
+   with rows, and would force a human count on every line before anything could be
+   received.
+
+The one addition worth keeping from them was ChatGPT's insistence on confidence and
+never silently trusting an uncertain output. That is implemented, and testing improved
+it: confidence alone was not enough. A model can be 100% confident it sees 3 packs
+while 3 more sit out of frame. `fully_visible` is now a separate flag, and anything
+not fully visible is asked about rather than declared short — a few false shortages
+would teach staff to ignore every count warning, which is worse than not counting.
+
+### The ledger boundary, which is the whole design
+
+`apply_vision_count()` writes `vision_*` columns ONLY. It never writes
+`qty_counted_pieces`, because that column means *a human stands behind this number*.
+So `approve()` still receives the invoice quantity until a person confirms otherwise
+with the existing `5:2W` reply. The machine can flag a discrepancy; it can never
+silently change what enters stock. Locked in by
+`test_machine_count_never_becomes_ledger_truth`.
+
+`SKIP` always works. A 40-line delivery at closing time, a flat battery or a model
+outage must never stop stock being received.
+
+### Verified against a real model
+
+Rendered a synthetic delivery photo with known ground truth (5 AMOXIL packs, 3
+PANADOL) against an invoice claiming 5 and 6. Result: AMOXIL 5 packs confidence 1.0
+variance 0; PANADOL 3 packs, −72 pieces (3 packs × 24) flagged, `pieces_to_receive`
+still the invoice figure until `2:3W` confirmed it, after which the ledger used 72.
+
+The first run counted PANADOL as 2 and said *"second pack is partially cropped at the
+right edge"* — the model was right and the test image was wrong (8 boxes at 150px on a
+1000px canvas). That is what prompted the `fully_visible` change.
+
+### Also this session
+
+- **GOWA** replaces Baileys as the transport, chosen for multi-device (one server, one
+  WhatsApp account per pharmacy). `wa-gowa/docker-compose.yml`. `WA_BACKEND` selects.
+- **Onboarding** (`dashboard/onboarding.py`): the dashboard used to `st.stop()` with
+  "add staff rows first", which was unenterable. No per-user passwords by request —
+  `staff.phone` is the WhatsApp whitelist, so the number IS the credential.
+- **PO PDF on letterhead**, sent to the distributor on approval. Withholds
+  `po_lines.rationale` and sell prices — that is the pharmacy's negotiating position.
+- **`build_report_pdf` was broken and nobody knew.** fpdf2's core Helvetica is
+  latin-1 only and the title had an en-dash, so `report for july` raised instead of
+  returning a PDF. That is Friday demo step 5. Fixed at the layer with a
+  `normalize_text` override so no future string can abort a document.
+- **Manual upload** for invoice and phAMACore export, reusing the same pipelines.
+
 ## Not done, deliberately
 
 - `MPESA_CONSUMER_KEY` / `MPESA_CONSUMER_SECRET` are empty in `.env`, so STK push

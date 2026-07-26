@@ -8,8 +8,8 @@ import uuid
 from datetime import date, timedelta
 
 from config import settings
-from db import apply_movement, download, ex1, q, q1, tx
-from llm import extract_invoice
+from db import apply_movement, download, ex, ex1, q, q1, tx
+from llm import count_delivery, extract_invoice
 from state import clear_state, get_state, set_state
 from utils import from_pieces, kes, parse_date_loose, parse_expiry, parse_wp, to_pieces
 from wa import send_text
@@ -71,8 +71,171 @@ def process_pages(phone: str, staff: dict) -> None:
         clear_state(phone)
         return
 
+    # ---- physical verification gate -------------------------------------------
+    # The invoice tells us what the supplier BILLED. It does not tell us what arrived.
+    # Ask for the goods before showing the approve prompt, because once staff see a
+    # tidy summary with an OK button they will press it.
+    ex1("update grns set status='awaiting_count' where id=%s returning id", (grn_id,))
+    set_state(phone, "grn_goods", {"grn_id": grn_id, "goods": []})
+    n = len(q("select 1 from grn_lines where grn_id=%s", (grn_id,)))
+    send_text(phone,
+              f"Read {n} line(s) from invoice {data.get('invoice_no') or '—'}.\n\n"
+              f"📦 *Now photograph the goods.*\n"
+              f"Lay the packs out so they are all visible — flat on the counter beats a "
+              f"stack, because I can only count what I can see. Send more than one photo "
+              f"if it does not fit in the frame.\n\n"
+              f"Reply *SKIP* to receive on the invoice quantities without counting.")
+
+
+def add_goods_photo(phone: str, storage_path: str) -> None:
+    """Collect photos of the delivered goods (state grn_goods)."""
+    st = get_state(phone)
+    goods = st["context"].get("goods", []) if st["flow"] == "grn_goods" else []
+    goods.append(storage_path)
+    set_state(phone, "grn_goods",
+              {"grn_id": st["context"].get("grn_id"), "goods": goods})
+    send_text(phone, f"Goods photo {len(goods)} received. Send more, or reply *COUNT* "
+                     f"to count them.")
+
+
+def handle_goods_reply(phone: str, staff: dict, text: str) -> bool:
+    """Returns True if consumed. SKIP must always work, or receiving can be blocked."""
+    st = get_state(phone)
+    if st["flow"] != "grn_goods":
+        return False
+    grn_id = st["context"].get("grn_id")
+    goods = st["context"].get("goods", [])
+    up = text.strip().upper()
+
+    if up in ("CANCEL", "STOP"):
+        ex1("update grns set status='rejected' where id=%s returning id", (grn_id,))
+        clear_state(phone)
+        send_text(phone, "Discarded. No stock was changed.")
+        return True
+
+    if up == "SKIP":
+        # Deliberate escape hatch. A 40-line delivery at 6pm, a flat battery, or a
+        # model outage must never stop stock being received — that is the one failure
+        # the pharmacy cannot absorb. approve() then falls back to invoice quantities,
+        # exactly as it did before this gate existed.
+        _to_review(phone, grn_id,
+                   "Receiving on invoice quantities — goods were not counted.")
+        return True
+
+    if up in ("COUNT", "DONE", "OK") and goods:
+        send_text(phone, f"Counting {len(goods)} photo(s)…")
+        try:
+            note = apply_vision_count(grn_id, goods)
+        except Exception as e:
+            log.exception("vision count failed")
+            note = (f"Could not count the photos ({type(e).__name__}). "
+                    f"Check the quantities by hand below.")
+        _to_review(phone, grn_id, note)
+        return True
+
+    if up in ("COUNT", "DONE", "OK"):
+        send_text(phone, "Send a photo of the goods first, or reply *SKIP* to receive "
+                         "on the invoice quantities.")
+        return True
+
+    return False
+
+
+def _to_review(phone: str, grn_id: str, note: str) -> None:
+    ex1("update grns set status='needs_review' where id=%s returning id", (grn_id,))
     set_state(phone, "grn_review", {"grn_id": grn_id})
-    send_text(phone, render_summary(grn_id))
+    send_text(phone, note + "\n\n" + render_summary(grn_id))
+
+
+def apply_vision_count(grn_id: str, goods_paths: list[str]) -> str:
+    """Count the goods photos and record the machine's opinion. Returns a summary.
+
+    Writes vision_* columns only. It does NOT write qty_counted_pieces: that column
+    means a human stands behind the number, and nothing here has been seen by a human
+    yet. approve() therefore still receives invoice quantities unless someone confirms
+    a different count — the machine can flag a discrepancy, never silently change what
+    enters the ledger.
+    """
+    lines = q("""select l.line_no, l.raw_description, l.qty_invoiced_pieces,
+                        coalesce(p.pack_size,1) as pack_size
+                   from grn_lines l left join products p on p.id = l.product_id
+                  where l.grn_id=%s order by l.line_no""", (grn_id,))
+    if not lines:
+        return "No lines to count."
+
+    images = [download(settings.BUCKET_INVOICES, p) for p in goods_paths]
+    result = count_delivery(images, [dict(l) for l in lines])
+
+    ex("update grns set goods_images=%s where id=%s",
+       (__import__("json").dumps(goods_paths), grn_id))
+
+    by_line = {int(i["line_no"]): i for i in (result.get("items") or [])
+               if i.get("line_no") is not None}
+    agreed, mismatched, unsure = 0, [], []
+
+    for l in lines:
+        item = by_line.get(l["line_no"])
+        if not item:
+            continue
+        packs = int(item.get("packs") or 0)
+        loose = int(item.get("loose") or 0)
+        conf = float(item.get("confidence") or 0)
+        ex("""update grn_lines set vision_packs=%s, vision_loose=%s,
+                  vision_confidence=%s, vision_note=%s
+                where grn_id=%s and line_no=%s""",
+           (packs, loose, round(conf, 3), (item.get("note") or "")[:300] or None,
+            grn_id, l["line_no"]))
+
+        seen = packs * int(l["pack_size"] or 1) + loose
+        invoiced = int(l["qty_invoiced_pieces"] or 0)
+        # `fully_visible` matters more than confidence, and they are different things.
+        # A model can be perfectly confident it sees 2 packs while 3 more sit out of
+        # frame. Reporting that as "invoice says 6, I count 2" is a false shortage --
+        # and a few of those teach staff to ignore every count warning, which costs
+        # more than never counting at all. Default to False when the key is absent so
+        # an older/looser model response degrades to "check by hand".
+        fully_visible = bool(item.get("fully_visible", False))
+        if conf < 0.75 or not fully_visible:
+            unsure.append((l, item))
+        elif seen != invoiced:
+            mismatched.append((l, item, seen, invoiced))
+            _add_flag(grn_id, l["line_no"], "count_mismatch")
+        else:
+            agreed += 1
+
+    parts = []
+    if result.get("photo_quality"):
+        parts.append(f"⚠️ Photo {result['photo_quality']} — counts below are unreliable.")
+    if agreed:
+        parts.append(f"✅ {agreed} line(s) match the invoice.")
+    if mismatched:
+        parts.append("⚠️ *Counts that do not match the invoice:*\n" + "\n".join(
+            f"{l['line_no']}. {(l['raw_description'] or '')[:34]} — invoice "
+            f"{from_pieces(inv, l['pack_size'])}, I count "
+            f"{from_pieces(seen, l['pack_size'])}"
+            + (f" ({item['note']})" if item.get("note") else "")
+            for l, item, seen, inv in mismatched))
+    if unsure:
+        parts.append("🔍 *Could not count confidently* (check these by hand):\n"
+                     + "\n".join(
+                         f"{l['line_no']}. {(l['raw_description'] or '')[:34]}"
+                         + (f" — {item['note']}" if item.get("note") else "")
+                         for l, item in unsure))
+    if result.get("unlisted_items_seen"):
+        parts.append(f"❓ {result['unlisted_items_seen']} product(s) in the photo are "
+                     f"not on this invoice.")
+    if mismatched or unsure:
+        parts.append("_Correct a count with_ *line:packs* _— e.g._ *5:2W* _for 2 packs, "
+                     "or_ *5:2W5P* _for 2 packs and 5 loose. The invoice figure is used "
+                     "for any line you do not correct._")
+    return "\n\n".join(parts) or "Counted, nothing to flag."
+
+
+def _add_flag(grn_id: str, line_no: int, flag: str) -> None:
+    ex("""update grn_lines
+             set flags = (select array_agg(distinct f)
+                            from unnest(flags || array[%s]::text[]) f)
+           where grn_id=%s and line_no=%s""", (flag, grn_id, line_no))
 
 
 def persist_from_paths(pages: list[str], staff: dict) -> str | None:
@@ -240,7 +403,29 @@ def render_summary(grn_id: str) -> str:
             short.append(f"{l['line_no']}. {l['raw_description']} — expires "
                          f"{l['expiry_date'].strftime('%b %Y')}")
 
+    # Physical count disagreements survive a re-render of the summary, so they cannot
+    # scroll out of the chat and be forgotten before someone presses OK.
+    counts = []
+    for l in lines:
+        if l.get("qty_counted_pieces") is not None and \
+           l["qty_counted_pieces"] != l["qty_invoiced_pieces"]:
+            counts.append(
+                f"{l['line_no']}. {l['product_name'] or l['raw_description']} — invoice "
+                f"{from_pieces(l['qty_invoiced_pieces'] or 0, l['pack_size'])}, "
+                f"receiving {from_pieces(l['qty_counted_pieces'], l['pack_size'])} "
+                f"(your count)")
+        elif "count_mismatch" in set(l["flags"] or []) and l.get("vision_packs") is not None:
+            seen = (l["vision_packs"] * (l["pack_size"] or 1)
+                    + (l["vision_loose"] or 0))
+            counts.append(
+                f"{l['line_no']}. {l['product_name'] or l['raw_description']} — invoice "
+                f"{from_pieces(l['qty_invoiced_pieces'] or 0, l['pack_size'])}, "
+                f"I counted {from_pieces(seen, l['pack_size'])} "
+                f"— *unconfirmed*, receiving the invoice figure")
+
     parts = [head, totals]
+    if counts:
+        parts.append("📦 *Physical count:*\n" + "\n".join(counts[:8]))
     if short:
         parts.append("🔶 *Short-dated — refuse or negotiate now:*\n" + "\n".join(short[:6]))
     if problems:

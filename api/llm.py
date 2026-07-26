@@ -207,6 +207,78 @@ def extract_invoice(images: list[bytes], media_types: list[str] | None = None) -
     )
 
 
+COUNT_SYSTEM = """You count pharmaceutical stock in photographs of a delivery.
+
+Return ONLY a single JSON object. No prose, no markdown fences.
+
+You are given the lines of a supplier invoice, and one or more photos of the goods
+that arrived. Your job is to say how many of each invoiced item you can SEE.
+
+COUNT SEALED PACKS / BOXES / CARTONS. Do not attempt to count individual tablets,
+capsules or blisters inside a sealed pack — you cannot see them, and guessing is worse
+than saying you are unsure. If loose single units are visible outside a pack, count
+those separately as "loose".
+
+Rules that matter more than being helpful:
+- Only count items that appear on the invoice line list you were given. Ignore shelves,
+  fixtures, other stock, hands, and the counter.
+- If items are stacked so you cannot see the back or bottom of a pile, you are seeing
+  a SUBSET. Say so in "note" and lower "confidence". Do NOT extrapolate a total from
+  a visible face.
+- If you cannot find an invoiced item in any photo at all, return it with packs 0 and
+  note "not visible in photo". That is different from "zero were delivered", and the
+  pharmacist will decide which it is.
+- If a pack looks crushed, wet, torn or opened, say so in "note".
+- confidence is your own honesty about the count: 1.0 only when every unit of that
+  item is individually and unambiguously visible.
+- fully_visible is a SEPARATE judgement from confidence, and the more important one.
+  Set it false whenever anything could be outside the frame, behind another pack, cut
+  off at an edge, or under a pile. "I can clearly see 2 packs and there may be more"
+  is confidence 1.0 with fully_visible false.
+
+Schema:
+{
+  "items": [
+    {
+      "line_no": integer,        // the invoice line you are counting
+      "packs": integer,          // whole sealed packs/boxes you can see
+      "loose": integer,          // loose single units outside a pack, else 0
+      "confidence": number,      // 0.0-1.0, how sure you are of what you counted
+      "fully_visible": boolean,  // false if any unit could be hidden or out of frame
+      "note": string|null        // "3 boxes behind the front row are partially hidden"
+    }
+  ],
+  "photo_quality": string|null,   // "blurry", "too dark", "glare on labels", or null
+  "unlisted_items_seen": integer  // how many distinct products you saw that are NOT
+                                  // on the invoice, 0 if none
+}"""
+
+
+def count_delivery(images: list[bytes], lines: list[dict],
+                   media_types: list[str] | None = None) -> dict:
+    """Count the physical goods against the invoice lines.
+
+    The invoice lines are passed IN as a reference list on purpose. Asking "how many
+    boxes are in this photo" of a mixed pharmaceutical delivery is hopeless — the boxes
+    are all small white cardboard with small print. Asking "how many AMOXIL 500MG 21S
+    can you see, and how many PANADOL 500MG 24S" is a far easier and more accurate
+    question, and it lets the model return an answer already keyed to line_no.
+    """
+    manifest = "\n".join(
+        f"line {l.get('line_no')}: {l.get('raw_description') or l.get('description')}"
+        + (f" (pack of {l['pack_size']})" if l.get("pack_size") else "")
+        + (f" — invoice says {l['qty_invoiced_pieces']} pieces"
+           if l.get("qty_invoiced_pieces") else "")
+        for l in lines
+    )
+    return vision_json(
+        COUNT_SYSTEM, images,
+        "Count how many of each of these invoiced items you can see in the photo(s).\n\n"
+        f"INVOICE LINES:\n{manifest}",
+        media_types,
+    )
+
+
 def extract_prescription(images: list[bytes], media_types: list[str] | None = None) -> dict:
     return vision_json(
         RX_SYSTEM, images,

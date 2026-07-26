@@ -96,9 +96,16 @@ def _handle_staff(phone: str, staff: dict, msg: dict, text: str) -> None:
     st = get_state(phone)
     up = text.upper()
 
-    # --- images always mean "receiving a delivery" for staff
+    # --- images always mean "receiving a delivery" for staff.
+    # Which KIND of photo depends on where we are: mid-receiving, after the invoice has
+    # been read, a photo is the goods being counted rather than another invoice page.
+    # Getting this order wrong would file a photo of the delivery as invoice page 3 and
+    # send it to the extractor.
     if msg.get("type") == "image" and msg.get("media_path"):
-        grn.add_page(phone, msg["media_path"])
+        if st["flow"] == "grn_goods":
+            grn.add_goods_photo(phone, msg["media_path"])
+        else:
+            grn.add_page(phone, msg["media_path"])
         return
 
     if up == "HELP":
@@ -117,6 +124,14 @@ def _handle_staff(phone: str, staff: dict, msg: dict, text: str) -> None:
         else:
             send_text(phone, "Send the next invoice page, or reply *DONE* to process "
                              "what you have sent, or *CANCEL*.")
+        return
+
+    if st["flow"] == "grn_goods":
+        if grn.handle_goods_reply(phone, staff, text):
+            return
+        send_text(phone, "Send a photo of the delivered goods, reply *COUNT* when you "
+                         "have sent them all, or *SKIP* to receive on the invoice "
+                         "quantities.")
         return
 
     if st["flow"] == "grn_review":
