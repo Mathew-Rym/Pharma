@@ -1,0 +1,70 @@
+# GOWA — go-whatsapp-web-multidevice — as Dishii's WhatsApp transport.
+#
+# WHY THIS AND NOT wa-gateway/: GOWA is multi-device, so ONE server holds a separate
+# WhatsApp account per pharmacy (scoped by X-Device-Id). wa-gateway/ is one device per
+# server, which does not survive pharmacy number two. It also handles media, PDFs and
+# webhook HMAC already, so we delete code rather than write it.
+#
+# It is TRANSPORT ONLY. No business logic goes in here, ever — same rule that kept
+# wa-gateway/ swappable is what made this swap a config change.
+#
+#   docker compose -f wa-gowa/docker-compose.yml up -d
+#   docker compose -f wa-gowa/docker-compose.yml logs -f      # watch for the QR
+#
+# Then open http://localhost:3001 and scan the QR with the pharmacy's WhatsApp SIM.
+# The session lives in the `gowa-storage` volume — delete it and you re-scan.
+
+services:
+  gowa:
+    image: aldinokemal2104/go-whatsapp-web-multidevice:latest
+    container_name: dishii-gowa
+    restart: unless-stopped
+    command: rest
+    ports:
+      # 3001 on purpose: wa-gateway/ already uses 3000, so both can coexist while
+      # you compare them.
+      - "3001:3000"
+    environment:
+      APP_PORT: 3000
+      APP_DEBUG: "false"
+      # Shows as the linked-device name on the pharmacy's phone. Make it recognisable
+      # so nobody unlinks it wondering what it is.
+      APP_OS: Dishii
+      # Protects /send/* and /statics/*. MUST match GOWA_USER / GOWA_PASS in ../.env.
+      APP_BASIC_AUTH: "${GOWA_USER:-dishii}:${GOWA_PASS:?set GOWA_PASS in .env}"
+
+      # --- where inbound messages go ---
+      # host.docker.internal reaches the API running on your laptop. On Linux this
+      # works via the extra_hosts entry below. In production point it at the deployed
+      # API instead.
+      WHATSAPP_WEBHOOK: "${GOWA_WEBHOOK_URL:-http://host.docker.internal:8000/webhook/gowa}"
+      # MUST match GOWA_WEBHOOK_SECRET in ../.env. GOWA's default is the literal
+      # string "secret" — leaving it there means anyone who can reach the webhook can
+      # forge a staff message and move stock.
+      WHATSAPP_WEBHOOK_SECRET: "${GOWA_WEBHOOK_SECRET:?set GOWA_WEBHOOK_SECRET in .env}"
+      # We only care about messages. Read receipts and typing indicators would be
+      # thousands of pointless POSTs a day.
+      WHATSAPP_WEBHOOK_EVENTS: "message"
+      # Drop group traffic at the source as well as in the API, so a group the number
+      # gets added to cannot drive the pharmacy.
+      WHATSAPP_WEBHOOK_IGNORE_JIDS: "@g.us"
+
+      # --- behaviour ---
+      # ON: media arrives as a path under /statics that we fetch. Off would hand us a
+      # URL we cannot authenticate against. wa.gowa_fetch_media() expects this on.
+      WHATSAPP_AUTO_DOWNLOAD_MEDIA: "true"
+      # Leave 'unavailable' so the pharmacy's phone keeps notifying its owner. Setting
+      # 'available' marks the account online and silences their handset.
+      WHATSAPP_PRESENCE_ON_CONNECT: unavailable
+      WHATSAPP_AUTO_MARK_READ: "true"
+      WHATSAPP_AUTO_REJECT_CALL: "true"
+      WHATSAPP_ACCOUNT_VALIDATION: "true"
+    volumes:
+      # The WhatsApp session AND downloaded media. Losing it means re-pairing and
+      # losing any inbound photo not yet pulled into Supabase.
+      - gowa-storage:/app/storages
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+volumes:
+  gowa-storage:

@@ -3,6 +3,9 @@
 The webhook returns 200 immediately and does the real work in a background task.
 Baileys will time out and re-deliver if you make it wait for a 30-second vision call.
 """
+import hashlib
+import hmac
+import json
 import logging
 import uuid
 from datetime import datetime
@@ -95,6 +98,107 @@ async def webhook_media(background: BackgroundTasks,
         "media_path": path,
     })
     return {"ok": True, "path": path}
+
+
+# ============================================================ GOWA webhook
+def _gowa_media_path(payload: dict) -> tuple[str, str] | None:
+    """Return (kind, relative_path) for the first media field GOWA sent, else None.
+
+    GOWA's shape is version-dependent and documented as such: with auto-download on
+    and no caption, `image` is a bare path string; with a caption it becomes
+    {"path": ..., "caption": ...}; with auto-download off it is {"url": ...}. Handle
+    all three rather than assuming one.
+    """
+    for kind in ("image", "document", "video", "audio", "sticker"):
+        v = payload.get(kind)
+        if not v:
+            continue
+        if isinstance(v, str):
+            return kind, v
+        if isinstance(v, dict):
+            p = v.get("path") or v.get("url")
+            if p:
+                return kind, p
+    return None
+
+
+@app.post("/webhook/gowa")
+async def webhook_gowa(request: Request, background: BackgroundTasks,
+                       x_hub_signature_256: str | None = Header(None)):
+    """Inbound from go-whatsapp-web-multidevice.
+
+    Translates GOWA's envelope into the one shape router.handle_inbound already
+    understands, so adding this transport touches no business logic.
+    """
+    raw = await request.body()
+
+    # HMAC-SHA256 over the raw body. GOWA's own default secret is the literal
+    # "secret", so a missing/incorrect WHATSAPP_WEBHOOK_SECRET is a real exposure:
+    # anyone who can reach this URL could inject a staff message and move stock.
+    expected = hmac.new(settings.GOWA_WEBHOOK_SECRET.encode(), raw,
+                        hashlib.sha256).hexdigest()
+    got = (x_hub_signature_256 or "").replace("sha256=", "").strip()
+    if not got or not hmac.compare_digest(expected, got):
+        log.warning("gowa webhook rejected: bad signature")
+        raise HTTPException(status_code=401, detail="bad signature")
+
+    body = json.loads(raw or b"{}")
+    if body.get("event") != "message":
+        return {"ok": True, "ignored": body.get("event")}
+
+    payload = body.get("payload") or {}
+    if payload.get("is_from_me"):
+        return {"ok": True, "ignored": "own message"}
+
+    chat_id = str(payload.get("chat_id") or "")
+    if chat_id.endswith("@g.us"):
+        # Group traffic would let any member of any group drive the pharmacy.
+        return {"ok": True, "ignored": "group"}
+
+    phone = norm_phone(payload.get("from") or chat_id)
+    if not phone:
+        return {"ok": True, "ignored": "no sender"}
+
+    inbound = {
+        "wa_id": payload.get("id") or f"gowa-{uuid.uuid4().hex[:12]}",
+        "from": phone,
+        "type": "text",
+        "text": payload.get("body") or payload.get("caption") or "",
+    }
+
+    media = _gowa_media_path(payload)
+    if media:
+        kind, rel = media
+        from wa import gowa_fetch_media
+        data = (gowa_fetch_media(rel) if not str(rel).startswith("http")
+                else None)
+        if data is None and str(rel).startswith("http"):
+            try:
+                import httpx
+                data = httpx.get(rel, timeout=120).content
+            except Exception:
+                log.exception("could not fetch remote media %s", rel)
+        if data:
+            staff = q1("""select id from staff where phone=%s and pharmacy_id=%s
+                           and is_active""", (phone, settings.PHARMACY_ID))
+            bucket = settings.BUCKET_INVOICES if staff else settings.BUCKET_RX
+            ext = str(rel).rsplit(".", 1)[-1].lower().split("?")[0]
+            if ext not in ("jpg", "jpeg", "png", "webp", "pdf"):
+                ext = "jpg"
+            path = f"{datetime.utcnow():%Y/%m}/{phone}/{uuid.uuid4().hex[:10]}.{ext}"
+            upload(bucket, path, data,
+                   "application/pdf" if ext == "pdf" else "image/jpeg")
+            log.info("gowa media stored bucket=%s path=%s bytes=%s",
+                     bucket, path, len(data))
+            inbound.update({"type": "image", "media_bucket": bucket,
+                            "media_path": path})
+        else:
+            log.warning("gowa media %s could not be retrieved; treating as text", rel)
+
+    log.info("gowa inbound from=%s type=%s device=%s",
+             phone, inbound["type"], body.get("device_id"))
+    background.add_task(handle_inbound, inbound)
+    return {"ok": True}
 
 
 # ============================================================ M-Pesa

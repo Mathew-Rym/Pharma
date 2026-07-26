@@ -75,6 +75,21 @@ def process_pages(phone: str, staff: dict) -> None:
     send_text(phone, render_summary(grn_id))
 
 
+def persist_from_paths(pages: list[str], staff: dict) -> str | None:
+    """Extract + persist from already-uploaded pages, with no WhatsApp involved.
+
+    The dashboard's manual-upload fallback needs the SAME pipeline as the photo path,
+    not a parallel one — a second extraction path would drift and you would end up
+    with invoices that receive correctly over WhatsApp but not from the desk. Returns
+    the GRN id for review, or None if it did not look like an invoice.
+    """
+    if not pages:
+        return None
+    images = [download(settings.BUCKET_INVOICES, p) for p in pages]
+    data = extract_invoice(images)
+    return _persist(data, pages, staff)
+
+
 def _persist(data: dict, pages: list[str], staff: dict) -> str | None:
     lines = data.get("lines") or []
     if not lines:

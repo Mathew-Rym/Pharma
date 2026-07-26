@@ -35,9 +35,27 @@ class Settings:
     MODEL_VISION = os.getenv("MODEL_VISION", "gemini-3.6-flash" if GEMINI_API_KEY else "claude-opus-5")
     MODEL_CHAT = os.getenv("MODEL_CHAT", "gemini-3.6-flash" if GEMINI_API_KEY else "claude-sonnet-5")
 
-    # --- whatsapp gateway ---
+    # --- whatsapp transport ---
+    # 'gowa'    = go-whatsapp-web-multidevice (github.com/aldinokemal). Multi-device,
+    #             so one server can hold a separate WhatsApp account per pharmacy.
+    # 'baileys' = the original wa-gateway/ node service. Single device.
+    # Only wa.py and main.py's webhook know the difference; no business logic moves.
+    WA_BACKEND = os.getenv("WA_BACKEND", "baileys").lower()
     WA_GATEWAY_URL = os.getenv("WA_GATEWAY_URL", "http://localhost:3000")
     SHARED_SECRET = _req("SHARED_SECRET")   # gateway <-> api, and cron <-> api
+
+    # --- GOWA (used when WA_BACKEND=gowa) ---
+    GOWA_URL = os.getenv("GOWA_URL", "http://localhost:3000")
+    GOWA_USER = os.getenv("GOWA_USER", "")          # from APP_BASIC_AUTH=user:pass
+    GOWA_PASS = os.getenv("GOWA_PASS", "")
+    # JID of the device to send AS, e.g. 254712345678@s.whatsapp.net. Optional while
+    # only one device is registered; REQUIRED once a second pharmacy is added, or
+    # GOWA cannot tell which account should send.
+    GOWA_DEVICE_ID = os.getenv("GOWA_DEVICE_ID", "")
+    # GOWA signs webhooks with HMAC-SHA256 in X-Hub-Signature-256. Its own default
+    # secret is the literal string "secret", so set WHATSAPP_WEBHOOK_SECRET on the
+    # GOWA side and mirror it here.
+    GOWA_WEBHOOK_SECRET = os.getenv("GOWA_WEBHOOK_SECRET", "secret")
 
     # --- tenant (single pharmacy for the pilot) ---
     PHARMACY_ID = _req("PHARMACY_ID")

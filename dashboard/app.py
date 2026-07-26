@@ -10,6 +10,7 @@ Run:  streamlit run app.py
 """
 import hmac
 import os
+import uuid
 from datetime import datetime
 
 from dotenv import load_dotenv
@@ -184,24 +185,58 @@ if not st.session_state.get("authed"):
             st.error("Wrong password.")
     st.stop()
 
+# ------------------------------------------------------------------ tenant
+# PHARMACY_ID from the environment is the DEFAULT, not a hard wire, so one dashboard
+# can onboard and then switch between pharmacies. Every query below still filters on
+# PID explicitly -- see onboarding.py for why that is discipline rather than isolation.
+_pharmacies = q("select id, name from pharmacies order by created_at")
+if not _pharmacies:
+    # Nothing exists yet. Onboarding has to work from a genuinely empty database or
+    # there is no way in.
+    from onboarding import first_run
+    first_run(q, ex)
+    st.stop()
+
+if st.session_state.get("pid") not in [str(p["id"]) for p in _pharmacies]:
+    st.session_state["pid"] = str(PID) if str(PID) in [str(p["id"]) for p in _pharmacies] \
+        else str(_pharmacies[0]["id"])
+PID = st.session_state["pid"]
+
 # Acting user — every clinical approval must be attributable to a real person
 staff = q("""select id, name, role, ppb_reg_no from staff
               where pharmacy_id=%s and is_active
               order by case role when 'pharmacist' then 0 when 'owner' then 1
                                  when 'manager' then 2 else 3 end, name""", (PID,))
-if not staff:
-    st.error("No active staff in this pharmacy. Add staff rows first.")
-    st.stop()
 
 with st.sidebar:
     st.title("💊 Pharma OS")
-    labels = {f"{s['name']} · {s['role']}": s for s in staff}
-    me = labels[st.selectbox("Signed in as", list(labels))]
-    st.caption(f"PPB reg: {me['ppb_reg_no'] or '—'}")
-    st.divider()
-    page = st.radio("", ["Verification queue", "Receiving", "Stock", "Expiry",
-                         "Purchase orders", "Orders", "Suppliers", "System"],
-                    label_visibility="collapsed")
+    if len(_pharmacies) > 1:
+        plabels = {p["name"]: str(p["id"]) for p in _pharmacies}
+        chosen = st.selectbox("Pharmacy", list(plabels),
+                             index=[str(p["id"]) for p in _pharmacies].index(PID))
+        if plabels[chosen] != PID:
+            st.session_state["pid"] = plabels[chosen]
+            st.rerun()
+    else:
+        st.caption(_pharmacies[0]["name"])
+
+    PAGES = ["Verification queue", "Receiving", "Stock", "Expiry",
+             "Purchase orders", "Orders", "Suppliers", "Manual upload",
+             "Setup", "System"]
+
+    if not staff:
+        # A pharmacy with no staff cannot do anything: WhatsApp only answers numbers
+        # in `staff`, and every approval needs an attributable actor. Send the user
+        # straight to Setup instead of dead-ending with an error.
+        st.warning("No staff yet — add the owner's number to begin.")
+        me = {"id": None, "name": "Setup", "role": "owner", "ppb_reg_no": None}
+        page = "Setup"
+    else:
+        labels = {f"{s['name']} · {s['role']}": s for s in staff}
+        me = labels[st.selectbox("Signed in as", list(labels))]
+        st.caption(f"PPB reg: {me['ppb_reg_no'] or '—'}")
+        st.divider()
+        page = st.radio("", PAGES, label_visibility="collapsed")
 
 
 # ============================================================ verification queue
@@ -510,6 +545,96 @@ elif page == "Suppliers":
                     r.get("rep_name"), r.get("email"), r.get("mpesa_paybill")))
         st.success("Saved.")
         st.rerun()
+
+
+# ============================================================ setup / onboarding
+elif page == "Setup":
+    from onboarding import setup_page
+    setup_page(q, ex, PID, me)
+
+
+# ============================================================ manual upload
+elif page == "Manual upload":
+    st.header("Manual upload")
+    st.caption("The fallback for every automated path. Nothing here is a happy path — "
+               "each option exists because the automated version can be unavailable "
+               "on the day, and 'we could not receive stock today' is not an "
+               "acceptable answer.")
+
+    tab_inv, tab_pos = st.tabs(["Supplier invoice", "phAMACore export"])
+
+    with tab_inv:
+        st.markdown("**Supplier invoice → Loop A**")
+        st.caption("Use when WhatsApp is down, the invoice is a PDF emailed by the "
+                   "distributor, or you are receiving from a desk rather than the "
+                   "counter. Identical pipeline to the photo path.")
+        who = st.selectbox("Receiving on behalf of",
+                           list({f"{s['name']} · {s['role']}": s for s in staff}),
+                           key="mu_staff") if staff else None
+        files = st.file_uploader("Invoice pages", type=["jpg", "jpeg", "png", "pdf"],
+                                 accept_multiple_files=True, key="mu_inv")
+        if files and st.button("Extract and review", type="primary"):
+            actor = {f"{s['name']} · {s['role']}": s for s in staff}[who]
+            _api()
+            with st.spinner(f"Reading {len(files)} page(s)…"):
+                try:
+                    from datetime import datetime as _dt
+                    from db import upload as _upload
+                    import grn as _grn
+                    paths = []
+                    for i, f in enumerate(files, 1):
+                        ext = (f.name or "p.jpg").rsplit(".", 1)[-1].lower()
+                        p = (f"{_dt.utcnow():%Y/%m}/manual/"
+                             f"{uuid.uuid4().hex[:10]}_{i}.{ext}")
+                        _upload(BUCKET_INV, p, f.getvalue(),
+                                "application/pdf" if ext == "pdf" else "image/jpeg")
+                        paths.append(p)
+                    grn_id = _grn.persist_from_paths(paths, actor)
+                    if grn_id:
+                        st.success("Extracted. Open **Receiving** to review and approve.")
+                        st.code(_grn.render_summary(grn_id), language=None)
+                    else:
+                        st.error("Could not read an invoice from those pages.")
+                except Exception as e:
+                    st.error(f"Failed: {e}")
+
+    with tab_pos:
+        st.markdown("**phAMACore export → Loop B**")
+        st.caption("Use when the PC agent is not installed yet, is offline, or the "
+                   "pharmacy PC has no internet. Same three shapes the agent "
+                   "recognises: transaction-level sales, monthly totals, or a stock "
+                   "snapshot. Detected automatically from the headers.")
+        up = st.file_uploader("CSV / XLSX from phAMACore",
+                              type=["csv", "xlsx", "xls", "txt"], key="mu_pos")
+        if up and st.button("Import", type="primary", key="mu_pos_btn"):
+            _api()
+            with st.spinner("Classifying and importing…"):
+                try:
+                    import sys as _sys, tempfile, os as _os
+                    agent_dir = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)),
+                                              "..", "agent")
+                    if agent_dir not in _sys.path:
+                        _sys.path.insert(0, agent_dir)
+                    from pathlib import Path as _P
+                    from agent import classify_and_parse
+                    with tempfile.NamedTemporaryFile(
+                            delete=False, suffix=_os.path.splitext(up.name)[1]) as tf:
+                        tf.write(up.getvalue())
+                        tmp = tf.name
+                    kind, rows = classify_and_parse(_P(tmp))
+                    _os.unlink(tmp)
+                    if not rows:
+                        st.error(f"Detected shape: **{kind}** — no usable rows. The "
+                                 f"headers did not match any known phAMACore export.")
+                    else:
+                        st.info(f"Detected **{kind}** · {len(rows)} rows")
+                        import manual_ingest
+                        res = manual_ingest.ingest(kind, rows, PID)
+                        st.success(res)
+                        st.dataframe(pd.DataFrame(rows[:20]),
+                                     use_container_width=True, hide_index=True)
+                except Exception as e:
+                    st.error(f"Failed: {e}")
 
 
 # ============================================================ system
