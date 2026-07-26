@@ -71,20 +71,45 @@ r=q1(\"select phone from staff where pharmacy_id=%s and is_active order by case 
 print(r['phone'] if r else '')" 2>/dev/null | tail -1)
   fi
   [ -n "$FROM" ] || { echo "no active staff — add your number in the dashboard first"; exit 1; }
-  echo "as $FROM: $TEXT"
-  curl -s -X POST http://127.0.0.1:8000/dev/simulate \
-    -H "x-pharmaos-secret: $SHARED_SECRET" -H 'content-type: application/json' \
-    -d "{\"from\":\"$FROM\",\"text\":$(printf '%s' "$TEXT" | "$PY" -c 'import json,sys;print(json.dumps(sys.stdin.read()))')}"
-  echo
-  sleep 3
-  echo "--- reply ---"
-  "$PY" -c "
-import sys; sys.path.insert(0,'api')
+  echo "you -> $TEXT   (as $FROM)"
+  # Show only replies produced AFTER this message, and WAIT for them. Reading a fixed
+  # number of recent rows after a fixed sleep prints stale replies from an earlier
+  # message whenever the model takes an extra second, which looks exactly like a bug.
+  "$PY" - "$FROM" "$TEXT" <<'PYEOF'
+import json, sys, time
+sys.path.insert(0, "api")
+import httpx
+from config import settings
 from db import q
-for r in reversed(q(\"select body,error from wa_messages where direction='out' order by created_at desc limit 3\")):
-    print((r['body'] or '')[:700])
-    if r['error']: print('   [not delivered: no WhatsApp gateway running]')
-" 2>/dev/null | grep -v "^$" || true
+
+phone, text = sys.argv[1], sys.argv[2]
+since = q("select now() as t")[0]["t"]
+r = httpx.post("http://127.0.0.1:8000/dev/simulate",
+               headers={"x-pharmaos-secret": settings.SHARED_SECRET},
+               json={"from": phone, "text": text}, timeout=30)
+if r.status_code != 200:
+    print(f"   simulate failed: {r.status_code} {r.text[:120]}")
+    sys.exit(1)
+
+deadline = time.time() + 45          # vision/LLM replies can take ~30s
+seen = 0
+print("   ...", end="", flush=True)
+while time.time() < deadline:
+    rows = q("""select body, error, created_at from wa_messages
+                 where direction='out' and created_at > %s
+                 order by created_at""", (since,))
+    if len(rows) > seen:
+        for row in rows[seen:]:
+            print("\r" + " " * 20)
+            print("bot <- " + (row["body"] or "")[:900])
+            if row["error"]:
+                print("       [logged only - no WhatsApp gateway running]")
+        seen = len(rows)
+        deadline = time.time() + 4   # brief grace for a follow-up message
+    time.sleep(1)
+if not seen:
+    print("\r   no reply in 45s. Is this number in `staff` and active?")
+PYEOF
   ;;
 
 check)
