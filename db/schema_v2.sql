@@ -207,7 +207,19 @@ hist as (
 select p.id as product_id,
        p.pharmacy_id,
        p.name,
-       coalesce(l.pieces / nullif(l.days,0), h.pieces / nullif(h.days,0), 0) as avg_daily,
+       -- Live sales only take over once there are >= 21 days of them. A plain
+       -- coalesce(live, history) lets ONE day of till data outrank 24 months of
+       -- signal: on the agent's first sync every product that sold today gets
+       -- avg_daily = today's qty / 1 day, which is 8-30x too high, and the reorder
+       -- list asks the owner to buy a year of stock. It also silently contradicted
+       -- the `method` string below, which has always applied the 21-day rule --
+       -- so the number said 'live' while its own explanation said 'history'.
+       -- Order: settled live > backfilled history > short live > nothing.
+       coalesce(
+         case when l.days >= 21 then l.pieces / nullif(l.days,0) end,
+         h.pieces / nullif(h.days,0),
+         case when l.days > 0  then l.pieces / nullif(l.days,0) end,
+         0) as avg_daily,
        case
          when l.days >= 60 then 'high'
          when l.days >= 21 or h.days >= 180 then 'medium'
@@ -216,6 +228,8 @@ select p.id as product_id,
        case
          when l.days >= 21 then 'live sales (' || round(l.days) || ' days observed)'
          when h.days > 0   then 'phAMACore history (' || round(h.days/30) || ' months)'
+         when l.days > 0   then 'only ' || round(l.days) || ' day(s) of live sales '
+                                || '- provisional, import phAMACore history'
          else 'no demand signal yet'
        end as method
   from products p

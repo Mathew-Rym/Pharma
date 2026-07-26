@@ -131,6 +131,44 @@ the live DB (pack row → selected, legacy `qty_pieces` row → falls back, null
 Locked in by `test_pack_rows_are_not_excluded_by_the_apply_filter`, which was
 confirmed to fail against the pre-fix code rather than pass vacuously.
 
+### Second bug, found by the end-to-end run: one day of live sales beat 24 months
+
+`v_demand_baseline` blended the two signals with
+`coalesce(live, history)` — so live won whenever it existed, even with a single day
+behind it. The `method` CASE right below it has always applied the documented 21-day
+threshold, so the two disagreed: the number came from live, the sentence printed to
+the owner said "phAMACore history".
+
+Caught because the e2e run reported **60.00/day with method "phAMACore history
+(6 months)"** — and 6 months of history (1365 pcs / 180 days) is 7.58/day, while 60
+was exactly the one POS sale just applied.
+
+Effect: on the agent's first sync every product that sold that day gets
+`avg_daily = today's qty / 1 day`. Here that was 8x; with a slower mover it is 30x.
+`forecast_30d` was 1800 instead of 228 and cover 1.5 days instead of 11.9, so `ORDER`
+would have asked the owner to buy roughly a year of stock on day one — which is how
+a forecasting feature gets switched off in week three.
+
+Fixed in `db/schema_v2.sql` (view replaced in the live DB too): the preference order
+is now settled live (>= 21 days) > backfilled history > short live > nothing, and a
+fourth `method` branch names the short-live case as provisional. Both directions are
+locked in by `test_one_day_of_live_sales_does_not_outrank_months_of_history` and
+`test_settled_live_sales_do_take_over_from_history`; the first was confirmed to fail
+against the old view (`avg_daily=60.0`) rather than pass vacuously.
+
+### Verified end to end against a running API
+
+Drove the whole agent protocol against `uvicorn` on the live DB: enrolment (bogus
+token → 403, missing token → 401, per-install token != enrolment token), heartbeat
+state persistence, the command queue (queued → taken → done), POS ingest of a
+pack-denominated `2W0P` row (**150 → 90 pieces: 2 x 30 = 60 deducted correctly**),
+replay of the same export not double-deducting, history backfill driving the
+forecast, and the snapshot producing the `VARIANCE` WhatsApp message. All test data
+removed afterwards; the DB is back to 0 products / 0 movements.
+
+Script kept at `scratchpad/e2e.py` — it is not in the repo because it writes to a
+real database and is not safe to run against a loaded pilot.
+
 ### The venv was broken — repaired
 
 `.venv/bin/python3` had been repointed to `/usr/bin/python3` (3.12) while

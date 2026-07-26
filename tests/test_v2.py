@@ -298,3 +298,106 @@ def test_suggest_qty_pack_size_zero_does_not_divide_by_zero():
     from forecast import suggest_qty
     assert suggest_qty(_row(8, 1.0, 0, 0)) == 240
     assert suggest_qty(_row(8, 1.0, 0, None)) == 240
+
+
+# ============================================================ baseline blending (DB)
+DB_AVAILABLE = bool(os.getenv("DATABASE_URL")) and bool(os.getenv("PHARMACY_ID"))
+db = pytest.mark.skipif(not DB_AVAILABLE, reason="DATABASE_URL/PHARMACY_ID not set")
+
+
+@db
+def test_one_day_of_live_sales_does_not_outrank_months_of_history():
+    """REGRESSION. `coalesce(live, history)` let a single day of till data outrank
+    24 months of backfilled signal.
+
+    On the agent's first sync every product that sold today got
+    avg_daily = today's qty / 1 day — 8-30x too high — so the reorder list asked the
+    owner to buy a year of stock on day one. It also contradicted its own `method`
+    string, which has always applied the 21-day rule: the number said 'live' while
+    the explanation printed to the owner said 'history'.
+
+    Live sales must only take over at >= 21 days observed.
+    """
+    import secrets
+
+    from config import settings
+    from db import ex, q1
+
+    PID = settings.PHARMACY_ID
+    mark = "PYTEST-" + secrets.token_hex(3).upper()
+    prod = q1("""insert into products (pharmacy_id, name, legacy_code, pack_size,
+                        cost_price, sell_price)
+                 values (%s,%s,%s,30,15,25) returning id""",
+              (PID, f"BASELINE PROBE {mark}", mark))
+    batch = q1("""insert into batches (pharmacy_id, product_id, batch_no, qty_pieces,
+                        expiry_date)
+                  values (%s,%s,%s,1000,current_date + 400) returning id""",
+               (PID, prod["id"], mark))
+    try:
+        # 6 months of history: 1365 pieces / 180 days = 7.583/day
+        for m, qty in [(1, 180), (2, 180), (3, 210), (4, 265), (5, 240), (6, 290)]:
+            ex("""insert into sales_history_monthly (pharmacy_id, product_id,
+                        legacy_code, period, qty_pieces)
+                  values (%s,%s,%s,%s,%s)""",
+               (PID, prod["id"], mark, f"2026-{m:02d}-01", qty))
+        # one day of live till sales, deliberately far larger than the daily history
+        ex("""insert into stock_movements (pharmacy_id, batch_id, delta_pieces, reason,
+                    note) values (%s,%s,-60,'pos_sale',%s)""", (PID, batch["id"], mark))
+
+        row = q1("""select avg_daily, method from v_demand_baseline
+                     where product_id=%s""", (prod["id"],))
+        avg = float(row["avg_daily"])
+
+        assert avg == pytest.approx(7.583, abs=0.05), (
+            f"avg_daily={avg}: one day of live sales outranked 6 months of history "
+            f"(60/day instead of 7.58/day)")
+        assert "history" in row["method"], (
+            f"method {row['method']!r} disagrees with the number it explains")
+    finally:
+        ex("delete from stock_movements where batch_id=%s", (batch["id"],))
+        ex("delete from sales_history_monthly where legacy_code=%s", (mark,))
+        ex("delete from demand_forecast where product_id=%s", (prod["id"],))
+        ex("delete from batches where id=%s", (batch["id"],))
+        ex("delete from products where id=%s", (prod["id"],))
+
+
+@db
+def test_settled_live_sales_do_take_over_from_history():
+    """The other side of the rule: once there are >= 21 days of live ledger sales,
+    they are the better signal and must win."""
+    import secrets
+
+    from config import settings
+    from db import ex, q1
+
+    PID = settings.PHARMACY_ID
+    mark = "PYTEST-" + secrets.token_hex(3).upper()
+    prod = q1("""insert into products (pharmacy_id, name, legacy_code, pack_size,
+                        cost_price, sell_price)
+                 values (%s,%s,%s,30,15,25) returning id""",
+              (PID, f"BASELINE PROBE {mark}", mark))
+    batch = q1("""insert into batches (pharmacy_id, product_id, batch_no, qty_pieces,
+                        expiry_date)
+                  values (%s,%s,%s,5000,current_date + 400) returning id""",
+               (PID, prod["id"], mark))
+    try:
+        ex("""insert into sales_history_monthly (pharmacy_id, product_id, legacy_code,
+                    period, qty_pieces) values (%s,%s,%s,'2026-01-01',180)""",
+           (PID, prod["id"], mark))
+        # 30 days of live sales, 10/day, backdated so the window is genuinely 30 days
+        for d in range(30):
+            ex("""insert into stock_movements (pharmacy_id, batch_id, delta_pieces,
+                        reason, note, created_at)
+                  values (%s,%s,-10,'pos_sale',%s, now() - make_interval(days => %s))""",
+               (PID, batch["id"], mark, d))
+
+        row = q1("select avg_daily, method from v_demand_baseline where product_id=%s",
+                 (prod["id"],))
+        assert float(row["avg_daily"]) == pytest.approx(10.0, abs=0.5)
+        assert "live sales" in row["method"]
+    finally:
+        ex("delete from stock_movements where batch_id=%s", (batch["id"],))
+        ex("delete from sales_history_monthly where legacy_code=%s", (mark,))
+        ex("delete from demand_forecast where product_id=%s", (prod["id"],))
+        ex("delete from batches where id=%s", (batch["id"],))
+        ex("delete from products where id=%s", (prod["id"],))
