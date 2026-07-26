@@ -446,6 +446,21 @@ def approve(grn_id: str, staff: dict, phone: str) -> None:
                     (l["unit_price"], l["product_id"]),
                 )
 
+            # Learn who supplies this product from the invoice that delivered it.
+            # `preferred_supplier_id` is read by forecast.reorder_list() and the low-stock
+            # digest, and create_draft_pos() DROPS every row where it is null -- so
+            # without this the reorder list says "No supplier set", `PO` creates nothing,
+            # and no order ever reaches the distributor. The supplier is already known
+            # here: _match_supplier() resolved it from the invoice at extraction time.
+            # Last supplier who actually delivered it wins, which self-corrects when the
+            # pharmacy switches wholesaler. If a deliberate override is ever needed, add
+            # a locked flag rather than removing this.
+            if g["supplier_id"]:
+                cur.execute(
+                    "update products set preferred_supplier_id=%s where id=%s",
+                    (g["supplier_id"], l["product_id"]),
+                )
+
         cur.execute(
             """update grns set status='approved', approved_by=%s, approved_at=now(),
                                discrepancy_note=%s

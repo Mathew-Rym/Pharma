@@ -362,6 +362,57 @@ def test_one_day_of_live_sales_does_not_outrank_months_of_history():
 
 
 @db
+def test_receiving_teaches_the_product_who_supplies_it():
+    """REGRESSION. `products.preferred_supplier_id` was read by reorder_list() and the
+    low-stock digest but written by nothing.
+
+    create_draft_pos() drops every row whose supplier_id is null, so the reorder list
+    said "No supplier set", `PO` created zero purchase orders, and no order ever
+    reached a distributor -- Loop C broke silently at the handoff. The supplier is
+    already known at receiving: _match_supplier() resolves it from the invoice.
+    """
+    import secrets
+
+    from config import settings
+    from db import ex, q1
+
+    PID = settings.PHARMACY_ID
+    mark = "PYTEST-" + secrets.token_hex(3).upper()
+    sup = q1("""insert into suppliers (pharmacy_id, name, phone) values (%s,%s,%s)
+                returning id""", (PID, f"WHOLESALER {mark}", "254711000222"))
+    prod = q1("""insert into products (pharmacy_id, name, legacy_code, pack_size,
+                        cost_price, sell_price) values (%s,%s,%s,30,15,25) returning id""",
+              (PID, f"SUPPLIER PROBE {mark}", mark))
+    g = q1("""insert into grns (pharmacy_id, supplier_id, invoice_no, status, images)
+              values (%s,%s,%s,'needs_review','{}') returning id""", (PID, sup["id"], mark))
+    ex("""insert into grn_lines (grn_id, line_no, raw_description, product_id, batch_no,
+                expiry_date, qty_invoiced_pieces, unit_price, confidence)
+          values (%s,1,%s,%s,%s,current_date + 400,60,15.00,0.95)""",
+       (g["id"], f"SUPPLIER PROBE {mark}", prod["id"], mark))
+    staff = q1("select * from staff where pharmacy_id=%s limit 1", (PID,))
+    try:
+        assert q1("select preferred_supplier_id from products where id=%s",
+                  (prod["id"],))["preferred_supplier_id"] is None
+
+        import grn as grnmod
+        grnmod.approve(str(g["id"]), staff, staff["phone"])
+
+        linked = q1("select preferred_supplier_id from products where id=%s",
+                    (prod["id"],))["preferred_supplier_id"]
+        assert str(linked) == str(sup["id"]), (
+            "receiving did not record who supplied the product, so `PO` will create "
+            "no purchase order and nothing will reach the distributor")
+    finally:
+        ex("""delete from stock_movements where batch_id in
+               (select id from batches where product_id=%s)""", (prod["id"],))
+        ex("delete from batches where product_id=%s", (prod["id"],))
+        ex("delete from grn_lines where grn_id=%s", (g["id"],))
+        ex("delete from grns where id=%s", (g["id"],))
+        ex("delete from products where id=%s", (prod["id"],))
+        ex("delete from suppliers where id=%s", (sup["id"],))
+
+
+@db
 def test_settled_live_sales_do_take_over_from_history():
     """The other side of the rule: once there are >= 21 days of live ledger sales,
     they are the better signal and must win."""
