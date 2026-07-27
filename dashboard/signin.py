@@ -21,6 +21,7 @@ visible. The PIN on `staff` is what carries per-person attribution for the actio
 that legally need it (prescription release, PO approval), and that is unaffected.
 """
 import base64
+import os
 from pathlib import Path
 
 import streamlit as st
@@ -75,39 +76,122 @@ def sign_in_page(icon_path: str, orange: str, app_password: str, hmac) -> None:
     </div>
     """, unsafe_allow_html=True)
 
-    # The working path. In a form so Enter submits — staff type a password and hit
-    # return; making them reach for the mouse is a small daily irritation.
-    with st.form("signin", clear_on_submit=False):
-        pw = st.text_input("Password", type="password",
-                           placeholder="Pharmacy password",
-                           label_visibility="collapsed")
-        go = st.form_submit_button("Sign in", type="primary",
-                                   use_container_width=True)
+    from identity import AUTH_MODE, send_code, verify_code
 
-    if go:
-        # hmac.compare_digest, not ==, so a wrong password cannot be recovered a
-        # character at a time from response timing.
-        if hmac.compare_digest(pw, app_password):
+    # Which sign-in methods are offered is driven by AUTH_MODE, which defaults to the
+    # old shared-password behaviour. An auth migration must never be able to lock a
+    # pharmacy out of its own stock system mid-shift.
+    personal = AUTH_MODE in ("whatsapp", "strict")
+    shared_ok = AUTH_MODE in ("shared", "whatsapp")
+
+    if personal:
+        _whatsapp_sign_in(send_code, verify_code)
+
+    if personal and shared_ok:
+        st.markdown('<div class="po-or">OR</div>', unsafe_allow_html=True)
+
+    if shared_ok:
+        with st.form("signin", clear_on_submit=False):
+            pw = st.text_input(
+                "Password", type="password",
+                placeholder="Pharmacy password" if not personal
+                            else "Shared pharmacy password",
+                label_visibility="collapsed")
+            go = st.form_submit_button(
+                "Sign in" if not personal else "Sign in with the shared password",
+                type="primary" if not personal else "secondary",
+                use_container_width=True)
+
+        if go:
+            # hmac.compare_digest, not ==, so a wrong password cannot be recovered a
+            # character at a time from response timing.
+            if hmac.compare_digest(pw, app_password):
+                st.session_state["authed"] = True
+                st.session_state["auth_method"] = "shared_password"
+                _audit_shared(True)
+                st.rerun()
+            else:
+                # Never echo the expected value, or any hint about it, to someone who
+                # has not authenticated.
+                _audit_shared(False)
+                st.error("Wrong password.")
+
+    if not personal:
+        st.markdown('<div class="po-or">OR</div>', unsafe_allow_html=True)
+        st.markdown('<div class="po-soon">', unsafe_allow_html=True)
+        c1, c2 = st.columns(2)
+        c1.button("Sign in with WhatsApp", disabled=True, use_container_width=True,
+                  help="Ready. Set AUTH_MODE=whatsapp in .env to switch on per-user "
+                       "sign-in; the shared password keeps working alongside it.")
+        c2.button("Continue with Google", disabled=True, use_container_width=True,
+                  help="Needs a Google Cloud project and OAuth consent screen "
+                       "configured in Supabase first.")
+        st.markdown("</div>", unsafe_allow_html=True)
+
+    foot = ("Signed-in actions are recorded against you. Prescription and "
+            "purchase-order approvals still require your PIN."
+            if personal else
+            "One shared password for now. Prescription and purchase-order approvals "
+            "are attributed individually by staff PIN.")
+    st.markdown(f'<p class="po-foot">{foot}<br/>Pharma OS</p>',
+                unsafe_allow_html=True)
+
+
+def _audit_shared(ok: bool) -> None:
+    try:
+        from db_helpers import ex_
+        from identity import log_shared_password_login
+        log_shared_password_login(ex_, os.getenv("PHARMACY_ID"), ok)
+    except Exception:
+        pass
+
+
+def _whatsapp_sign_in(send_code, verify_code) -> None:
+    """Two steps in one place: request a code, then enter it."""
+    from db_helpers import ex_, q_
+
+    stage = st.session_state.get("signin_stage", "phone")
+
+    if stage == "phone":
+        with st.form("wa_request", clear_on_submit=False):
+            phone = st.text_input("WhatsApp number", placeholder="0713 755 274",
+                                  label_visibility="collapsed")
+            sent = st.form_submit_button("Send me a code on WhatsApp",
+                                         type="primary", use_container_width=True)
+        if sent:
+            ok, msg = send_code(phone, q_, ex_)
+            if ok:
+                st.session_state["signin_stage"] = "code"
+                st.session_state["signin_phone"] = phone
+                st.info(msg)
+                st.rerun()
+            else:
+                st.error(msg)
+        return
+
+    phone = st.session_state.get("signin_phone", "")
+    st.caption(f"Code sent to {phone} on WhatsApp. It expires in 10 minutes.")
+    with st.form("wa_verify", clear_on_submit=False):
+        code = st.text_input("6-digit code", max_chars=6, placeholder="123456",
+                             label_visibility="collapsed")
+        ok_btn = st.form_submit_button("Sign in", type="primary",
+                                       use_container_width=True)
+    c1, c2 = st.columns(2)
+    if c1.button("Send a new code", use_container_width=True):
+        send_code(phone, q_, ex_)
+        st.info("A new code is on its way.")
+    if c2.button("Use a different number", use_container_width=True):
+        st.session_state.pop("signin_stage", None)
+        st.rerun()
+
+    if ok_btn:
+        staff, msg = verify_code(phone, code, q_, ex_)
+        if staff:
             st.session_state["authed"] = True
+            st.session_state["auth_method"] = "whatsapp"
+            st.session_state["staff_id"] = str(staff["id"])
+            st.session_state["pid"] = str(staff["pharmacy_id"])
+            st.session_state.pop("signin_stage", None)
             st.rerun()
         else:
-            # Never echo the expected value, or any hint about it, to someone who has
-            # not authenticated.
-            st.error("Wrong password.")
-
-    st.markdown('<div class="po-or">OR</div>', unsafe_allow_html=True)
-
-    st.markdown('<div class="po-soon">', unsafe_allow_html=True)
-    c1, c2 = st.columns(2)
-    c1.button("Continue with Google", disabled=True, use_container_width=True,
-              help="Coming with per-user accounts. Needs Supabase Auth, "
-                   "staff.supabase_user_id and RLS policies first — the button "
-                   "without those would imply attribution the system cannot yet honour.")
-    c2.button("Email magic link", disabled=True, use_container_width=True,
-              help="Coming with per-user accounts, alongside Google sign-in.")
-    st.markdown("</div>", unsafe_allow_html=True)
-
-    st.markdown(
-        '<p class="po-foot">One shared password for now. Prescription and purchase-order '
-        'approvals are attributed individually by staff PIN.<br/>Pharma OS</p>',
-        unsafe_allow_html=True)
+            st.error(msg)

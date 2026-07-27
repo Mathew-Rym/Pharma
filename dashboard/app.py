@@ -194,10 +194,18 @@ if not _pharmacies:
     first_run(q, ex)
     st.stop()
 
-if st.session_state.get("pid") not in [str(p["id"]) for p in _pharmacies]:
-    st.session_state["pid"] = str(PID) if str(PID) in [str(p["id"]) for p in _pharmacies] \
-        else str(_pharmacies[0]["id"])
-PID = st.session_state["pid"]
+# Whoever signed in personally brings their own tenant and identity. Only a shared
+# password session gets to pick either from a dropdown, because a shared password
+# cannot tell us who is holding it.
+PERSONAL = st.session_state.get("auth_method") == "whatsapp"
+
+if PERSONAL:
+    PID = st.session_state["pid"]
+else:
+    if st.session_state.get("pid") not in [str(p["id"]) for p in _pharmacies]:
+        st.session_state["pid"] = str(PID) if str(PID) in [str(p["id"]) for p in _pharmacies] \
+            else str(_pharmacies[0]["id"])
+    PID = st.session_state["pid"]
 
 # Acting user — every clinical approval must be attributable to a real person
 staff = q("""select id, name, role, ppb_reg_no from staff
@@ -218,7 +226,13 @@ with st.sidebar:
                 Pharma OS</span>
             </div>""",
         unsafe_allow_html=True)
-    if len(_pharmacies) > 1:
+    _here = next((p for p in _pharmacies if str(p["id"]) == PID), _pharmacies[0])
+    if PERSONAL:
+        # No tenant switcher. The pharmacy comes from the staff row of whoever signed
+        # in, so it cannot be changed from the UI. This is the difference that makes
+        # one deployment safe for two customers.
+        st.caption(_here["name"])
+    elif len(_pharmacies) > 1:
         plabels = {p["name"]: str(p["id"]) for p in _pharmacies}
         chosen = st.selectbox("Pharmacy", list(plabels),
                              index=[str(p["id"]) for p in _pharmacies].index(PID))
@@ -226,11 +240,15 @@ with st.sidebar:
             st.session_state["pid"] = plabels[chosen]
             st.rerun()
     else:
-        st.caption(_pharmacies[0]["name"])
+        st.caption(_here["name"])
 
     PAGES = ["Verification queue", "Receiving", "Stock", "Expiry",
              "Purchase orders", "Orders", "Suppliers", "Manual upload",
              "Setup", "System"]
+
+    _me_id = st.session_state.get("staff_id")
+    _me_row = next((s for s in staff if str(s["id"]) == _me_id), None) if PERSONAL \
+        else None
 
     if not staff:
         # A pharmacy with no staff cannot do anything: WhatsApp only answers numbers
@@ -239,12 +257,26 @@ with st.sidebar:
         st.warning("No staff yet — add the owner's number to begin.")
         me = {"id": None, "name": "Setup", "role": "owner", "ppb_reg_no": None}
         page = "Setup"
+    elif _me_row:
+        # Signed in personally: the acting user IS the person who authenticated. The
+        # dropdown is exactly the "self-selected pharmacist" theatre the review called
+        # out, so it is not offered here.
+        me = _me_row
+        st.markdown(f"**{me['name']}** · {me['role']}")
+        st.caption(f"PPB reg: {me['ppb_reg_no'] or '—'}")
+        if st.button("Sign out", use_container_width=True):
+            for k in ("authed", "auth_method", "staff_id", "pid",
+                      "signin_stage", "signin_phone"):
+                st.session_state.pop(k, None)
+            st.rerun()
+        st.divider()
+        page = st.radio("Page", PAGES, label_visibility="collapsed")
     else:
         labels = {f"{s['name']} · {s['role']}": s for s in staff}
         me = labels[st.selectbox("Signed in as", list(labels))]
         st.caption(f"PPB reg: {me['ppb_reg_no'] or '—'}")
         st.divider()
-        page = st.radio("", PAGES, label_visibility="collapsed")
+        page = st.radio("Page", PAGES, label_visibility="collapsed")
 
 
 # ============================================================ verification queue

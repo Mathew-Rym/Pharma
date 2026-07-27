@@ -58,6 +58,26 @@ Then **Set PIN** → `4417` → Save PIN.
 > in `staff` and ignores everything else *silently* — no error, no log, nothing looks
 > broken. If you skip this, every later stage fails quietly.
 
+### 1.2b Try per-user sign-in (optional, new)
+
+Everything above uses one shared password. To sign in **as yourself** instead:
+
+```bash
+# .env
+AUTH_MODE=whatsapp        # shared password still works alongside it
+```
+
+Restart the dashboard, then on the sign-in page enter your WhatsApp number →
+**Send me a code on WhatsApp** → type the 6 digits.
+
+**Expect:** the sidebar shows *your* name and role with a Sign out button, and there
+is no "Signed in as" dropdown — the acting user is you, because you authenticated.
+
+**Needs WhatsApp paired first** (Stage 3), or the code has nowhere to go. Until then
+stay on `AUTH_MODE=shared`.
+
+See [AUTH.md](AUTH.md) for the rollout path and what is still missing (RLS).
+
 ### 1.3 Fill in the pharmacy
 **Setup → Pharmacy** — set the name, M-Pesa Paybill, and **PPB licence** (the licence
 prints on the purchase-order PDF a distributor receives).
