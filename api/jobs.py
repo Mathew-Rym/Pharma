@@ -26,7 +26,13 @@ def _staff(roles: tuple[str, ...]) -> list[dict]:
 
 
 def _run(job: str, fn) -> dict:
-    row = ex1("insert into job_runs (job, status) values (%s,'running') returning id", (job,))
+    # pharmacy_id is not optional here even though the column is nullable. v2 added it
+    # for multi-tenant hygiene and this helper never set it, so every job_runs row was
+    # tenant-less -- which the dashboard papered over with `or pharmacy_id is null`.
+    # Under RLS a null would fail the WITH CHECK outright and every cron job would
+    # start erroring the moment isolation is switched on.
+    row = ex1("""insert into job_runs (pharmacy_id, job, status)
+                 values (%s,%s,'running') returning id""", (PID, job))
     try:
         detail = fn() or {}
         ex("update job_runs set status='ok', detail=%s, ended_at=now() where id=%s",

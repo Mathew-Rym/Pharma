@@ -47,6 +47,61 @@ atexit.register(lambda: pool.close())
 sb = create_client(settings.SUPABASE_URL, settings.SUPABASE_SERVICE_KEY)
 
 
+# ---------------------------------------------------------------- tenant isolation
+@contextmanager
+def tenant_scope(pharmacy_id: str):
+    """Run a block where the DATABASE enforces which pharmacy is visible.
+
+        with tenant_scope(pid) as cur:
+            cur.execute("select * from products")     # no WHERE pharmacy_id needed
+
+    Two things happen, both SET LOCAL so they die with the transaction:
+
+      set local role pharmaos_app     -- a role WITHOUT bypassrls, so policies apply
+      set local app.current_pharmacy  -- which tenant those policies resolve to
+
+    The role switch is the part that matters. RLS was already enabled on most tables,
+    but the app connects as `postgres`, which has rolbypassrls -- so every policy was
+    being ignored and the "fail-closed posture" enforced nothing at all.
+
+    SET LOCAL rather than a separate connection: it is transaction-scoped, so it
+    cannot leak into the next request that borrows the same pooled connection, and it
+    needs no second credential.
+
+    Fails OPEN by design when DB_ENFORCE_RLS is off, because everything outside this
+    block still filters pharmacy_id by hand and works today. Turning it on is a
+    deliberate step, not a side effect of deploying.
+    """
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            if settings.DB_ENFORCE_RLS:
+                cur.execute("set local role pharmaos_app")
+                cur.execute("select set_config('app.current_pharmacy', %s, true)",
+                            (str(pharmacy_id),))
+            yield cur
+
+
+def rls_active() -> bool:
+    """Is the database actually enforcing isolation, or only appearing to?
+
+    Answers the real question rather than 'is RLS enabled', which was true and
+    meaningless for months.
+    """
+    if not settings.DB_ENFORCE_RLS:
+        return False
+    try:
+        with pool.connection() as conn, conn.cursor() as cur:
+            cur.execute("set local role pharmaos_app")
+            cur.execute("select current_user as u, "
+                        "(select rolbypassrls from pg_roles "
+                        "  where rolname = current_user) as bypass")
+            row = cur.fetchone()
+            return row["u"] == "pharmaos_app" and not row["bypass"]
+    except Exception:
+        log.warning("RLS check failed", exc_info=True)
+        return False
+
+
 # ---------------------------------------------------------------- SQL helpers
 def q(sql: str, params: tuple | dict | None = None) -> list[dict]:
     """Run a SELECT, return all rows as dicts."""

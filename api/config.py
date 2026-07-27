@@ -60,6 +60,12 @@ class Settings:
     # --- tenant (single pharmacy for the pilot) ---
     PHARMACY_ID = _req("PHARMACY_ID")
 
+    # Make the DATABASE enforce tenant isolation instead of trusting every query to
+    # remember `where pharmacy_id = %s`. Off by default: the hand-written filters
+    # still work, and switching enforcement on is a deliberate step rather than
+    # something that happens because someone deployed. See db.tenant_scope().
+    DB_ENFORCE_RLS = os.getenv("DB_ENFORCE_RLS", "false").lower() in ("1", "true", "yes")
+
     # --- m-pesa daraja ---
     MPESA_ENV = os.getenv("MPESA_ENV", "sandbox")          # sandbox | production
     MPESA_KEY = os.getenv("MPESA_CONSUMER_KEY", "")

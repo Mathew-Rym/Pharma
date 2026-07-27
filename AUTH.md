@@ -97,23 +97,92 @@ possession of a WhatsApp number.
 The enumeration one matters more than it looks: a sign-in box that says *"that number
 is not a staff member"* is a tool for discovering who works at the pharmacy.
 
-## What is NOT done — Phase 2
+---
 
-**RLS is not enabled, and tenant isolation is still application-level.** Every query
-filters `pharmacy_id = %s` by hand. That is discipline, not isolation — one forgotten
-filter leaks another pharmacy's data, and the reviewer already found two such queries
-(`job_runs`, `wa_messages`).
+# Phase 2 — database-enforced isolation
 
-Phase 2:
+## What was actually wrong before
 
-1. RLS policies on every tenant-scoped table, keyed on `auth.uid()`
-2. A **non-`service_role`** connection for user-facing queries — `service_role`
-   bypasses RLS entirely, so policies alone would do nothing
-3. `set local app.current_pharmacy` per request
-4. Pass the Supabase session JWT from the dashboard into the API
+RLS was already **enabled** on most tables with **zero policies**, and the checkpoint
+described that as a fail-closed posture. It was not protecting anything:
 
-Until then the honest statement is: **one deployment is safe for pharmacies that all
-belong to you. It is not yet safe for a second paying customer.**
+```sql
+select rolname, rolbypassrls from pg_roles where rolname = 'postgres';
+-->  postgres | true
+```
 
-Phase 1 was the prerequisite — RLS needs `auth.uid()`, and `auth.uid()` needs the
-identity link that now exists.
+The application connects as `postgres`, and a role with `BYPASSRLS` ignores every
+policy. Enabling RLS and connecting as `postgres` looks locked in the Supabase UI and
+enforces nothing. That is worse than no RLS, because it reads as done.
+
+## What shipped
+
+`schema_v7.sql` adds a role that **cannot** bypass RLS, plus a `tenant_isolation`
+policy on all 31 public tables. `db.tenant_scope()` switches into it per transaction:
+
+```python
+with tenant_scope(pharmacy_id) as cur:
+    cur.execute("select * from products")     # no WHERE pharmacy_id needed
+```
+
+```
+set local role pharmaos_app          -- policies now apply
+set local app.current_pharmacy = ... -- which tenant they resolve to
+```
+
+`SET LOCAL`, not a separate connection: it dies with the transaction, so it cannot
+leak onto whoever borrows that pooled connection next — asserted by
+`test_scope_does_not_leak_to_the_next_transaction`.
+
+Child tables (`grn_lines`, `order_lines`, `po_lines`, `login_codes`, …) have no
+`pharmacy_id`; they are scoped through their parent, so there is still exactly one
+definition of who owns a row rather than a denormalised copy that can drift.
+
+### Proven, not asserted
+
+`tests/test_rls.py` uses two real pharmacies and checks behaviour:
+
+| | |
+|---|---|
+| A cannot read B's rows | `test_a_tenant_cannot_read_another_tenants_rows` |
+| A cannot INSERT rows owned by B | `test_a_tenant_cannot_write_into_another_tenant` |
+| A cannot UPDATE B's rows | `test_a_tenant_cannot_update_another_tenants_rows` |
+| Unset tenant shows **nothing**, not everything | `test_unset_tenant_shows_nothing_rather_than_everything` |
+| Child rows don't leak | `test_child_rows_are_scoped_through_their_parent` |
+| `pharmaos_app` cannot bypass RLS | `test_the_app_role_cannot_bypass_rls` |
+| Every table has a policy (queried from the DB, not a hand-kept list) | `test_policies_exist_on_every_tenant_table` |
+
+## A bug this surfaced immediately
+
+`jobs._run()` inserted into `job_runs` **without** `pharmacy_id` — for months. Nothing
+complained, because the dashboard papered over it with `or pharmacy_id is null`. Under
+RLS that same insert fails the `WITH CHECK` outright, so **every cron job would have
+started failing the moment isolation was switched on.** Fixed, and
+`test_no_insert_omits_pharmacy_id_on_a_tenant_table` now scans for the whole class.
+
+## Where it actually stands — read this bit
+
+`DB_ENFORCE_RLS` defaults to **false**, and even set to true it only affects code
+inside `tenant_scope()`. The existing `q()` / `ex()` helpers still connect as
+`postgres` and are still protected only by their hand-written `where pharmacy_id = %s`.
+
+So, precisely:
+
+- **The mechanism is built and proven.** Isolation works and is tested against a real
+  second tenant.
+- **The application does not route through it yet.** Migrating ~200 call sites is
+  Phase 2b.
+
+Two things block flipping it on globally rather than per-call:
+
+1. **Onboarding creates a pharmacy.** `WITH CHECK` rejects inserting a pharmacy whose
+   id is not already the current tenant, which is correct and also breaks first-run.
+2. **The admin view lists all pharmacies.** That is a legitimate cross-tenant read and
+   needs an explicit exemption, not a leak.
+
+Both need an admin escape hatch — a `pharmaos_admin` role, or running those specific
+operations outside `tenant_scope()`. Small, but it should be deliberate rather than
+discovered when onboarding stops working.
+
+**Honest status: one deployment is safe for pharmacies that all belong to you. The
+database can now prove isolation, but the app is not yet asking it to.**
