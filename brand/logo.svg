@@ -1,0 +1,27 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512"
+     role="img" aria-label="Pharma OS">
+  <title>Pharma OS</title>
+  <!--
+    Two people standing together: two heads, one shared body, a gap between the legs.
+
+    Drawn as ONE path with a genuine cut-out rather than a body rectangle plus a white
+    rectangle over it. A white overlay only looks right on a white page — it shows as a
+    white bar the moment the mark sits on a dark WhatsApp bubble, a coloured PDF header,
+    or a dark-mode dashboard. The cut-out is transparent everywhere.
+  -->
+  <g fill="#FF7A00">
+    <circle cx="200" cy="118" r="42"/>
+    <circle cx="312" cy="118" r="42"/>
+    <path d="M168 182
+             H344
+             V414
+             H274
+             V232
+             a12 12 0 0 0 -12 -12
+             H250
+             a12 12 0 0 0 -12 12
+             V414
+             H168
+             Z"/>
+  </g>
+</svg>

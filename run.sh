@@ -112,6 +112,59 @@ if not seen:
 PYEOF
   ;;
 
+brand)
+  # Push the Pharma OS mark and display name onto the paired WhatsApp account, so the
+  # pharmacy's customers see the logo rather than a grey silhouette. Run once after
+  # pairing, and again whenever the logo changes.
+  "$PY" - <<'PYEOF'
+import sys
+sys.path.insert(0, "api")
+from pathlib import Path
+import httpx
+from config import settings
+
+if settings.WA_BACKEND != "gowa":
+    print("WA_BACKEND is not 'gowa' — nothing to brand."); sys.exit(0)
+
+base = settings.GOWA_URL.rstrip("/")
+auth = (settings.GOWA_USER, settings.GOWA_PASS) if settings.GOWA_USER else None
+hdrs = {"X-Device-Id": settings.GOWA_DEVICE_ID} if settings.GOWA_DEVICE_ID else {}
+img = Path("brand/whatsapp-profile-640.png")
+
+if not img.exists():
+    print(f"missing {img} — run: .venv/bin/python brand/make_assets.py"); sys.exit(1)
+
+try:
+    r = httpx.get(f"{base}/app/devices", auth=auth, timeout=15)
+    if r.status_code == 401:
+        print("GOWA rejected the credentials. Check GOWA_USER / GOWA_PASS."); sys.exit(1)
+except Exception as e:
+    print(f"GOWA not reachable at {base}: {e}\nStart it with ./run.sh whatsapp")
+    sys.exit(1)
+
+# Display name first: it succeeds even when no avatar can be set, so a failure here
+# tells you the session is not actually paired.
+try:
+    r = httpx.post(f"{base}/user/pushname", json={"push_name": "Pharma OS"},
+                   auth=auth, headers=hdrs, timeout=30)
+    print(("  display name -> 'Pharma OS'" if r.status_code == 200
+           else f"  display name failed: {r.status_code} {r.text[:120]}"))
+except Exception as e:
+    print(f"  display name failed: {e}")
+
+try:
+    with open(img, "rb") as fh:
+        r = httpx.post(f"{base}/user/avatar",
+                       files={"avatar": ("logo.png", fh, "image/png")},
+                       auth=auth, headers=hdrs, timeout=60)
+    print(("  profile picture -> brand/whatsapp-profile-640.png"
+           if r.status_code == 200
+           else f"  profile picture failed: {r.status_code} {r.text[:160]}"))
+except Exception as e:
+    print(f"  profile picture failed: {e}")
+PYEOF
+  ;;
+
 check)
   "$PY" - <<'PYEOF'
 import sys; sys.path.insert(0, "api")
@@ -193,6 +246,7 @@ Pharma OS
   ./run.sh check       is the database up to date with the code
   ./run.sh migrate     apply any missing migrations, then check
   ./run.sh test        run the test suite
+  ./run.sh brand       push the logo + name onto the paired WhatsApp account
   ./run.sh say "ORDER" send a fake WhatsApp message and show the reply
 
 See RUNBOOK.md for walking Loop A -> B -> C.

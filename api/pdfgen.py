@@ -7,6 +7,7 @@ first try. Optimise this later, not on build weekend.
 import io
 import logging
 from datetime import date
+from pathlib import Path
 
 import matplotlib
 matplotlib.use("Agg")             # must precede pyplot import; no display on a server
@@ -20,9 +21,17 @@ from utils import kes
 log = logging.getLogger(__name__)
 
 INK = (23, 37, 42)
-ACCENT = (13, 124, 102)
+ACCENT = (255, 122, 0)            # Pharma OS orange, matches brand/logo.svg
 MUTED = (110, 122, 128)
 RULE = (222, 228, 230)
+
+# Brand marks, generated from brand/logo.svg by brand/make_assets.py. Referenced by
+# path rather than embedded so the logo can be changed in one place. Every use is
+# guarded with .exists() and try/except: a missing or corrupt asset must never be the
+# reason a pharmacist cannot produce a purchase order.
+BRAND = Path(__file__).resolve().parent.parent / "brand"
+BRAND_MARK = BRAND / "pdf-mark-96.png"
+BRAND_WATERMARK = BRAND / "pdf-watermark-600.png"
 
 # fpdf2's built-in Helvetica is latin-1 only, so ANY of these raises
 # FPDFUnicodeEncodingException at render time and takes the whole document with it.
@@ -80,13 +89,37 @@ class Doc(FPDF):
         return super().normalize_text(latin1(text))
 
     def header(self):
+        y0 = self.get_y()
+
+        # Watermark first, so page content draws over it. Every page: a document that
+        # leaves the pharmacy (a PO to a distributor, a receipt to a patient) should be
+        # identifiable on any single page that gets photocopied or forwarded.
+        if BRAND_WATERMARK.exists():
+            try:
+                self.image(str(BRAND_WATERMARK), x=63, y=105, w=84)
+            except Exception:      # never let branding break a document
+                log.debug("watermark skipped", exc_info=True)
+            self.set_y(y0)
+
+        # Logo, with the text block beside it rather than under it.
+        text_x = 15
+        if BRAND_MARK.exists():
+            try:
+                self.image(str(BRAND_MARK), x=15, y=y0 - 1, w=13)
+                text_x = 32
+            except Exception:
+                log.debug("header mark skipped", exc_info=True)
+
+        self.set_xy(text_x, y0)
         self.set_font("Helvetica", "B", 15)
         self.set_text_color(*INK)
-        self.cell(0, 8, self.pharmacy_name, new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+        self.cell(0, 8, self.pharmacy_name, new_x=XPos.LEFT, new_y=YPos.NEXT)
         if self.contact:
+            self.set_x(text_x)
             self.set_font("Helvetica", "", 9)
             self.set_text_color(*MUTED)
-            self.cell(0, 4, self.contact, new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+            self.cell(0, 4, self.contact, new_x=XPos.LEFT, new_y=YPos.NEXT)
+        self.set_x(text_x)
         self.set_font("Helvetica", "", 10)
         self.set_text_color(*MUTED)
         self.cell(0, 5, f"{self.doc_title}  ·  generated {date.today():%d %b %Y}  ·  Pharma OS",
@@ -99,7 +132,9 @@ class Doc(FPDF):
         self.set_y(-14)
         self.set_font("Helvetica", "", 8)
         self.set_text_color(*MUTED)
-        self.cell(0, 5, f"Page {self.page_no()}", align="C")
+        self.cell(60, 5, "Pharma OS", align="L")
+        self.cell(60, 5, f"Page {self.page_no()}", align="C")
+        self.cell(60, 5, self.pharmacy_name[:34], align="R")
 
     # ------------------------------------------------------------- building blocks
     def h2(self, text: str):

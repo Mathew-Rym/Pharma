@@ -23,7 +23,14 @@ import streamlit as st
 from psycopg.rows import dict_row
 from supabase import create_client
 
-st.set_page_config(page_title="Pharma OS", page_icon="💊", layout="wide")
+# One brand source for the whole app. brand/ is generated from brand/logo.svg by
+# brand/make_assets.py, so the dashboard tab icon, the sign-in mark and the PDF
+# letterhead can never drift apart.
+BRAND = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "brand")
+ICON = os.path.join(BRAND, "icon-192.png")
+ORANGE = "#FF7A00"
+
+st.set_page_config(page_title="Pharma OS", page_icon=ICON, layout="wide")
 
 DATABASE_URL = os.environ["DATABASE_URL"]
 PID = os.environ["PHARMACY_ID"]
@@ -170,19 +177,8 @@ if not APP_PASSWORD:
     st.stop()
 
 if not st.session_state.get("authed"):
-    st.title("💊 Pharma OS")
-    st.caption("Sign in to access the pharmacy operations dashboard.")
-    pw = st.text_input("Password", type="password")
-    if st.button("Enter"):
-        # hmac.compare_digest, not ==, so a wrong password cannot be recovered a
-        # character at a time from response timing.
-        if hmac.compare_digest(pw, APP_PASSWORD):
-            st.session_state["authed"] = True
-            st.rerun()
-        else:
-            # Never echo the expected value, or any hint about it, to someone who
-            # has not authenticated.
-            st.error("Wrong password.")
+    from signin import sign_in_page
+    sign_in_page(ICON, ORANGE, APP_PASSWORD, hmac)
     st.stop()
 
 # ------------------------------------------------------------------ tenant
