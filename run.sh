@@ -35,11 +35,16 @@ whatsapp|wa)
 
 all)
   mkdir -p .run
-  api_up  || { (cd api && nohup "$PY" -m uvicorn main:app --host 0.0.0.0 --port 8000 \
-                 >"$ROOT/.run/api.log" 2>&1 &) ; }
-  dash_up || { (cd dashboard && nohup "$PY" -m streamlit run app.py --server.port 8501 \
+  # setsid, not just nohup+&. A backgrounded child stays in this script's process
+  # group, so whatever reaps the launcher -- a terminal closing, a CI step finishing,
+  # an agent harness cleaning up -- takes the services down with it. setsid puts them
+  # in their own session so they outlive the thing that started them.
+  DETACH="setsid"; command -v setsid >/dev/null || DETACH="nohup"
+  api_up  || { (cd api && $DETACH "$PY" -m uvicorn main:app --host 0.0.0.0 --port 8000 \
+                 >"$ROOT/.run/api.log" 2>&1 < /dev/null &) ; }
+  dash_up || { (cd dashboard && $DETACH "$PY" -m streamlit run app.py --server.port 8501 \
                  --server.headless true --browser.gatherUsageStats false \
-                 >"$ROOT/.run/dashboard.log" 2>&1 &) ; }
+                 >"$ROOT/.run/dashboard.log" 2>&1 < /dev/null &) ; }
   for _ in $(seq 1 30); do api_up && dash_up && break; sleep 1; done
   echo
   api_up  && echo "  API        http://localhost:8000/docs" || echo "  API        FAILED — see .run/api.log"
