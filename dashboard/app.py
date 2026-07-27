@@ -34,7 +34,11 @@ ORANGE = "#FF7A00"
 st.set_page_config(page_title="Pharma OS", page_icon=ICON, layout="wide")
 
 DATABASE_URL = os.environ["DATABASE_URL"]
-PID = os.environ["PHARMACY_ID"]
+# Optional, not required. On a fresh install there IS no pharmacy yet, so there is no
+# id to put in .env -- the onboarding screen is what creates the first one and prints
+# the id to paste back. Requiring it here made the dashboard KeyError before it could
+# show the screen that produces the value it was demanding.
+PID = os.getenv("PHARMACY_ID", "")
 SB_URL = os.environ["SUPABASE_URL"]
 SB_KEY = os.environ["SUPABASE_SERVICE_KEY"]
 # No default, and no "empty means no gate". This surface holds prescription images,
