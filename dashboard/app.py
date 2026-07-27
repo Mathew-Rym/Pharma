@@ -8,6 +8,7 @@ it exists for the three jobs a chat window is genuinely bad at:
 
 Run:  streamlit run app.py
 """
+import base64
 import hmac
 import os
 import uuid
@@ -205,7 +206,18 @@ staff = q("""select id, name, role, ppb_reg_no from staff
                                  when 'manager' then 2 else 3 end, name""", (PID,))
 
 with st.sidebar:
-    st.title("💊 Pharma OS")
+    # The mark, not an emoji. Rendered inline as base64 rather than st.image so the
+    # logo and wordmark sit on one line at a controlled size — st.image in a sidebar
+    # column would stack them and take three times the vertical space.
+    _logo_b64 = base64.b64encode(open(os.path.join(BRAND, "icon-192.png"), "rb")
+                                 .read()).decode()
+    st.markdown(
+        f"""<div style="display:flex;align-items:center;gap:10px;margin:0 0 4px">
+              <img src="data:image/png;base64,{_logo_b64}" width="30" height="30"/>
+              <span style="font-size:26px;font-weight:700;letter-spacing:-0.4px">
+                Pharma OS</span>
+            </div>""",
+        unsafe_allow_html=True)
     if len(_pharmacies) > 1:
         plabels = {p["name"]: str(p["id"]) for p in _pharmacies}
         chosen = st.selectbox("Pharmacy", list(plabels),

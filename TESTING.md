@@ -47,7 +47,7 @@ surface holds prescription images, so an unconfigured deploy fails closed.
 | Field | Value |
 |---|---|
 | Name | your name |
-| WhatsApp number | **your real number**, e.g. `0713 755 274` |
+| WhatsApp number | **0720521291**, e.g. `0713 755 274` |
 | Role | `owner` |
 
 Then **Set PIN** → `4417` → Save PIN.

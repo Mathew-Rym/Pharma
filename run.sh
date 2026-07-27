@@ -28,9 +28,200 @@ dashboard|dash)
   ;;
 
 whatsapp|wa)
-  docker compose -f wa-gowa/docker-compose.yml up -d
-  echo "GOWA starting. Scan the QR at http://localhost:3001"
-  echo "Logs: docker compose -f wa-gowa/docker-compose.yml logs -f"
+  # `docker compose` is a CLI PLUGIN, not part of docker itself, and it is missing on
+  # plenty of Ubuntu installs -- including this one. When it is absent the compose
+  # command fails with "unknown shorthand flag: 'f'", which reads like a typo rather
+  # than a missing dependency, and localhost:3001 just never comes up. So: use compose
+  # when it exists, otherwise run the same container directly. Same result either way,
+  # no extra install.
+  : "${GOWA_PASS:?set GOWA_PASS in .env}"
+  : "${GOWA_WEBHOOK_SECRET:?set GOWA_WEBHOOK_SECRET in .env}"
+
+  if docker compose version >/dev/null 2>&1; then
+    docker compose -f wa-gowa/docker-compose.yml up -d
+    echo "Logs: docker compose -f wa-gowa/docker-compose.yml logs -f"
+  else
+    echo "docker compose plugin not installed - running the container directly"
+    docker rm -f pharmaos-gowa >/dev/null 2>&1 || true
+    docker volume create gowa-storage >/dev/null
+    docker run -d --name pharmaos-gowa --restart unless-stopped \
+      -p 3001:3000 \
+      --add-host host.docker.internal:host-gateway \
+      -v gowa-storage:/app/storages \
+      -e APP_PORT=3000 \
+      -e APP_DEBUG=false \
+      -e APP_OS="Pharma OS" \
+      -e APP_BASIC_AUTH="${GOWA_USER:-pharmaos}:${GOWA_PASS}" \
+      -e WHATSAPP_WEBHOOK="${GOWA_WEBHOOK_URL:-http://host.docker.internal:8000/webhook/gowa}" \
+      -e WHATSAPP_WEBHOOK_SECRET="${GOWA_WEBHOOK_SECRET}" \
+      -e WHATSAPP_WEBHOOK_EVENTS=message \
+      -e WHATSAPP_WEBHOOK_IGNORE_JIDS=@g.us \
+      -e WHATSAPP_AUTO_DOWNLOAD_MEDIA=true \
+      -e WHATSAPP_PRESENCE_ON_CONNECT=unavailable \
+      -e WHATSAPP_AUTO_MARK_READ=true \
+      -e WHATSAPP_AUTO_REJECT_CALL=true \
+      -e WHATSAPP_ACCOUNT_VALIDATION=true \
+      aldinokemal2104/go-whatsapp-web-multidevice:latest rest
+    echo "Logs: docker logs -f pharmaos-gowa"
+  fi
+
+  echo -n "waiting for GOWA "
+  for _ in $(seq 1 60); do
+    curl -sf --max-time 2 -u "${GOWA_USER:-pharmaos}:${GOWA_PASS}" \
+         http://127.0.0.1:3001/app/info >/dev/null 2>&1 && break
+    echo -n "."; sleep 2
+  done
+  echo
+  if curl -sf --max-time 3 -u "${GOWA_USER:-pharmaos}:${GOWA_PASS}" \
+       http://127.0.0.1:3001/app/info >/dev/null 2>&1; then
+    echo "  GOWA is up:  http://localhost:3001"
+    echo "  Login:       ${GOWA_USER:-pharmaos} / (GOWA_PASS from .env)"
+    echo
+    echo "  Next: ./run.sh qr    then scan with the pharmacy SIM"
+  else
+    echo "  GOWA did not come up. Check: docker logs pharmaos-gowa"
+  fi
+  ;;
+
+qr)
+  # Pair a WhatsApp number, entirely from the terminal.
+  #
+  # GOWA v9 no longer bundles its web dashboard -- it downloads it from GitHub at
+  # startup, and that download fails with 403 behind many networks, which is why
+  # http://localhost:3001 can look dead while the API is perfectly healthy. So we do
+  # not depend on the browser UI at all.
+  #
+  # From v8 it is multi-device: you must CREATE a device slot first, then request the
+  # QR scoped to it. `GET /app/login` with no device returns DEVICE_ID_REQUIRED.
+  : "${GOWA_PASS:?set GOWA_PASS in .env}"
+  "$PY" - <<'PYEOF'
+import sys, time
+from pathlib import Path
+sys.path.insert(0, "api")
+import httpx
+from config import settings
+
+base = settings.GOWA_URL.rstrip("/")
+auth = (settings.GOWA_USER or "pharmaos", settings.GOWA_PASS)
+
+
+def devices():
+    r = httpx.get(f"{base}/devices", auth=auth, timeout=15)
+    return (r.json() or {}).get("results") or []
+
+
+try:
+    devs = devices()
+except Exception as e:
+    print(f"GOWA not reachable at {base}: {e}\nStart it with: ./run.sh whatsapp")
+    sys.exit(1)
+
+connected = [d for d in devs if d.get("connected") or d.get("logged_in")]
+if connected:
+    print("Already paired:")
+    for d in connected:
+        print(f"   {d.get('device_id') or d.get('jid')}  {d.get('push_name') or ''}")
+    print("\nSet GOWA_DEVICE_ID in .env to that id if it is not already.")
+    print("To pair a different number: ./run.sh unpair, then ./run.sh qr")
+    sys.exit(0)
+
+dev_id = settings.GOWA_DEVICE_ID or (devs[0].get("device_id") if devs else None)
+if not dev_id:
+    r = httpx.post(f"{base}/devices", auth=auth, timeout=20,
+                   json={"device_id": "pharmacy-1"})
+    if r.status_code not in (200, 201):
+        print(f"could not create a device slot: {r.status_code} {r.text[:200]}")
+        sys.exit(1)
+    dev_id = ((r.json() or {}).get("results") or {}).get("device_id") or "pharmacy-1"
+    print(f"created device slot: {dev_id}")
+
+hdrs = {"X-Device-Id": dev_id}
+print("Requesting pairing QR (can take ~10s)...\n")
+try:
+    r = httpx.get(f"{base}/app/login", auth=auth, headers=hdrs, timeout=90)
+    res = (r.json() or {}).get("results") or {}
+except Exception as e:
+    print(f"login request failed: {e}")
+    sys.exit(1)
+
+code = res.get("qr_code") or res.get("code")
+link = res.get("qr_link")
+
+if code:
+    # Raw payload: render it straight into the terminal, no browser needed.
+    try:
+        import qrcode
+        q = qrcode.QRCode(border=1)
+        q.add_data(code)
+        q.make()
+        q.print_ascii(invert=True)
+    except Exception:
+        print("QR payload (paste into any QR generator):\n", code)
+elif link:
+    # GOWA returns an ABSOLUTE url built from its own container hostname, e.g.
+    # http://localhost/statics/qrcode/scan-qr-xxx.png -- port 80 inside the container,
+    # which is not reachable from here. Keep only the path and re-join to GOWA_URL.
+    from urllib.parse import urlparse
+    path = urlparse(str(link)).path or str(link)
+    url = f"{base}/{path.lstrip('/')}"
+    out = Path(".run"); out.mkdir(exist_ok=True)
+    png = out / "whatsapp-qr.png"
+    try:
+        img = httpx.get(url, auth=auth, timeout=30)
+        img.raise_for_status()
+        png.write_bytes(img.content)
+        print(f"QR saved to: {png.resolve()}")
+        print("Open that file and scan it.\n")
+        # Also try to draw it in the terminal, so a headless box still works.
+        try:
+            from PIL import Image
+            im = Image.open(png).convert("L")
+            w, h = im.size
+            # QR images are a fixed module grid; sample it back down to that grid.
+            n = 45
+            step_x, step_y = w / n, h / n
+            for gy in range(n):
+                row = ""
+                for gx in range(n):
+                    px = im.getpixel((min(int(gx * step_x + step_x / 2), w - 1),
+                                      min(int(gy * step_y + step_y / 2), h - 1)))
+                    row += "  " if px > 128 else "██"
+                print(row)
+        except Exception:
+            pass
+    except Exception as e:
+        print(f"could not download the QR image ({e})")
+        print(f"Try opening: {url}")
+else:
+    print("No QR returned:", res)
+    sys.exit(1)
+
+print(f"\nOn the pharmacy phone: WhatsApp -> Settings -> Linked devices -> Link a device")
+print(f"\nDevice id: {dev_id}")
+print(f"Put this in .env:  GOWA_DEVICE_ID={dev_id}")
+
+print("\nWaiting for the scan", end="", flush=True)
+for _ in range(60):
+    time.sleep(3)
+    try:
+        if [d for d in devices() if d.get("connected") or d.get("logged_in")]:
+            print("\n\n  PAIRED.")
+            print("  Next: ./run.sh brand   (pushes the logo + display name)")
+            sys.exit(0)
+    except Exception:
+        pass
+    print(".", end="", flush=True)
+print("\n\nNot paired yet. The QR expires quickly — rerun ./run.sh qr for a fresh one.")
+PYEOF
+  ;;
+
+unpair)
+  : "${GOWA_PASS:?set GOWA_PASS in .env}"
+  D="${GOWA_DEVICE_ID:-pharmacy-1}"
+  curl -s -u "${GOWA_USER:-pharmaos}:${GOWA_PASS}" -H "X-Device-Id: $D" \
+       "http://127.0.0.1:3001/app/logout" | head -c 300
+  echo
+  echo "Logged out. Run ./run.sh qr to pair a different number."
   ;;
 
 all)
@@ -58,8 +249,12 @@ all)
 stop)
   pkill -f "uvicorn main:app" 2>/dev/null || true
   pkill -f "streamlit run app.py" 2>/dev/null || true
+  # Stop whichever way GOWA was started. NOT `docker rm` -- that would delete the
+  # container but the WhatsApp session lives in the named volume, so pairing survives
+  # a stop/start. Only ./run.sh unpair should end a session.
   docker compose -f wa-gowa/docker-compose.yml down 2>/dev/null || true
-  echo "stopped"
+  docker stop pharmaos-gowa >/dev/null 2>&1 || true
+  echo "stopped (WhatsApp pairing preserved in the gowa-storage volume)"
   ;;
 
 say)
@@ -245,7 +440,9 @@ Pharma OS
   ./run.sh all         start API + dashboard, print the URLs
   ./run.sh api         API only          http://localhost:8000/docs
   ./run.sh dashboard   dashboard only    http://localhost:8501
-  ./run.sh whatsapp    GOWA + QR         http://localhost:3001
+  ./run.sh whatsapp    start GOWA        http://localhost:3001
+  ./run.sh qr          print the pairing QR in the terminal
+  ./run.sh unpair      log out the paired number
   ./run.sh stop        stop everything
 
   ./run.sh check       is the database up to date with the code

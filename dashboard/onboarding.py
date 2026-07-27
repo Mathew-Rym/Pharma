@@ -65,7 +65,7 @@ def _valid(phone: str) -> bool:
 
 def first_run(q, ex) -> None:
     """Shown only when `pharmacies` is empty — the database has to be enterable."""
-    st.title("💊 Set up your pharmacy")
+    st.title("Set up your pharmacy")
     st.caption("Nothing exists yet. Create the pharmacy, then add the owner's "
                "WhatsApp number.")
 

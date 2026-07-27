@@ -23,6 +23,18 @@ pool = ConnectionPool(
     min_size=1,
     max_size=8,
     open=True,
+    # Supabase (and any pooler in front of Postgres) closes idle connections. Without
+    # a check the pool cheerfully hands out a dead socket and the first query fails
+    # with "server closed the connection unexpectedly" -- observed on this API after
+    # it had been idle a while. check_connection validates before handing over and
+    # transparently replaces a dead one, so an idle overnight API still answers the
+    # 07:00 cron.
+    check=ConnectionPool.check_connection,
+    # Recycle before the server's own idle timeout can reach them.
+    max_idle=300,
+    max_lifetime=1800,
+    # Fail a request rather than hang forever when the database is unreachable.
+    timeout=15,
     kwargs={"row_factory": dict_row, "prepare_threshold": None},
 )
 
