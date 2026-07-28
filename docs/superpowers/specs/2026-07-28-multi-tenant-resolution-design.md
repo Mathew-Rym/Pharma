@@ -113,12 +113,38 @@ GOWA (3 sessions) ──webhook──▶ POST /webhook/gowa
                     └─────────────────────────────┘
 ```
 
-**Platform bot behaviour on Thursday.** The registration flow is deferred (§9), so the
-platform handler is a stub that replies with a fixed message — *"This is the Pharma OS
-platform line. Registration opens shortly."* It must be an explicit branch, not an
-unresolved-tenant fall-through: `254777602338` has live customer history from testing, and
-letting those messages hit the generic "unknown device" path would be indistinguishable
-from a genuine routing failure while debugging on the day.
+**The platform bot is a row, not a constant.** `if device_id == PLATFORM_BOT_DEVICE_ID`
+would delete four hardcoded constants and add a fifth. Give `pharmacies` a `kind` column
+(`'pharmacy' | 'platform'`) so a single lookup yields three outcomes: **tenant**,
+**platform**, or **throw**. No second code path, no second source of truth.
+
+**Platform bot behaviour on Thursday.** Registration is deferred (§9), so the platform
+handler is a stub. It must be an explicit branch, not an unresolved-tenant fall-through:
+`254777602338` has live customer history from today's testing, and letting those messages
+hit the generic "unknown device" path would be indistinguishable from a genuine routing
+failure while debugging on the day.
+
+**Legacy customers get a useful sentence, not a generic greeting.** The line is
+platform-only — it is not a shopfront, and dual-purposing it would reintroduce the
+implicit tenant default this change exists to remove. But "contact your pharmacy
+directly" is a redirect that withholds the destination: same message slot, strictly less
+use. So the stub does two things:
+
+- A phone with existing `customers` history → name the number to use. The destination is
+  **derived, not hardcoded**: `customers.pharmacy_id → pharmacies.wa_number`. Those
+  customers already belonged to exactly one pharmacy when the system was single-tenant,
+  so this tells them where their pharmacy moved. It is a migration, not a reassignment —
+  and deriving it means a real pharmacy's customers are never pointed at a demo fixture.
+- Any other phone → the platform message plus `REGISTER`.
+
+**Match explicit commands before identity.** Checking "is this phone a known owner?"
+ahead of `REGISTER` routes a registered owner into owner-commands and they can never
+register a second pharmacy — which breaks the two-pharmacy demo, since both are
+registered from the same handset. Commands first, identity second (or owner-commands must
+itself handle `REGISTER`).
+
+**Cutover is gated.** Do not switch `254777602338` to platform-only until Pharmacy A is
+paired *and* a real order has completed on it. Until then the working line stays working.
 
 ### Schema change
 
@@ -160,16 +186,19 @@ are the demo. Registration is a bonus beat.**
 
 | # | Task | Why this position |
 |---|---|---|
-| 1 | Device-scoped outbound (`wa.py`) | Invisible with one number, catastrophic with three (§6) |
-| 2 | `wa_jid` / `gowa_device_id` columns + partial unique indexes | Everything else needs them |
-| 3 | Resolver: `device_id` → `pharmacy_id`, contextvar, replace 4 `PID` constants, platform-bot stub branch | The core change |
-| 4 | `jobs.py` per-pharmacy loop | Otherwise cron writes to one tenant only |
-| 5 | Seed two tenants with overlapping SKUs at different prices | What makes isolation *visible* |
+| 0 | **Tag the last known-good single-tenant state; verify one-command revert** | This tag is what makes Wednesday-night breakage survivable rather than terminal |
+| 1 | Device-scoped outbound, persisted on the record (`wa.py`) | Invisible with one number, catastrophic with two (§6) |
+| 2 | `wa_jid`, `gowa_device_id`, `kind` columns + partial unique indexes | Everything else needs them |
+| 3 | Resolver: `device_id` → `pharmacy_id`, contextvar, replace 4 `PID` constants, platform/tenant/throw branch | The core change |
+| 4 | `jobs.py` per-pharmacy loop | Otherwise cron writes to one tenant only — and it is the path that catches context-based device resolution |
+| 5 | Seed two tenants, visibly distinct: different companies, different stock, **different price for the same molecule** | Without this the isolation beat has nothing to show |
 | 6 | Pair both SIMs, brand each per device | Needs #1 to brand independently |
 | 7 | Re-run the existing demo end to end on Pharmacy A | Regression: today's working flow must survive |
-| 8 | *(after the demo)* registration + `CONNECT` activation | Narrate from a screenshot Thursday |
+| 8 | Cut `254777602338` over to platform-only | **Gated:** only after A is paired and a real order completes on it |
+| 9 | *(after the demo)* registration + pair-by-code activation | Narrate from a screenshot Thursday |
 
-If time runs out, cut from the bottom. Never cut #1 or #7.
+If time runs out, cut from the bottom. **Never cut #0, #1, #5 or #7.** Registration stays
+off the critical path: resolver + two seeded tenants *is* the demo.
 
 ---
 
@@ -182,13 +211,40 @@ if settings.GOWA_DEVICE_ID:
     kw["headers"] = {"X-Device-Id": settings.GOWA_DEVICE_ID}
 ```
 
-With three sessions live, **Pharmacy B's customer receives their reply from Pharmacy A's
-number.** Correct inbound resolution does not fix this, and nothing would look more
-broken on stage. `send_text` must take the resolved pharmacy's `gowa_device_id`, and a
-missing device must be a hard error rather than a silent fall back to the env default.
+Once a second number is paired, **Pharmacy B's customer receives their reply from
+Pharmacy A's number.** Correct inbound resolution does not fix this, and nothing would
+look more broken on stage.
 
-`run.sh brand` has the same shape — it brands whichever slot `GOWA_DEVICE_ID` names, so
-it needs a device argument for each pharmacy to get its own name and logo.
+### The device must be persisted, not read from context
+
+This is the part that is easy to get wrong in a way that passes tests.
+
+**Do not resolve the outbound device from request or contextvar state.** Sending happens
+off the request path in at least four places today — `jobs.py` reorder alerts, the Rx
+approval SLA escalation, the retry path in `wa.py`, and the daily report push. By the time
+those execute there is no inbound message and no contextvar. A synchronous implementation
+that reads ambient context will pass every test written against the webhook path and
+still cross wires the first time a scheduled job fires.
+
+So: **the resolved `gowa_device_id` is written onto the outbound record** (the
+`wa_messages` row, or the queue row for anything deferred) at the moment the message is
+composed, and the sender reads it from there. A missing device is a hard error, never a
+fall back to `settings.GOWA_DEVICE_ID`.
+
+### Validate the slot against the JID before sending
+
+GOWA addresses outbound by `X-Device-Id`, which is the slot *label* — so unlike inbound,
+the label cannot be avoided. That creates one specific hole: delete a slot and later
+recreate one reusing the name, and it now points at a different handset. Messages would
+go to the wrong pharmacy's customers while every log line looks correct.
+
+Guard: immediately before sending, confirm the slot's reported `jid` equals the
+pharmacy's `wa_jid`, and refuse if it does not. Fails loudly instead of silently
+misrouting.
+
+`run.sh brand` has the same single-device shape — it brands whichever slot
+`GOWA_DEVICE_ID` names, so it needs a device argument for each pharmacy to get its own
+name and logo.
 
 ---
 
@@ -210,11 +266,18 @@ These decide whether the change shipped. `tests/test_rls.py` already builds two 
 pharmacies, so the fixtures exist.
 
 1. Same product name at A and B with different price/stock → each number returns its own.
-2. **A reply arrives from the number it was sent to** (catches §6).
-3. A's staff phone messaging B's number is not treated as staff.
-4. No module-level `PID` remains anywhere (grep-style structural test).
-5. A cron job writes rows for both tenants with the correct `pharmacy_id`.
-6. Unknown `device_id` yields the generic message and no pharmacy name.
+2. **Message both numbers within a few seconds; each reply arrives from the number it was
+   sent to.** Interleaved, not sequential — sequential passes even with a shared global.
+3. **Trigger a reorder alert on B; the manager's message arrives from B, not A.** This is
+   the test that distinguishes a real fix from a context-based one, because the job has no
+   request scope. If §6 was implemented from ambient context, this is where it fails.
+4. A product carried only by A, requested from B → not found (the demo beat, as a test).
+5. A's staff phone messaging B's number is not treated as staff.
+6. No module-level `PID` and no hardcoded device id remains anywhere (structural test).
+7. A cron job writes rows for both tenants with the correct `pharmacy_id`.
+8. Unknown `device_id` yields the generic message and no pharmacy name.
+9. A legacy customer phone on the platform line is named their own pharmacy's number,
+   derived from `customers.pharmacy_id`.
 
 ---
 
@@ -265,3 +328,34 @@ dashboard — the owner issues it from WhatsApp.
 - Staff vs customer already works and already drives stock intake: a known staff phone
   sends media to `BUCKET_INVOICES` and the GRN flow, an unknown phone to `BUCKET_RX`
   (`main.py:83`, `router.py:73-81`). Only the tenant is hardcoded, not the role logic.
+
+---
+
+## 12. Rejected approaches — do not reintroduce
+
+Each of these has been proposed at least once during design. They are recorded with the
+reason so the next draft does not rediscover them.
+
+| Proposal | Why it fails |
+|---|---|
+| **`CONNECT <code>` on the platform line pairs the pharmacy** | Proposed three times. A message arriving on the platform device cannot create a GOWA session for a different number. Linking requires an action **on the pharmacy handset**: backend opens the session → GOWA returns a link code → the code is typed on that phone → GOWA reports the device_id and its number → bind. Chat can relay the code; it cannot do the linking. |
+| **`DEVICE_MAPPING` dict / `PLATFORM_BOT_DEVICE_ID` constant** | Replaces one hardcoded tenant with a hardcoded tenant list. A dict cannot contain a pharmacy that registered at runtime, so every self-registered tenant raises. DB lookup only. |
+| **Resolve the outbound device from request context** | Background jobs, retries and scheduled alerts have no request context (§6). Passes webhook tests, crosses wires on the first cron run. |
+| **Bind tenancy to the message sender** (`WHERE wa_number = from_phone`) | On a message to Pharmacy A's number the sender is the *customer*. A pharmacy's own number never appears as the sender of a message to itself, so the lookup can never match. |
+| **Dual-purpose the platform line as a shopfront** | Reintroduces an implicit tenant default, which is the entire thing being removed. |
+| **PPB number as the login credential** | The register is public (§10). |
+| **Identity checked before explicit commands** | A known owner can then never reach `REGISTER`, breaking two-pharmacy registration from one handset. |
+| **`device_id TEXT UNIQUE NOT NULL` on `pharmacies`** | A pharmacy exists before it is paired; the first insert would violate the constraint. Nullable + partial unique index. |
+
+---
+
+## 13. Demo ordering
+
+Lead with **isolation on two already-seeded tenants**, not registration. Registration is
+the least-finished, highest-risk component; opening with it turns a likely failure into
+the first thing the room sees, rather than a footnote.
+
+The strongest thirty seconds available, and it costs nothing to prepare: **from Pharmacy
+B, ask for a product only Pharmacy A stocks. It comes back not found.** That is isolation
+demonstrated rather than asserted — and it is the one beat that cannot be faked by a
+seeded screenshot.
