@@ -106,8 +106,43 @@ auth = (settings.GOWA_USER or "pharmaos", settings.GOWA_PASS)
 
 
 def devices():
+    # Pairing state is split across TWO endpoints in GOWA v9 and neither alone is
+    # enough. /devices lists the slots with {"id", "state"}; /app/devices reports the
+    # WhatsApp account with {"device", "jid", "name"}. Nothing anywhere returns the
+    # `connected` / `logged_in` / `device_id` keys this script used to look for, so the
+    # scan-detection loop below could never fire -- a successful pairing still printed
+    # "Not paired yet", and an already-paired number was offered a pointless new QR.
+    # Merge both, keyed by slot id, and normalise to the fields the rest of this uses.
+    slots = {}
     r = httpx.get(f"{base}/devices", auth=auth, timeout=15)
-    return (r.json() or {}).get("results") or []
+    for d in (r.json() or {}).get("results") or []:
+        did = d.get("id") or d.get("device_id")
+        slots[did] = {"device_id": did, "state": d.get("state") or ""}
+    try:
+        r = httpx.get(f"{base}/app/devices", auth=auth, timeout=15)
+        for d in (r.json() or {}).get("results") or []:
+            did = d.get("device") or d.get("device_id")
+            slots.setdefault(did, {"device_id": did, "state": ""})
+            slots[did]["jid"] = d.get("jid") or ""
+            slots[did]["push_name"] = d.get("name") or ""
+    except Exception:
+        pass  # slot list alone is still usable
+    return list(slots.values())
+
+
+def paired(d):
+    # jid is the ONLY trustworthy signal: WhatsApp only hands back an account id once
+    # the handshake completed, and a paired-but-offline device keeps it across restarts.
+    #
+    # Do NOT trust state=="connected" from /devices. That is transport-level -- it flips
+    # to connected the moment GOWA opens its socket to WhatsApp to *show you a QR*, with
+    # nobody logged in and jid still empty. Treating it as proof reports "PAIRED." for an
+    # unscanned QR, which is worse than the original bug: you'd chase silent messaging
+    # failures instead of just scanning again.
+    # state=="logged_in" is the other authoritative value; observed alongside a jid the
+    # moment pairing completes.
+    return bool(d.get("jid") or d.get("state") == "logged_in"
+                or d.get("connected") or d.get("logged_in"))
 
 
 try:
@@ -116,7 +151,7 @@ except Exception as e:
     print(f"GOWA not reachable at {base}: {e}\nStart it with: ./run.sh whatsapp")
     sys.exit(1)
 
-connected = [d for d in devs if d.get("connected") or d.get("logged_in")]
+connected = [d for d in devs if paired(d)]
 if connected:
     print("Already paired:")
     for d in connected:
@@ -126,6 +161,14 @@ if connected:
     sys.exit(0)
 
 dev_id = settings.GOWA_DEVICE_ID or (devs[0].get("device_id") if devs else None)
+if dev_id and not any(d.get("device_id") == dev_id for d in devs):
+    # GOWA_DEVICE_ID names a slot that no longer exists (a `docker rm` without the
+    # volume, or an unpair that dropped it). Requesting a QR against it just returns
+    # DEVICE_ID_REQUIRED, so recreate the slot under the same name first.
+    r = httpx.post(f"{base}/devices", auth=auth, timeout=20, json={"device_id": dev_id})
+    print(f"recreated missing device slot: {dev_id}"
+          if r.status_code in (200, 201) else
+          f"could not recreate slot {dev_id}: {r.status_code} {r.text[:200]}")
 if not dev_id:
     r = httpx.post(f"{base}/devices", auth=auth, timeout=20,
                    json={"device_id": "pharmacy-1"})
@@ -136,82 +179,107 @@ if not dev_id:
     print(f"created device slot: {dev_id}")
 
 hdrs = {"X-Device-Id": dev_id}
-print("Requesting pairing QR (can take ~10s)...\n")
-try:
-    r = httpx.get(f"{base}/app/login", auth=auth, headers=hdrs, timeout=90)
-    res = (r.json() or {}).get("results") or {}
-except Exception as e:
-    print(f"login request failed: {e}")
-    sys.exit(1)
+out = Path(".run"); out.mkdir(exist_ok=True)
+png = out / "whatsapp-qr.png"
 
-code = res.get("qr_code") or res.get("code")
-link = res.get("qr_link")
 
-if code:
-    # Raw payload: render it straight into the terminal, no browser needed.
+def draw(im_bytes):
+    # Draw into the terminal too, so a headless box can pair without opening a file.
     try:
-        import qrcode
-        q = qrcode.QRCode(border=1)
-        q.add_data(code)
-        q.make()
-        q.print_ascii(invert=True)
-    except Exception:
-        print("QR payload (paste into any QR generator):\n", code)
-elif link:
-    # GOWA returns an ABSOLUTE url built from its own container hostname, e.g.
-    # http://localhost/statics/qrcode/scan-qr-xxx.png -- port 80 inside the container,
-    # which is not reachable from here. Keep only the path and re-join to GOWA_URL.
-    from urllib.parse import urlparse
-    path = urlparse(str(link)).path or str(link)
-    url = f"{base}/{path.lstrip('/')}"
-    out = Path(".run"); out.mkdir(exist_ok=True)
-    png = out / "whatsapp-qr.png"
-    try:
-        img = httpx.get(url, auth=auth, timeout=30)
-        img.raise_for_status()
-        png.write_bytes(img.content)
-        print(f"QR saved to: {png.resolve()}")
-        print("Open that file and scan it.\n")
-        # Also try to draw it in the terminal, so a headless box still works.
-        try:
-            from PIL import Image
-            im = Image.open(png).convert("L")
-            w, h = im.size
-            # QR images are a fixed module grid; sample it back down to that grid.
-            n = 45
-            step_x, step_y = w / n, h / n
-            for gy in range(n):
-                row = ""
-                for gx in range(n):
-                    px = im.getpixel((min(int(gx * step_x + step_x / 2), w - 1),
-                                      min(int(gy * step_y + step_y / 2), h - 1)))
-                    row += "  " if px > 128 else "██"
-                print(row)
-        except Exception:
-            pass
-    except Exception as e:
-        print(f"could not download the QR image ({e})")
-        print(f"Try opening: {url}")
-else:
-    print("No QR returned:", res)
-    sys.exit(1)
-
-print(f"\nOn the pharmacy phone: WhatsApp -> Settings -> Linked devices -> Link a device")
-print(f"\nDevice id: {dev_id}")
-print(f"Put this in .env:  GOWA_DEVICE_ID={dev_id}")
-
-print("\nWaiting for the scan", end="", flush=True)
-for _ in range(60):
-    time.sleep(3)
-    try:
-        if [d for d in devices() if d.get("connected") or d.get("logged_in")]:
-            print("\n\n  PAIRED.")
-            print("  Next: ./run.sh brand   (pushes the logo + display name)")
-            sys.exit(0)
+        from PIL import Image
+        import io
+        im = Image.open(io.BytesIO(im_bytes)).convert("L")
+        w, h = im.size
+        # QR images are a fixed module grid; sample it back down to that grid.
+        n = 45
+        step_x, step_y = w / n, h / n
+        for gy in range(n):
+            row = ""
+            for gx in range(n):
+                px = im.getpixel((min(int(gx * step_x + step_x / 2), w - 1),
+                                  min(int(gy * step_y + step_y / 2), h - 1)))
+                row += "  " if px > 128 else "██"
+            print(row)
     except Exception:
         pass
-    print(".", end="", flush=True)
-print("\n\nNot paired yet. The QR expires quickly — rerun ./run.sh qr for a fresh one.")
+
+
+def fetch_qr():
+    """Ask GOWA for a pairing QR, save it to .run/whatsapp-qr.png, draw it. False on
+    failure."""
+    try:
+        r = httpx.get(f"{base}/app/login", auth=auth, headers=hdrs, timeout=90)
+        res = (r.json() or {}).get("results") or {}
+    except Exception as e:
+        print(f"login request failed: {e}")
+        return False
+
+    code = res.get("qr_code") or res.get("code")
+    link = res.get("qr_link")
+
+    if code:
+        # Raw payload: render it straight into the terminal, no browser needed.
+        try:
+            import qrcode
+            q = qrcode.QRCode(border=1)
+            q.add_data(code)
+            q.make()
+            q.print_ascii(invert=True)
+        except Exception:
+            print("QR payload (paste into any QR generator):\n", code)
+        return True
+    if link:
+        # GOWA returns an ABSOLUTE url built from its own container hostname, e.g.
+        # http://localhost/statics/qrcode/scan-qr-xxx.png -- port 80 inside the
+        # container, which is not reachable from here. Keep only the path and re-join
+        # to GOWA_URL.
+        from urllib.parse import urlparse
+        path = urlparse(str(link)).path or str(link)
+        url = f"{base}/{path.lstrip('/')}"
+        try:
+            img = httpx.get(url, auth=auth, timeout=30)
+            img.raise_for_status()
+            png.write_bytes(img.content)
+            print(f"QR saved to: {png.resolve()}   (refreshes here automatically)")
+            draw(img.content)
+            return True
+        except Exception as e:
+            print(f"could not download the QR image ({e})")
+            print(f"Try opening: {url}")
+            return False
+    print("No QR returned:", res)
+    return False
+
+
+print(f"On the pharmacy phone: WhatsApp -> Settings -> Linked devices -> Link a device")
+print(f"Device id: {dev_id}   (GOWA_DEVICE_ID in .env)\n")
+
+# A WhatsApp QR dies after ~60s, and GOWA rotates to a new one roughly every 90s --
+# but /app/login returns only the FIRST one and then logs "QR context canceled while
+# sending QR path" as it tries to push the rest into a request we already closed. So a
+# single fetch gives you one ~60s window: open the png, walk to the phone, and it is
+# already dead. That is the whole reason pairing "never works". Re-fetch on a loop so
+# the file on disk is always a live code and you get several attempts.
+ROUNDS, POLL_SECS = 6, 50
+for rnd in range(ROUNDS):
+    if rnd:
+        print(f"\nThat code expired. Fresh QR ({rnd + 1}/{ROUNDS})...\n")
+    if not fetch_qr():
+        sys.exit(1)
+    print("\nWaiting for the scan", end="", flush=True)
+    for _ in range(POLL_SECS // 5):
+        time.sleep(5)
+        try:
+            if [d for d in devices() if paired(d)]:
+                print("\n\n  PAIRED.")
+                print("  Next: ./run.sh brand   (pushes the logo + display name)")
+                sys.exit(0)
+        except Exception:
+            pass
+        print(".", end="", flush=True)
+
+print(f"\n\nStill not paired after {ROUNDS} codes. The phone must be on the "
+      "'Link a device' screen BEFORE the QR appears. Rerun: ./run.sh qr")
 PYEOF
   ;;
 
