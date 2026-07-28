@@ -15,11 +15,18 @@ The database is already multi-tenant. The application is not.
 | Schema | `pharmacy_id` on every tenant table; `tenant_isolation` policy on all 31 public tables; isolation proven against two real tenants in `tests/test_rls.py` |
 | Application | **Hard-bound to one pharmacy at import time** |
 
-The binding is four module-level constants:
+The binding is **nine** module-level constants:
 
 ```python
-PID = settings.PHARMACY_ID     # router.py:19, grn.py:18, reports.py:17, approvals.py:37
+PID = settings.PHARMACY_ID
+# router.py:19   grn.py:18            reports.py:17
+# approvals.py:37  jobs.py:17         agent_api.py:26
+# forecast.py:34   payments_sms.py:31  rx.py:21
 ```
+
+An earlier draft of this spec said four. It was wrong — a narrow grep missed five, including
+`rx.py` (the prescription path, i.e. the demo centrepiece) and `forecast.py`. Anyone
+estimating item #3 from the old figure will be out by more than half.
 
 `settings.PHARMACY_ID` is read from `.env` once at process start. Every query below
 these lines already accepts `pharmacy_id` as a SQL parameter — the value is merely
@@ -161,10 +168,10 @@ bug in the earlier draft plan.
 ### Carrying `pharmacy_id` to the queries
 
 **Decision: a contextvar set once per inbound message.** `PID` becomes
-`current_pharmacy()` in all four modules.
+`current_pharmacy()` across all nine modules.
 
 Rejected alternative — threading an explicit parameter through every signature. It is
-cleaner in the abstract, but it is dozens of edits across four modules inside two days,
+cleaner in the abstract, but it is dozens of edits across nine modules inside two days,
 and each missed site is a chance of a silent cross-tenant read. With a contextvar the
 correct tenant is the default everywhere, and a missed site behaves correctly rather than
 leaking.
@@ -189,7 +196,7 @@ are the demo. Registration is a bonus beat.**
 | 0 | **Tag the last known-good single-tenant state; verify one-command revert** | This tag is what makes Wednesday-night breakage survivable rather than terminal |
 | 1 | Device-scoped outbound, persisted on the record (`wa.py`) | Invisible with one number, catastrophic with two (§6) |
 | 2 | `wa_jid`, `gowa_device_id`, `kind` columns + partial unique indexes | Everything else needs them |
-| 3 | Resolver: `device_id` → `pharmacy_id`, contextvar, replace 4 `PID` constants, platform/tenant/throw branch | The core change |
+| 3 | Resolver: `device_id` → `pharmacy_id`, contextvar, replace **9** `PID` constants, platform/tenant/throw branch | The core change |
 | 4 | `jobs.py` per-pharmacy loop | Otherwise cron writes to one tenant only — and it is the path that catches context-based device resolution |
 | 5 | Seed two tenants, visibly distinct: different companies, different stock, **different price for the same molecule** | Without this the isolation beat has nothing to show |
 | 6 | Pair both SIMs, brand each per device | Needs #1 to brand independently |
