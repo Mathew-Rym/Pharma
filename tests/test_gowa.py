@@ -151,42 +151,63 @@ def test_every_documented_media_shape_is_understood(payload, expected):
 
 
 # ============================================================ send adapter
-def test_send_text_targets_the_gowa_endpoint(monkeypatch):
-    """The two backends use different paths and body keys; a mix-up is a silent
-    404 that only shows up as 'the pharmacist never got the message'."""
-    import wa
+# These assert the transport payload shape, which now belongs to _send_for(row, slot).
+# They used to drive send_text() and stub _log_out to keep the database out; the row is
+# now written BEFORE the send (by compose), so there is no after-the-fact hook to stub.
+# Driving _send_for directly is closer to the behaviour under test and needs no DB at all.
+def _capture(monkeypatch, wa, gowa: bool) -> list:
     calls = []
 
     class _R:
         def raise_for_status(self):
             pass
 
-    monkeypatch.setattr(wa, "_GOWA", True)
+    monkeypatch.setattr(wa, "_GOWA", gowa)
     monkeypatch.setattr(wa.httpx, "post",
                         lambda url, **kw: calls.append((url, kw)) or _R())
-    monkeypatch.setattr(wa, "_log_out", lambda *a, **k: None)
-    wa.send_text("0713755274", "hello")
+    return calls
+
+
+def _row(**over) -> dict:
+    row = {"to_phone": "254713755274", "msg_type": "text", "body": "hello",
+           "media_path": None}
+    row.update(over)
+    return row
+
+
+def test_send_text_targets_the_gowa_endpoint(monkeypatch):
+    """The two backends use different paths and body keys; a mix-up is a silent
+    404 that only shows up as 'the pharmacist never got the message'."""
+    import wa
+    calls = _capture(monkeypatch, wa, True)
+    wa._send_for(_row(), "pharmacy-a")
 
     url, kw = calls[0]
     assert url.endswith("/send/message")
     assert kw["json"] == {"phone": "254713755274", "message": "hello"}
 
 
+def test_the_send_carries_the_device_from_the_row(monkeypatch):
+    """The slot on the record decides which WhatsApp account the message leaves by.
+
+    Would fail if _post fell back to a configured default device -- which is how one
+    pharmacy's customer receives another pharmacy's reply.
+    """
+    import wa
+    calls = _capture(monkeypatch, wa, True)
+    wa._send_for(_row(), "pharmacy-b")
+
+    _, kw = calls[0]
+    assert kw["headers"]["X-Device-Id"] == "pharmacy-b"
+
+
 def test_send_image_uses_image_url_not_a_file_upload(monkeypatch):
     """GOWA tolerates a missing file when image_url is set, which lets signed URLs
     stay out of this process. Sending the wrong key silently drops the image."""
     import wa
-    calls = []
-
-    class _R:
-        def raise_for_status(self):
-            pass
-
-    monkeypatch.setattr(wa, "_GOWA", True)
-    monkeypatch.setattr(wa.httpx, "post",
-                        lambda url, **kw: calls.append((url, kw)) or _R())
-    monkeypatch.setattr(wa, "_log_out", lambda *a, **k: None)
-    wa.send_image("254713755274", "https://signed/rx.jpg", "Prescription")
+    calls = _capture(monkeypatch, wa, True)
+    wa._send_for(_row(msg_type="image", body="Prescription",
+                      media_path="https://signed/rx.jpg"), "pharmacy-a")
 
     url, kw = calls[0]
     assert url.endswith("/send/image")
@@ -197,17 +218,8 @@ def test_send_image_uses_image_url_not_a_file_upload(monkeypatch):
 def test_baileys_backend_still_uses_the_old_shape(monkeypatch):
     """The pilot may run either transport; the old one must not break."""
     import wa
-    calls = []
-
-    class _R:
-        def raise_for_status(self):
-            pass
-
-    monkeypatch.setattr(wa, "_GOWA", False)
-    monkeypatch.setattr(wa.httpx, "post",
-                        lambda url, **kw: calls.append((url, kw)) or _R())
-    monkeypatch.setattr(wa, "_log_out", lambda *a, **k: None)
-    wa.send_text("254713755274", "hello")
+    calls = _capture(monkeypatch, wa, False)
+    wa._send_for(_row(), "pharmacy-a")
 
     url, kw = calls[0]
     assert url.endswith("/send")
