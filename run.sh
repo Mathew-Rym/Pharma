@@ -433,6 +433,131 @@ except Exception as e:
 PYEOF
   ;;
 
+pair)
+  # Pair a pharmacy handset by CODE rather than QR.
+  #
+  # Use this for onboarding a real pharmacy: WhatsApp generates an 8-character code, the
+  # human types it on THAT handset, and no image has to be relayed anywhere. A QR expires
+  # in under a minute and cannot survive being sent to another phone as a picture, which
+  # is why ./run.sh qr only works when you are standing at the machine.
+  #
+  # Usage: ./run.sh pair 254712345678 [slot-name]
+  : "${GOWA_PASS:?set GOWA_PASS in .env}"
+  PHONE="${2:?usage: ./run.sh pair <phone-with-country-code> [slot-name]}"
+  SLOT="${3:-pharmacy-$(echo "$PHONE" | tail -c 5)}"
+  PHONE="$PHONE" SLOT="$SLOT" "$PY" - <<'PYEOF'
+import os, sys, time
+sys.path.insert(0, "api")
+import httpx
+from config import settings
+
+base = settings.GOWA_URL.rstrip("/")
+auth = (settings.GOWA_USER or "pharmaos", settings.GOWA_PASS)
+phone, slot = os.environ["PHONE"], os.environ["SLOT"]
+
+
+def slots():
+    r = httpx.get(f"{base}/devices", auth=auth, timeout=15)
+    return {s["id"]: s for s in ((r.json() or {}).get("results") or [])}
+
+
+live = slots()
+if slot not in live:
+    r = httpx.post(f"{base}/devices", auth=auth, timeout=20, json={"device_id": slot})
+    if r.status_code not in (200, 201):
+        print(f"could not create slot {slot}: {r.status_code} {r.text[:200]}")
+        sys.exit(1)
+    print(f"created slot {slot}")
+elif live[slot].get("jid"):
+    print(f"slot {slot} is ALREADY paired to {live[slot]['jid']}")
+    print("To pair a different number use a new slot name, or ./run.sh unpair first.")
+    sys.exit(0)
+
+print(f"\nAsking WhatsApp for a link code for +{phone} ...\n")
+r = httpx.get(f"{base}/app/login-with-code", auth=auth,
+              headers={"X-Device-Id": slot}, params={"phone_number": phone}, timeout=90)
+res = (r.json() or {}).get("results") or {}
+code = res.get("pair_code") or res.get("code") or res.get("pairing_code")
+if not code:
+    print(f"no code returned: {r.status_code} {str(res)[:300]}")
+    sys.exit(1)
+
+print("=" * 46)
+print(f"   CODE:  {code}")
+print("=" * 46)
+print(f"\nOn the handset for +{phone}:")
+print("  WhatsApp -> Settings -> Linked devices")
+print("  -> Link a device -> 'Link with phone number instead'")
+print(f"  -> enter {code}\n")
+print("Relay that code to the pharmacy however you like -- it is text, so WhatsApp,")
+print("SMS or a phone call all work. Unlike a QR it does not have to be a picture.\n")
+
+print("Waiting for the pairing", end="", flush=True)
+for _ in range(40):
+    time.sleep(3)
+    s = slots().get(slot) or {}
+    if s.get("jid"):
+        print(f"\n\n  PAIRED: {slot} -> {s['jid']}")
+        print("\n  Now bind it to a pharmacy:")
+        print(f"    ./run.sh bind {slot}\n")
+        sys.exit(0)
+    print(".", end="", flush=True)
+print("\n\nNot paired yet. The code expires; rerun ./run.sh pair to get a fresh one.")
+PYEOF
+  ;;
+
+bind)
+  # Attach a paired GOWA slot to a pharmacy row, so inbound resolves and outbound has a
+  # device. Reads the JID from GOWA rather than accepting it as an argument: the JID is
+  # the tenant key, and typing it by hand is how you bind the wrong handset.
+  SLOT="${2:?usage: ./run.sh bind <slot-name> [pharmacy-name]}"
+  SLOT="$SLOT" PHARM="${3:-}" "$PY" - <<'PYEOF'
+import os, sys
+sys.path.insert(0, "api")
+import httpx
+from config import settings
+from db import ex, q, q1
+
+base = settings.GOWA_URL.rstrip("/")
+auth = (settings.GOWA_USER or "pharmaos", settings.GOWA_PASS)
+slot, want = os.environ["SLOT"], os.environ.get("PHARM") or ""
+
+r = httpx.get(f"{base}/devices", auth=auth, timeout=15)
+s = {d["id"]: d for d in ((r.json() or {}).get("results") or [])}.get(slot)
+if not s:
+    print(f"no such slot: {slot}"); sys.exit(1)
+jid = s.get("jid")
+if not jid:
+    print(f"slot {slot} is not paired yet -- run ./run.sh pair first"); sys.exit(1)
+
+taken = q1("select name from pharmacies where wa_jid=%s and gowa_device_id<>%s",
+           (jid, slot))
+if taken:
+    print(f"{jid} is already bound to {taken['name']}"); sys.exit(1)
+
+if want:
+    row = q1("select id, name from pharmacies where name = %s", (want,))
+    if not row:
+        row = q1("""insert into pharmacies (name, kind, timezone)
+                    values (%s,'tenant','Africa/Nairobi') returning id, name""", (want,))
+        print(f"created pharmacy {row['name']}")
+else:
+    rows = q("""select id, name, wa_jid, gowa_device_id from pharmacies
+                 where kind='tenant' order by name""")
+    print("\nWhich pharmacy?\n")
+    for i, x in enumerate(rows, 1):
+        bound = f"  (bound to {x['gowa_device_id']})" if x["gowa_device_id"] else ""
+        print(f"  {i}. {x['name']}{bound}")
+    pick = input("\nNumber: ").strip()
+    row = rows[int(pick) - 1]
+
+ex("update pharmacies set wa_jid=%s, gowa_device_id=%s, wa_number=%s where id=%s",
+   (jid, slot, jid.split("@")[0], row["id"]))
+print(f"\n  {row['name']}  <-  {slot}  ({jid})\n")
+print("  Verify: ./run.sh safety\n")
+PYEOF
+  ;;
+
 safety)
   # A gate that is off looks exactly like a gate that is on until the number is banned.
   # Print the posture so it is checkable in one command rather than inferred from .env.

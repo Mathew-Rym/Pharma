@@ -15,7 +15,7 @@ from fastapi.responses import HTMLResponse, JSONResponse
 
 from config import settings
 from db import ensure_buckets, q, q1, upload
-from jobs import JOBS
+from jobs import JOBS, for_every_tenant
 from router import handle_inbound
 from tenant import resolve_pharmacy_by_device, resolve_tenant
 from utils import from_pieces, kes, norm_phone
@@ -44,14 +44,17 @@ def _startup() -> None:
         ensure_buckets()
     except Exception:
         log.warning("bucket check skipped", exc_info=True)
-    log.info("pharmaos api up · pharmacy=%s · model=%s",
-             settings.PHARMACY_ID, settings.MODEL_VISION)
+    log.info("pharmaos api up · model=%s", settings.MODEL_VISION)
 
 
 @app.get("/health")
 def health():
-    row = q1("select count(*) as n from products where pharmacy_id=%s", (settings.PHARMACY_ID,))
-    return {"ok": True, "products": row["n"], "time": datetime.utcnow().isoformat()}
+    # Health has no tenant context, so it reports the whole deployment rather than
+    # pretending to be one pharmacy.
+    row = q1("select count(*) as n from products")
+    ten = q1("select count(*) as n from pharmacies where kind='tenant'")
+    return {"ok": True, "products": row["n"], "tenants": ten["n"],
+            "time": datetime.utcnow().isoformat()}
 
 
 # ============================================================ WhatsApp webhook
@@ -82,9 +85,13 @@ async def webhook_media(background: BackgroundTasks,
     data = await file.read()
 
     # Resolve which pharmacy this image is for
-    pid = resolve_tenant(phone) or settings.PHARMACY_ID
+    # No `or settings.PHARMACY_ID`: an unresolved sender must not have their media filed
+    # under whichever pharmacy the environment names.
+    tenant = resolve_tenant(phone)
+    if not tenant:
+        raise HTTPException(400, "sender is not linked to any pharmacy")
     staff = q1("select id from staff where phone=%s and pharmacy_id=%s and is_active",
-               (phone, pid))
+               (phone, tenant))
     bucket = settings.BUCKET_INVOICES if staff else settings.BUCKET_RX
     ext = (file.filename or "img.jpg").rsplit(".", 1)[-1].lower()
     if ext not in ("jpg", "jpeg", "png", "webp"):
@@ -101,7 +108,7 @@ async def webhook_media(background: BackgroundTasks,
         "text": caption,
         "media_bucket": bucket,
         "media_path": path,
-        "pharmacy_id": pid,
+        "pharmacy_id": tenant,
     })
     return {"ok": True, "path": path}
 
@@ -186,10 +193,16 @@ async def webhook_gowa(request: Request, background: BackgroundTasks,
                 log.exception("could not fetch remote media %s", rel)
         if data:
             # Resolve which pharmacy received this media
-            pid = resolve_pharmacy_by_device(
-                body.get("device_id") or "") or settings.PHARMACY_ID
+            media_tenant = resolve_pharmacy_by_device(body.get("device_id") or "")
+            if not media_tenant:
+                # Unknown device: we do not know whose prescription this is, and filing it
+                # under a configured default would put a patient's Rx in another
+                # pharmacy's bucket.
+                log.warning("media from unknown device %s; not stored",
+                            body.get("device_id"))
+                return {"ok": True, "ignored": "unknown device"}
             staff = q1("""select id from staff where phone=%s and pharmacy_id=%s
-                           and is_active""", (phone, pid))
+                           and is_active""", (phone, media_tenant))
             bucket = settings.BUCKET_INVOICES if staff else settings.BUCKET_RX
             ext = str(rel).rsplit(".", 1)[-1].lower().split("?")[0]
             if ext not in ("jpg", "jpeg", "png", "webp", "pdf"):
@@ -205,9 +218,14 @@ async def webhook_gowa(request: Request, background: BackgroundTasks,
             log.warning("gowa media %s could not be retrieved; treating as text", rel)
 
     # Resolve pharmacy from GOWA device and inject into the message
-    device_pharmacy = resolve_pharmacy_by_device(
-        body.get("device_id") or "") or settings.PHARMACY_ID
-    inbound["pharmacy_id"] = device_pharmacy
+    # The device that RECEIVED this message names the tenant. When it does not resolve,
+    # leave pharmacy_id unset and let the router fall back to the sender's identity --
+    # which is the honest path while one number serves several pharmacies. What must not
+    # happen is defaulting to a configured pharmacy: that silently files a stranger's
+    # conversation into whichever tenant .env happens to name.
+    device_pharmacy = resolve_pharmacy_by_device(body.get("device_id") or "")
+    if device_pharmacy:
+        inbound["pharmacy_id"] = device_pharmacy
 
     log.info("gowa inbound from=%s type=%s device=%s pharmacy=%s",
              phone, inbound["type"], body.get("device_id"), device_pharmacy)
@@ -239,7 +257,12 @@ def run_job(name: str, x_pharmaos_secret: str | None = Header(None),
     fn = JOBS.get(name)
     if not fn:
         raise HTTPException(404, f"unknown job. available: {list(JOBS)}")
-    return fn()
+    # Cron has no inbound message and therefore no tenant, so the job runs once per paired
+    # tenant with that tenant bound. Calling fn() directly would raise NoTenant -- which is
+    # the intended behaviour of pid(), and the reason this loop has to be here rather than
+    # relying on a default.
+    results = for_every_tenant(fn)
+    return {"job": name, "tenants": len(results), "results": results}
 
 
 # ============================================================ QR verification

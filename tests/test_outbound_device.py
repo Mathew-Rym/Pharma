@@ -37,8 +37,12 @@ def gate_one_off(monkeypatch):
     With a WA_ALLOWLIST set in .env, Gate 1 refuses these fixture numbers before compose
     reaches the device logic -- so the result would depend on the developer's environment.
     """
-    from config import settings
-    monkeypatch.setattr(settings, "WA_ALLOWLIST", "")
+    # Patch the object safety.py actually reads. `from config import settings`
+    # here can hand back a different Settings instance than safety bound at
+    # import time, in which case patching it has no effect and Gate 1 stays on --
+    # which is why these tests passed alone and failed in the full suite.
+    import safety
+    monkeypatch.setattr(safety.settings, "WA_ALLOWLIST", "")
 
 
 @pytest.fixture

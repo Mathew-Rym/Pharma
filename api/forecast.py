@@ -31,7 +31,7 @@ from db import ex, ex1, q, q1
 from utils import from_pieces, kes
 
 log = logging.getLogger(__name__)
-PID = settings.PHARMACY_ID
+from tenancy import pid          # tenant comes from the request, not from .env
 
 
 def recompute_all() -> dict:
@@ -46,7 +46,7 @@ def recompute_all() -> dict:
                   left join v_seasonality s
                          on s.product_id = b.product_id and s.mo = %s
                   left join v_stock_on_hand oh on oh.product_id = b.product_id
-                 where b.pharmacy_id = %s""", (month, PID))
+                 where b.pharmacy_id = %s""", (month, pid()))
 
     written, with_signal = 0, 0
     for r in rows:
@@ -77,7 +77,7 @@ def recompute_all() -> dict:
                     days_of_cover=excluded.days_of_cover,
                     confidence=excluded.confidence, method=excluded.method,
                     computed_at=now()""",
-           (r["product_id"], PID, round(base, 3), round(season, 3), forecast30,
+           (r["product_id"], pid(), round(base, 3), round(season, 3), forecast30,
             round(cover, 1) if cover is not None else None,
             r["confidence"], method[:300]))
         written += 1
@@ -105,7 +105,7 @@ def reorder_list(limit: int = 25) -> list[dict]:
                    and f.days_of_cover is not null
                    and f.days_of_cover <= (coalesce(sup.lead_time_days,2) + 10)
                  order by f.days_of_cover asc
-                 limit %s""", (PID, limit))
+                 limit %s""", (pid(), limit))
 
 
 def suggest_qty(row: dict, target_days: int = 30) -> int:
@@ -126,7 +126,7 @@ def reorder_message(limit: int = 12) -> str:
     rows = reorder_list(limit)
     if not rows:
         no_signal = q1("""select count(*) as n from demand_forecast
-                           where pharmacy_id=%s and avg_daily = 0""", (PID,))
+                           where pharmacy_id=%s and avg_daily = 0""", (pid(),))
         if no_signal and no_signal["n"] > 20:
             return (f"Nothing to reorder from what I can see — but {no_signal['n']} "
                     f"products have no sales history in the system yet. Reply *SYNC* "
@@ -177,7 +177,7 @@ def create_draft_pos(staff_id: str | None = None,
         po = ex1("""insert into purchase_orders (pharmacy_id, supplier_id, status, reason,
                            total_estimate)
                     values (%s,%s,'awaiting_approval',%s,%s) returning id""",
-                 (PID, sup_id,
+                 (pid(), sup_id,
                   json.dumps({"trigger": "forecast", "method": "seasonal_naive",
                               "requested_by": staff_id}), est))
         if not po:
@@ -205,7 +205,7 @@ def forecast_explain(product_query: str) -> str:
                 left join v_stock_on_hand oh on oh.product_id = f.product_id
                where f.pharmacy_id=%s and similarity(p.name,%s) > 0.3
                order by similarity(p.name,%s) desc limit 1""",
-           (PID, product_query, product_query))
+           (pid(), product_query, product_query))
     if not r:
         return f"No forecast for '{product_query}'."
 
@@ -213,7 +213,7 @@ def forecast_explain(product_query: str) -> str:
                   from sales_history_monthly h
                   join products p on p.id = h.product_id
                  where p.pharmacy_id=%s and similarity(p.name,%s) > 0.3
-                 order by period desc limit 6""", (PID, product_query))
+                 order by period desc limit 6""", (pid(), product_query))
     trail = ("\nRecent months: " + ", ".join(f"{h['m']} {h['qty_pieces']}"
                                              for h in reversed(hist))) if hist else ""
 

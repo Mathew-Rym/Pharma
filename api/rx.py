@@ -18,18 +18,18 @@ from utils import from_pieces, kes, parse_date_loose
 from wa import reply_document, reply_text, send_text
 
 log = logging.getLogger(__name__)
-PID = settings.PHARMACY_ID
+from tenancy import pid          # tenant comes from the request, not from .env
 
 
 # ------------------------------------------------------------ customer identity
 def get_or_create_customer(phone: str) -> dict:
-    row = q1("select * from customers where pharmacy_id=%s and phone=%s", (PID, phone))
+    row = q1("select * from customers where pharmacy_id=%s and phone=%s", (pid(), phone))
     if row:
         return row
     return ex1(
         """insert into customers (pharmacy_id, phone) values (%s,%s)
            returning *""",
-        (PID, phone),
+        (pid(), phone),
     )
 
 
@@ -50,7 +50,7 @@ def record_consent(phone: str) -> None:
     ex(
         """update customers set consent_given=true, consent_at=now()
             where pharmacy_id=%s and phone=%s""",
-        (PID, phone),
+        (pid(), phone),
     )
     clear_state(phone)
     reply_text(phone,
@@ -101,7 +101,7 @@ def receive_prescription(phone: str, storage_path: str) -> None:
                                       extracted, confidence, flags, status)
            values (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'pending_verification')
            returning id""",
-        (PID, cust["id"], storage_path, data.get("patient_name"),
+        (pid(), cust["id"], storage_path, data.get("patient_name"),
          data.get("prescriber_name"), data.get("prescriber_reg"), issued,
          __import__("json").dumps(drugs), data.get("overall_confidence"), flags),
     )
@@ -123,7 +123,7 @@ def _build_quote(customer_id: str, rx_id: str, drugs: list[dict]):
         """insert into orders (pharmacy_id, customer_id, prescription_id, status,
                                qr_token)
            values (%s,%s,%s,'awaiting_pharmacist',%s) returning id""",
-        (PID, customer_id, rx_id, secrets.token_urlsafe(16)),
+        (pid(), customer_id, rx_id, secrets.token_urlsafe(16)),
     )
     order_id = order["id"]
     avail, missing, subtotal = [], [], 0.0
@@ -140,7 +140,7 @@ def _build_quote(customer_id: str, rx_id: str, drugs: list[dict]):
                   and (p.name ilike %s or similarity(p.name,%s) > 0.35
                        or similarity(coalesce(p.generic_name,''), %s) > 0.35)
                 order by similarity(p.name,%s) desc limit 1""",
-            (PID, f"%{d.get('drug') or ''}%", name, d.get("drug") or "", name),
+            (pid(), f"%{d.get('drug') or ''}%", name, d.get("drug") or "", name),
         )
         if not prod or (prod["qty_pieces"] or 0) <= 0:
             missing.append(name or (d.get("drug") or "unknown item"))
@@ -151,7 +151,7 @@ def _build_quote(customer_id: str, rx_id: str, drugs: list[dict]):
                 where pharmacy_id=%s and product_id=%s and qty_pieces > 0
                   and (expiry_date is null or expiry_date > current_date + %s)
                 order by expiry_date nulls last""",
-            (PID, prod["id"], timedelta(days=settings.MIN_SHELF_LIFE_DAYS)),
+            (pid(), prod["id"], timedelta(days=settings.MIN_SHELF_LIFE_DAYS)),
         )
         remaining, allocated = qty_wanted, []
         for b in batches:
@@ -193,7 +193,7 @@ def _notify_pharmacists(rx_id: str, cust: dict, drugs: list[dict], flags: list[s
     pharmacists = q(
         """select phone, name from staff
             where pharmacy_id=%s and role in ('pharmacist','owner','manager') and is_active""",
-        (PID,),
+        (pid(),),
     )
     names = ", ".join(d.get("drug", "?") for d in drugs[:5])
     warn = f"\n⚠️ Flags: {', '.join(flags)}" if flags else ""
@@ -235,7 +235,7 @@ def pharmacist_approve(rx_id: str, staff_id: str) -> None:
         f"• {l['name']} — {from_pieces(l['qty_pieces'], l['pack_size'])} — {kes(l['line_total'])}"
         for l in lines
     )
-    ph = q1("select mpesa_paybill from pharmacies where id=%s", (PID,))
+    ph = q1("select mpesa_paybill from pharmacies where id=%s", (pid(),))
     set_state(cust["phone"], "awaiting_confirm", {"order_id": str(order["id"])}, ttl_min=120)
     reply_text(
         cust["phone"],
@@ -286,7 +286,7 @@ def customer_confirm(phone: str) -> None:
             reply_text(phone, "📲 Check your phone and enter your M-Pesa PIN to pay "
                              f"{kes(order['total'])}. We will confirm here automatically.")
         else:
-            ph = q1("select mpesa_paybill from pharmacies where id=%s", (PID,))
+            ph = q1("select mpesa_paybill from pharmacies where id=%s", (pid(),))
             reply_text(phone, "The M-Pesa prompt failed to send. Please pay to Paybill "
                              f"{ph['mpesa_paybill'] or '—'}, account "
                              f"{str(order_id)[:8].upper()}, amount {kes(order['total'])}.")
@@ -342,7 +342,7 @@ def on_payment_success(order_id: str, receipt: str) -> None:
     )
 
     for s in q("""select phone from staff where pharmacy_id=%s and is_active
-                   and role in ('owner','manager','attendant')""", (PID,)):
+                   and role in ('owner','manager','attendant')""", (pid(),)):
         reply_text(s["phone"],
                   f"💰 Paid order {str(order_id)[:8].upper()} · {kes(order['total'])} · "
                   f"{cust['phone']} · code {code}. Pack and dispatch.")
@@ -356,7 +356,7 @@ def order_status(phone: str) -> None:
              join customers c on c.id = o.customer_id
             where c.pharmacy_id=%s and c.phone=%s
             order by o.created_at desc limit 1""",
-        (PID, phone),
+        (pid(), phone),
     )
     if not o:
         reply_text(phone, "You have no orders with us yet.")
@@ -378,10 +378,10 @@ def order_status(phone: str) -> None:
 def delete_my_data(phone: str) -> None:
     """DPA 2019 right to erasure. Keeps financial records, drops personal data."""
     ex("""update customers set name=null, consent_given=false, marketing_opt_in=false
-           where pharmacy_id=%s and phone=%s""", (PID, phone))
+           where pharmacy_id=%s and phone=%s""", (pid(), phone))
     ex("""update prescriptions set patient_name=null, extracted='[]'::jsonb
            where customer_id in (select id from customers where pharmacy_id=%s and phone=%s)""",
-       (PID, phone))
+       (pid(), phone))
     clear_state(phone)
     reply_text(phone, "Your personal details and prescription contents have been removed. "
                      "Payment records are kept as the law requires.")

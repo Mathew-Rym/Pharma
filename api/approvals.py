@@ -34,7 +34,7 @@ from utils import from_pieces, kes
 from wa import reply_document, reply_image, reply_text, send_document, send_text
 
 log = logging.getLogger(__name__)
-PID = settings.PHARMACY_ID
+from tenancy import pid          # tenant comes from the request, not from .env
 PIN_MAX_FAILS = 4
 PIN_LOCK_MINUTES = 15
 
@@ -85,7 +85,7 @@ def present_numbered_list(phone: str, rx_id: str, drugs: list[dict]) -> None:
                       where p.pharmacy_id=%s
                         and (p.name ilike %s or similarity(p.name,%s) > 0.35)
                       order by similarity(p.name,%s) desc limit 1""",
-                  (PID, f"%{d.get('drug') or ''}%", name_q, name_q))
+                  (pid(), f"%{d.get('drug') or ''}%", name_q, name_q))
         want = int(d.get("qty") or 1)
         if prod and prod["on_hand"] >= 1:
             price = float(prod["sell_price"] or 0)
@@ -160,7 +160,7 @@ def handle_selection(phone: str, text: str) -> None:
                    select %s, c.id, %s, 'awaiting_pharmacist', %s
                      from customers c where c.pharmacy_id=%s and c.phone=%s
                    returning id""",
-                (PID, rx_id, secrets.token_urlsafe(16), PID, phone))
+                (pid(), rx_id, secrets.token_urlsafe(16), pid(), phone))
     if not order:
         reply_text(phone, "Something went wrong creating your order. Please try again.")
         return
@@ -172,7 +172,7 @@ def handle_selection(phone: str, text: str) -> None:
                           and (expiry_date is null
                                or expiry_date > current_date + %s)
                         order by expiry_date nulls last""",
-                    (PID, it["product_id"],
+                    (pid(), it["product_id"],
                      timedelta(days=settings.MIN_SHELF_LIFE_DAYS)))
         remaining = it["qty"]
         for b in batches:
@@ -227,7 +227,7 @@ def notify_pharmacist(rx_id: str, order_id: str) -> None:
     on_duty = _on_duty_pharmacists()
     if not on_duty:
         on_duty = q("""select * from staff where pharmacy_id=%s and is_active
-                        and role in ('pharmacist','owner','manager')""", (PID,))
+                        and role in ('pharmacist','owner','manager')""", (pid(),))
 
     body = [
         "🩺 *PRESCRIPTION FOR VERIFICATION*",
@@ -275,7 +275,7 @@ def _on_duty_pharmacists() -> list[dict]:
                  where s.pharmacy_id=%s and s.is_active
                    and s.role in ('pharmacist','owner','manager')
                    and (r.on_date = %s or (r.on_date is null and r.weekday = %s))""",
-             (PID, today, weekday))
+             (pid(), today, weekday))
 
 
 def handle_pharmacist_reply(phone: str, staff: dict, text: str) -> bool:
@@ -321,7 +321,7 @@ def _do_approve(rx_id: str, order_id: str, staff: dict, phone: str) -> None:
 
     order = q1("select * from orders where id=%s", (order_id,))
     cust = q1("select * from customers where id=%s", (order["customer_id"],))
-    ph = q1("select mpesa_paybill from pharmacies where id=%s", (PID,))
+    ph = q1("select mpesa_paybill from pharmacies where id=%s", (pid(),))
 
     reply_text(phone, f"✅ Verified and released. Recorded against {staff['name']}"
                      + (f" (PPB {staff['ppb_reg_no']})" if staff.get("ppb_reg_no") else "")
@@ -376,7 +376,7 @@ def send_po_for_approval(po_id: str) -> None:
               f"Ref: {str(po_id)[:8].upper()}")
 
     for s in q("""select phone from staff where pharmacy_id=%s and is_active
-                   and role in ('owner','manager')""", (PID,)):
+                   and role in ('owner','manager')""", (pid(),)):
         set_state(s["phone"], "po_review", {"po_id": str(po_id)}, ttl_min=1440)
         reply_text(s["phone"], body)
 
