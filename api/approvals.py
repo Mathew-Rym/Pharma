@@ -31,7 +31,7 @@ from config import settings
 from db import ex, ex1, q, q1, signed_url
 from state import clear_state, get_state, set_state
 from utils import from_pieces, kes
-from wa import reply_document, reply_image, reply_text, send_text
+from wa import reply_document, reply_image, reply_text, send_document, send_text
 
 log = logging.getLogger(__name__)
 PID = settings.PHARMACY_ID
