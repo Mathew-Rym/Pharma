@@ -8,14 +8,68 @@ import uuid
 from datetime import date, timedelta
 
 from config import settings
-from db import apply_movement, download, ex1, q, q1, tx
-from llm import extract_invoice
-from state import clear_state, get_state, set_state
 from utils import from_pieces, kes, parse_date_loose, parse_expiry, parse_wp, to_pieces
-from wa import send_text
 
 log = logging.getLogger(__name__)
-PID = settings.PHARMACY_ID
+
+
+def _pid() -> str:
+    return settings.PHARMACY_ID
+
+
+def apply_movement(*args, **kwargs):
+    from db import apply_movement as _apply_movement
+    return _apply_movement(*args, **kwargs)
+
+
+def download(*args, **kwargs):
+    from db import download as _download
+    return _download(*args, **kwargs)
+
+
+def ex1(*args, **kwargs):
+    from db import ex1 as _ex1
+    return _ex1(*args, **kwargs)
+
+
+def q(*args, **kwargs):
+    from db import q as _q
+    return _q(*args, **kwargs)
+
+
+def q1(*args, **kwargs):
+    from db import q1 as _q1
+    return _q1(*args, **kwargs)
+
+
+def tx(*args, **kwargs):
+    from db import tx as _tx
+    return _tx(*args, **kwargs)
+
+
+def extract_invoice(*args, **kwargs):
+    from llm import extract_invoice as _extract_invoice
+    return _extract_invoice(*args, **kwargs)
+
+
+def clear_state(*args, **kwargs):
+    from state import clear_state as _clear_state
+    return _clear_state(*args, **kwargs)
+
+
+def get_state(*args, **kwargs):
+    from state import get_state as _get_state
+    return _get_state(*args, **kwargs)
+
+
+def set_state(*args, **kwargs):
+    from state import set_state as _set_state
+    return _set_state(*args, **kwargs)
+
+
+def send_text(*args, **kwargs):
+    from wa import send_text as _send_text
+    return _send_text(*args, **kwargs)
 
 
 # ------------------------------------------------------------ page collection
@@ -62,7 +116,7 @@ def process_pages(phone: str, staff: dict) -> None:
             where g.pharmacy_id = %s and g.invoice_no = %s
               and g.status = 'approved' and g.id <> %s
             limit 1""",
-        (PID, data.get("invoice_no"), grn_id),
+        (_pid(), data.get("invoice_no"), grn_id),
     )
     if dup:
         when = dup["approved_at"].strftime("%d %b %H:%M") if dup["approved_at"] else "earlier"
@@ -89,7 +143,7 @@ def _persist(data: dict, pages: list[str], staff: dict) -> str | None:
                              status, images, raw_extract, model)
            values (%s,%s,%s,%s,%s,%s,%s,%s,%s,'needs_review',%s,%s,%s)
            returning id""",
-        (PID, supplier_id, data.get("invoice_no"),
+        (_pid(), supplier_id, data.get("invoice_no"),
          parse_date_loose(data.get("invoice_date")), data.get("po_ref"),
          data.get("printed_subtotal"), data.get("printed_vat"), data.get("printed_net"),
          parsed_total, __import__("json").dumps(pages),
@@ -141,7 +195,7 @@ def match_product(code: str | None, description: str | None):
     if code:
         row = q1(
             "select id, name, pack_size from products where pharmacy_id=%s and legacy_code=%s",
-            (PID, code.strip()),
+            (_pid(), code.strip()),
         )
         if row:
             return row, 1.0
@@ -152,7 +206,7 @@ def match_product(code: str | None, description: str | None):
              from products
             where pharmacy_id = %s and similarity(name, %s) > %s
             order by score desc limit 1""",
-        (description, PID, description, settings.MATCH_THRESHOLD),
+        (description, _pid(), description, settings.MATCH_THRESHOLD),
     )
     return (row, float(row["score"])) if row else (None, None)
 
@@ -164,13 +218,13 @@ def _match_supplier(name: str | None) -> str | None:
         """select id from suppliers
             where pharmacy_id=%s and similarity(name, %s) > 0.4
             order by similarity(name, %s) desc limit 1""",
-        (PID, name, name),
+        (_pid(), name, name),
     )
     if row:
         return row["id"]
     row = ex1(
         "insert into suppliers (pharmacy_id, name) values (%s,%s) returning id",
-        (PID, name.strip()[:120]),
+        (_pid(), name.strip()[:120]),
     )
     return row["id"]
 
@@ -357,7 +411,7 @@ def _create_product_from_line(grn_id: str, line_no: int) -> str | None:
            values (%s,%s,%s,%s,%s)
            on conflict (pharmacy_id, legacy_code) do update set name = excluded.name
            returning id, pack_size""",
-        (PID, l["raw_code"] or f"NEW-{uuid.uuid4().hex[:6]}", name, pack, l["unit_price"]),
+        (_pid(), l["raw_code"] or f"NEW-{uuid.uuid4().hex[:6]}", name, pack, l["unit_price"]),
     )
     pieces = to_pieces(None, l["qty_invoiced_pieces"], 1) or l["qty_invoiced_pieces"]
     ex1(
@@ -429,7 +483,7 @@ def approve(grn_id: str, staff: dict, phone: str) -> None:
                      do update set verified_by = excluded.verified_by,
                                    verified_at = now()
                    returning id""",
-                (PID, l["product_id"], l["batch_no"], l["expiry_date"],
+                (_pid(), l["product_id"], l["batch_no"], l["expiry_date"],
                  l["unit_price"], grn_id,
                  (g["images"][0] if g["images"] else None),
                  l["confidence"], staff["id"]),
@@ -465,7 +519,7 @@ def approve(grn_id: str, staff: dict, phone: str) -> None:
 
     owner = q1(
         "select phone from staff where pharmacy_id=%s and role='owner' and is_active limit 1",
-        (PID,),
+        (_pid(),),
     )
     if owner and owner["phone"] != phone:
         send_text(owner["phone"],
