@@ -23,7 +23,7 @@ from utils import kes
 
 log = logging.getLogger(__name__)
 router = APIRouter(prefix="/agent", tags=["agent"])
-PID = settings.PHARMACY_ID
+from tenancy import pid          # tenant comes from the request, not from .env
 
 
 def _agent(token: str | None) -> dict:
@@ -149,7 +149,7 @@ def queue_command(command: str, reply_to: str | None = None,
                   requested_by: str | None = None, args: dict | None = None) -> bool:
     """Called from the WhatsApp router. Returns False if no agent is enrolled."""
     a = q1("""select id, last_seen_at from agents where pharmacy_id=%s
-               order by last_seen_at desc nulls last limit 1""", (PID,))
+               order by last_seen_at desc nulls last limit 1""", (pid(),))
     if not a:
         return False
     ex("""insert into agent_commands (agent_id, command, args, reply_to, requested_by)
@@ -162,7 +162,7 @@ def agent_status() -> str:
     a = q1("""select machine_name, agent_version, ingest_mode, db_engine, last_seen_at,
                      suspended
                 from agents where pharmacy_id=%s
-               order by last_seen_at desc nulls last limit 1""", (PID,))
+               order by last_seen_at desc nulls last limit 1""", (pid(),))
     if not a:
         return ("No agent is installed on the pharmacy PC yet. Stock levels reflect "
                 "only what Pharma OS has received and sold, not the till.")
@@ -200,7 +200,7 @@ async def pos_sales(request: Request, x_agent_token: str | None = Header(None)):
                         payment_method, raw)
                   values (%s,'phamacore',%s,%s,%s,%s,%s,%s,%s,%s,%s)
                   on conflict (pharmacy_id, source, external_id) do nothing""",
-               (PID, r.get("external_id"), r.get("sold_at"), r.get("legacy_code"),
+               (pid(), r.get("external_id"), r.get("sold_at"), r.get("legacy_code"),
                 r.get("description"), int(r.get("qty_pieces") or 0),
                 r.get("unit_price"), r.get("line_total"), r.get("payment_method"),
                 json.dumps(r)))
@@ -249,7 +249,7 @@ def apply_pos_sales(limit: int = 2000) -> int:
                  where pharmacy_id=%s and applied=false
                    and (qty_pieces > 0
                         or coalesce((raw->>'qty_is_packs')::boolean, false))
-                 order by sold_at limit %s""", (PID, limit))
+                 order by sold_at limit %s""", (pid(), limit))
     applied = 0
 
     for r in rows:
@@ -257,12 +257,12 @@ def apply_pos_sales(limit: int = 2000) -> int:
         if r["legacy_code"]:
             product = q1("select id, pack_size from products "
                          "where pharmacy_id=%s and legacy_code=%s",
-                         (PID, r["legacy_code"]))
+                         (pid(), r["legacy_code"]))
         if not product and r["description"]:
             product = q1("""select id, pack_size from products
                              where pharmacy_id=%s and similarity(name,%s) > 0.5
                              order by similarity(name,%s) desc limit 1""",
-                         (PID, r["description"], r["description"]))
+                         (pid(), r["description"], r["description"]))
         if not product:
             ex("update pos_sales set apply_error=%s where id=%s",
                ("no matching product", r["id"]))
@@ -281,7 +281,7 @@ def apply_pos_sales(limit: int = 2000) -> int:
         batches = q("""select id, qty_pieces from batches
                         where pharmacy_id=%s and product_id=%s and qty_pieces > 0
                         order by expiry_date nulls last, created_at""",
-                    (PID, product["id"]))
+                    (pid(), product["id"]))
         if not batches:
             ex("update pos_sales set apply_error=%s where id=%s",
                ("sold but we hold no stock for it — likely missing GRN", r["id"]))
@@ -330,12 +330,12 @@ async def history(request: Request, x_agent_token: str | None = Header(None)):
         if r.get("legacy_code"):
             product = q1("""select id, pack_size from products
                              where pharmacy_id=%s and legacy_code=%s""",
-                         (PID, r["legacy_code"]))
+                         (pid(), r["legacy_code"]))
         if not product and r.get("description"):
             product = q1("""select id, pack_size from products where pharmacy_id=%s
                              and similarity(name,%s) > 0.5
                              order by similarity(name,%s) desc limit 1""",
-                         (PID, r["description"], r["description"]))
+                         (pid(), r["description"], r["description"]))
         # Resolve packs -> pieces here too. A monthly total in packs stored as pieces
         # would depress avg_daily by pack_size and make every forecast far too low.
         pieces = _resolve_pieces(r, int(r.get("qty_pieces") or 0),
@@ -348,7 +348,7 @@ async def history(request: Request, x_agent_token: str | None = Header(None)):
                     set qty_pieces = excluded.qty_pieces, value = excluded.value,
                         product_id = coalesce(excluded.product_id,
                                               sales_history_monthly.product_id)""",
-               (PID, (product or {}).get("id"), r.get("legacy_code"), r["period"],
+               (pid(), (product or {}).get("id"), r.get("legacy_code"), r["period"],
                 pieces, r.get("value")))
             inserted += 1
         except Exception as e:
@@ -375,18 +375,18 @@ async def snapshot(request: Request, x_agent_token: str | None = Header(None)):
     compared, variance_total = 0, 0.0
 
     ex("""update stock_reconciliation set status='ignored'
-           where pharmacy_id=%s and status='open'""", (PID,))
+           where pharmacy_id=%s and status='open'""", (pid(),))
 
     for r in rows:
         product = None
         if r.get("legacy_code"):
             product = q1("""select id, pack_size, cost_price from products
                              where pharmacy_id=%s and legacy_code=%s""",
-                         (PID, r["legacy_code"]))
+                         (pid(), r["legacy_code"]))
         if not product:
             continue
         ours = q1("""select coalesce(sum(qty_pieces),0) as n from batches
-                      where pharmacy_id=%s and product_id=%s""", (PID, product["id"]))
+                      where pharmacy_id=%s and product_id=%s""", (pid(), product["id"]))
         # Only multiply by pack_size when the export actually used W/P pack notation.
         # Multiplying a plain piece count would inflate every variance by pack_size
         # and make the headline "unexplained stock" figure fiction.
@@ -399,7 +399,7 @@ async def snapshot(request: Request, x_agent_token: str | None = Header(None)):
         ex("""insert into stock_reconciliation (pharmacy_id, product_id, legacy_code,
                     ledger_pieces, pos_pieces, variance, variance_value, status)
               values (%s,%s,%s,%s,%s,%s,%s,'open')""",
-           (PID, product["id"], r.get("legacy_code"), ours["n"], pos_pieces,
+           (pid(), product["id"], r.get("legacy_code"), ours["n"], pos_pieces,
             variance, value))
         compared += 1
         variance_total += abs(value)
@@ -410,7 +410,7 @@ async def snapshot(request: Request, x_agent_token: str | None = Header(None)):
 def reconciliation_summary(limit: int = 12) -> str:
     rows = q("""select name, legacy_code, ledger_pieces, pos_pieces, variance,
                        variance_value
-                  from v_stock_variance where pharmacy_id=%s limit %s""", (PID, limit))
+                  from v_stock_variance where pharmacy_id=%s limit %s""", (pid(), limit))
     if not rows:
         return "No stock variances open. Pharma OS and phAMACore agree."
     total = sum(abs(float(r["variance_value"] or 0)) for r in rows)

@@ -14,7 +14,7 @@ from pdfgen import Doc, bar_chart, line_chart, qr_png
 from utils import from_pieces, kes
 
 log = logging.getLogger(__name__)
-PID = settings.PHARMACY_ID
+from tenancy import pid          # tenant comes from the request, not from .env
 
 
 # ============================================================ tool schemas
@@ -130,7 +130,7 @@ def _period_bounds(period: str, start: str | None = None, end: str | None = None
 
 def get_stock(product_query: str | None = None, low_stock_only: bool = False,
               limit: int = 15, pharmacy_id: str | None = None) -> str:
-    pid = pharmacy_id or PID
+    pid = pharmacy_id or pid()
     if product_query:
         rows = q(
             """select name, legacy_code, pack_size, qty_pieces, earliest_expiry, sell_price
@@ -165,7 +165,7 @@ def get_stock(product_query: str | None = None, low_stock_only: bool = False,
 
 
 def get_expiry_risk(days: int = 90, limit: int = 20, pharmacy_id: str | None = None) -> str:
-    pid = pharmacy_id or PID
+    pid = pharmacy_id or pid()
     rows = q(
         """select name, batch_no, expiry_date, qty_pieces, value_at_risk, days_left
              from v_expiry_risk
@@ -187,7 +187,7 @@ def get_expiry_risk(days: int = 90, limit: int = 20, pharmacy_id: str | None = N
 
 def get_sales_summary(period: str = "today", start: str | None = None,
                       end: str | None = None, pharmacy_id: str | None = None) -> str:
-    pid = pharmacy_id or PID
+    pid = pharmacy_id or pid()
     s, e = _period_bounds(period, start, end)
     row = q1(
         """select count(distinct o.id) as orders,
@@ -214,7 +214,7 @@ def get_sales_summary(period: str = "today", start: str | None = None,
 
 def get_top_products(days: int = 30, limit: int = 10, by: str = "value",
                      pharmacy_id: str | None = None) -> str:
-    pid = pharmacy_id or PID
+    pid = pharmacy_id or pid()
     order_col = "value" if by == "value" else "pieces"
     rows = q(
         f"""select p.name,
@@ -240,7 +240,7 @@ def get_top_products(days: int = 30, limit: int = 10, by: str = "value",
 def find_supplier(supplier_name: str | None = None,
                   product_query: str | None = None,
                   pharmacy_id: str | None = None) -> str:
-    pid = pharmacy_id or PID
+    pid = pharmacy_id or pid()
     if supplier_name:
         rows = q(
             """select name, phone, alt_phone, rep_name, email, mpesa_paybill
@@ -283,7 +283,7 @@ def find_supplier(supplier_name: str | None = None,
 
 
 def get_reorder_suggestions(limit: int = 20, pharmacy_id: str | None = None) -> str:
-    pid = pharmacy_id or PID
+    pid = pharmacy_id or pid()
     rows = q(
         """select s.name, s.pack_size, s.qty_pieces, s.reorder_level_pieces,
                   coalesce(v.avg_daily, 0) as avg_daily,
@@ -315,7 +315,7 @@ def get_reorder_suggestions(limit: int = 20, pharmacy_id: str | None = None) -> 
 def build_report_pdf(period: str = "month") -> tuple[str, str]:
     """Returns (storage_path, filename)."""
     s, e = _period_bounds(period)
-    ph = q1("select name from pharmacies where id=%s", (PID,))
+    ph = q1("select name from pharmacies where id=%s", (pid(),))
     title = {"today": "Daily Report", "week": "Weekly Report",
              "month": "Monthly Report"}.get(period, "Report")
     doc = Doc(ph["name"] if ph else "Pharmacy", f"{title} · {s:%d %b} – {e:%d %b %Y}")
@@ -328,18 +328,18 @@ def build_report_pdf(period: str = "month") -> tuple[str, str]:
              from orders o
             where o.pharmacy_id=%s and o.status in ('paid','packed','dispatched','delivered')
               and o.created_at::date between %s and %s""",
-        (PID, s, e),
+        (pid(), s, e),
     )
     exp = q1(
         """select count(*) as n, coalesce(sum(value_at_risk),0) as v
              from v_expiry_risk where pharmacy_id=%s and days_left <= 90""",
-        (PID,),
+        (pid(),),
     )
     stockval = q1(
         """select coalesce(sum(b.qty_pieces * coalesce(p.cost_price,0)),0) as v
              from batches b join products p on p.id=b.product_id
             where b.pharmacy_id=%s and b.qty_pieces > 0""",
-        (PID,),
+        (pid(),),
     )
     doc.kpis([
         ("Revenue", kes(fin["revenue"])),
@@ -357,7 +357,7 @@ def build_report_pdf(period: str = "month") -> tuple[str, str]:
                    and o.pharmacy_id = %s
                    and o.status in ('paid','packed','dispatched','delivered')
             group by d.day order by d.day""",
-        (s, e, PID),
+        (s, e, pid()),
     )
     if trend and any(float(t["revenue"]) for t in trend):
         doc.h2("Revenue trend")
@@ -374,7 +374,7 @@ def build_report_pdf(period: str = "month") -> tuple[str, str]:
             where m.pharmacy_id=%s and m.reason='sale'
               and m.created_at::date between %s and %s
             group by p.id, p.name order by value desc limit 10""",
-        (PID, s, e),
+        (pid(), s, e),
     )
     if top:
         doc.h2("Top 10 products")
@@ -390,7 +390,7 @@ def build_report_pdf(period: str = "month") -> tuple[str, str]:
         """select name, batch_no, expiry_date, qty_pieces, value_at_risk, days_left
              from v_expiry_risk where pharmacy_id=%s and days_left <= 120
             order by expiry_date limit 25""",
-        (PID,),
+        (pid(),),
     )
     if exp_rows:
         doc.add_page()
@@ -410,7 +410,7 @@ def build_report_pdf(period: str = "month") -> tuple[str, str]:
             where g.pharmacy_id=%s and g.status='approved'
               and g.approved_at::date between %s and %s
             order by g.approved_at desc limit 20""",
-        (PID, s, e),
+        (pid(), s, e),
     )
     if grns:
         doc.h2("Deliveries received")
@@ -428,7 +428,7 @@ def build_report_pdf(period: str = "month") -> tuple[str, str]:
              left join v_velocity_90d v on v.product_id = s.product_id
             where s.pharmacy_id=%s and s.qty_pieces > 0 and v.product_id is null
             order by s.qty_pieces desc limit 15""",
-        (PID,),
+        (pid(),),
     )
     if dead:
         doc.h2("No sales in 90 days — cash sitting on the shelf")
@@ -458,7 +458,7 @@ def build_receipt_pdf(order_id: str) -> tuple[str, str]:
             where l.order_id=%s""",
         (order_id,),
     )
-    ph = q1("select name, mpesa_paybill from pharmacies where id=%s", (PID,))
+    ph = q1("select name, mpesa_paybill from pharmacies where id=%s", (pid(),))
 
     doc = Doc(ph["name"] if ph else "Pharmacy", f"Receipt · Order {str(order_id)[:8].upper()}")
     doc.add_page()
@@ -521,7 +521,7 @@ def build_po_pdf(po_id: str) -> tuple[str, str]:
                    from po_lines l join products p on p.id = l.product_id
                   where l.po_id = %s order by p.name""", (po_id,))
     ph = q1("""select name, ppb_licence, mpesa_paybill, wa_number
-                 from pharmacies where id=%s""", (PID,))
+                 from pharmacies where id=%s""", (pid(),))
 
     ref = str(po_id)[:8].upper()
     contact = " · ".join(x for x in [
@@ -635,7 +635,7 @@ def run_tool(name: str, args: dict, phone: str, pharmacy_id: str | None = None) 
     if not pid and phone:
         from tenant import resolve_tenant
         pid = resolve_tenant(phone)
-    pid = pid or PID
+    pid = pid or pid()
 
     if name == "generate_report_pdf":
         from wa import send_document

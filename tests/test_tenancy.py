@@ -125,6 +125,56 @@ def test_an_inactive_staff_member_does_not_resolve(pair):
     assert tenancy.resolve_by_sender("254744555666") == []
 
 
+def test_pid_raises_when_no_tenant_is_set():
+    """Never a default. The whole point of removing nine constants is removing nine
+    implicit defaults; an accessor that falls back reinstates all of them at once, and
+    the symptom is data written to the wrong pharmacy with clean-looking logs."""
+    import tenancy
+    tenancy.clear_pharmacy()
+    with pytest.raises(tenancy.NoTenant):
+        tenancy.pid()
+
+
+def test_the_tenant_does_not_leak_to_the_next_request():
+    """Workers are reused. A tenant left set would serve the next pharmacy's message
+    with the previous pharmacy's data."""
+    import tenancy
+    tenancy.clear_pharmacy()          # opt out of conftest's default binding
+    with tenancy.pharmacy_scope("11111111-1111-1111-1111-111111111111"):
+        assert tenancy.pid() == "11111111-1111-1111-1111-111111111111"
+    with pytest.raises(tenancy.NoTenant):
+        tenancy.pid()
+
+
+def test_nested_scopes_restore_the_outer_tenant():
+    """The jobs loop sets a tenant per iteration; an inner scope must not clobber it."""
+    import tenancy
+    with tenancy.pharmacy_scope("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"):
+        with tenancy.pharmacy_scope("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"):
+            assert tenancy.pid().startswith("bbbb")
+        assert tenancy.pid().startswith("aaaa")
+
+
+def test_no_module_still_pins_itself_to_a_boot_time_tenant():
+    """Structural sweep: the nine PID = settings.PHARMACY_ID constants must be gone.
+
+    Grepping for the assignment rather than trusting nine separate edits, because one
+    missed module silently keeps serving a single tenant while everything looks migrated.
+    """
+    import pathlib
+    api = pathlib.Path(__file__).parent.parent / "api"
+    offenders = []
+    for p in api.glob("*.py"):
+        # Only a real assignment at module level counts. Matching anywhere in the file
+        # flags prose: tenancy.py's own docstring names the constant to explain what it
+        # replaces, and my first version of this test failed on that.
+        for line in p.read_text().splitlines():
+            if line.startswith("PID = settings.PHARMACY_ID"):
+                offenders.append(p.name)
+                break
+    assert offenders == [], f"still pinned to one tenant at import: {offenders}"
+
+
 def test_the_resolver_does_not_import_config_at_all():
     """Structural: the resolver must not be able to reach a configured tenant.
 

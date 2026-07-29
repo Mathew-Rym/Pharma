@@ -1,16 +1,21 @@
-from __future__ import annotations
+"""Compatibility shim. The implementation lives in tenancy.py.
 
-"""Multi-tenant resolution.
+This module and tenancy.py were written independently and did the same job differently,
+which is two sources of truth for the single most security-sensitive question in the
+system. Consolidated on tenancy.py because of one behavioural difference:
 
-Takes a sender's phone number and returns the pharmacy_id they belong to.
-When two pharmacies share a GOWA device (e.g. a platform device), this is
-the only way to know which pharmacy a message is "for".
+  * resolve_tenant() here used `limit 1` -- first-match-wins. Its own docstring admitted
+    the gap. The spec makes a person at two pharmacies a DELIBERATE product decision
+    (separate history, separate balances), so silently picking whichever row was created
+    first is undetectable from outside and locks them in permanently.
+  * resolve_pharmacy_by_device() here ignored `kind`, so the platform line resolved as if
+    it were a tenant -- collapsing three outcomes back into two.
 
-Priority order: staff > customer > supplier > wa_messages history.
-Staff first because they drive the highest-privilege operations.
+Kept as a shim so existing imports keep working; prefer tenancy directly in new code.
 """
 import logging
 
+import tenancy
 from db import q1
 from utils import norm_phone
 
@@ -18,56 +23,40 @@ log = logging.getLogger(__name__)
 
 
 def resolve_tenant(sender_phone: str) -> str | None:
-    """Return the pharmacy_id for this phone, or None if unknown.
+    """The pharmacy this phone belongs to, or None if unknown OR ambiguous.
 
-    For the pilot, each phone belongs to exactly one pharmacy. If a phone
-    appears in multiple pharmacies (e.g. the owner runs two), the first
-    match wins. Phase 2 should prompt for disambiguation.
+    Returns None rather than guessing when a phone is known at more than one pharmacy.
+    Callers that can ask should use tenancy.resolve_by_sender() and prompt.
     """
-    phone = norm_phone(sender_phone)
-    if not phone:
-        return None
-
-    # 1. Staff — most common sender, highest priority
-    row = q1("select pharmacy_id from staff where phone = %s and is_active limit 1",
-             (phone,))
-    if row:
-        return str(row["pharmacy_id"])
-
-    # 2. Customer — people who have ordered before
-    row = q1("select pharmacy_id from customers where phone = %s limit 1",
-             (phone,))
-    if row:
-        return str(row["pharmacy_id"])
-
-    # 3. Supplier — rep replying to a PO
-    row = q1("select pharmacy_id from suppliers where phone = %s limit 1",
-             (phone,))
-    if row:
-        return str(row["pharmacy_id"])
-
-    # 4. Unknown — no relationship found
+    found = tenancy.resolve_by_sender(sender_phone)
+    if len(found) == 1:
+        return found[0]
+    if len(found) > 1:
+        log.warning("phone %s is known at %d pharmacies; refusing to guess",
+                    norm_phone(sender_phone), len(found))
     return None
 
 
 def resolve_pharmacy_by_device(device_id: str) -> str | None:
-    """Return the pharmacy_id that owns this GOWA device.
+    """The TENANT that owns this GOWA device, or None.
 
-    This is used by the webhook to figure out which pharmacy received the
-    message, since GOWA identifies messages by the WhatsApp device_id.
+    Returns None for the platform line: it is not a tenant and has no inventory. Callers
+    that need to tell platform from unknown should use tenancy.resolve().
     """
     if not device_id:
         return None
-    # Try exact match on gowa_device_id or wa_jid
-    row = q1("select id from pharmacies where gowa_device_id = %s or wa_jid = %s",
-             (device_id, device_id))
-    if row:
+    r = tenancy.resolve(device_jid=device_id)
+    if r.kind == "tenant":
+        return r.pharmacy_id
+    if r.kind == "platform":
+        return None
+    # Fall back to the slot label and to wa_number, since GOWA reports a JID on the
+    # webhook but the slot id elsewhere, and older rows may only have wa_number set.
+    row = q1("select id, kind from pharmacies where gowa_device_id = %s", (device_id,))
+    if not row:
+        phone = norm_phone(device_id.split("@")[0])
+        if phone:
+            row = q1("select id, kind from pharmacies where wa_number = %s", (phone,))
+    if row and row["kind"] == "tenant":
         return str(row["id"])
-    # Try normalised phone against wa_number
-    jid = device_id.split("@")[0] if "@" in device_id else device_id
-    phone = norm_phone(jid)
-    if phone:
-        row = q1("select id from pharmacies where wa_number = %s", (phone,))
-        if row:
-            return str(row["id"])
     return None

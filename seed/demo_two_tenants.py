@@ -95,11 +95,21 @@ def _stock(pid: str, rows: list) -> None:
                         reorder_level_pieces)
                      values (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) returning id""",
                   (pid, code, nm, gen, form, strength, pack, rx, cost, sell, reorder))
-        ex("""insert into batches
-                (pharmacy_id, product_id, batch_no, expiry_date, qty_pieces, cost_price)
-              values (%s,%s,%s,%s,%s,%s)""",
-           (pid, prod["id"], f"{code}-B1",
-            date.today() + timedelta(days=exp_days), qty, cost))
+        batch = q1("""insert into batches
+                        (pharmacy_id, product_id, batch_no, expiry_date, qty_pieces,
+                         cost_price)
+                      values (%s,%s,%s,%s,%s,%s) returning id""",
+                   (pid, prod["id"], f"{code}-B1",
+                    date.today() + timedelta(days=exp_days), qty, cost))
+        # Every batch needs a matching ledger entry. test_invariants asserts that batch
+        # quantities agree with the sum of stock_movements, and it is right to: a batch
+        # that exists without a movement is stock that appeared from nowhere, which is
+        # exactly what the audit trail exists to make impossible. Seeding the balance
+        # without the movement made all six seeded batches fail that invariant.
+        ex("""insert into stock_movements
+                (pharmacy_id, batch_id, delta_pieces, reason, note)
+              values (%s,%s,%s,'opening','opening stock (seed)')""",
+           (pid, batch["id"], qty))
 
 
 def _staff(pid: str, rows: list) -> None:

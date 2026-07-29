@@ -17,12 +17,58 @@ Two signals, ranked:
                 so it returns a LIST and the caller decides, rather than guessing.
 """
 import logging
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 
 from db import q, q1
 from utils import norm_phone
 
 log = logging.getLogger(__name__)
+
+_current: ContextVar[str | None] = ContextVar("current_pharmacy", default=None)
+
+
+class NoTenant(RuntimeError):
+    """Code that needs a tenant ran without one being resolved.
+
+    Deliberately fatal. The nine constants this replaces were nine implicit defaults, and
+    an accessor that falls back to one reinstates all of them behind a single function
+    call -- with the symptom being rows written to the wrong pharmacy while every log line
+    looks correct. Loud failure is the only safe behaviour.
+    """
+
+
+def pid() -> str:
+    """The pharmacy this unit of work belongs to."""
+    v = _current.get()
+    if not v:
+        raise NoTenant("no pharmacy in context; resolve one before touching tenant data")
+    return v
+
+
+def set_pharmacy(pharmacy_id: str):
+    """Bind the tenant. Returns the token needed to restore the previous value."""
+    return _current.set(str(pharmacy_id))
+
+
+def clear_pharmacy() -> None:
+    _current.set(None)
+
+
+@contextmanager
+def pharmacy_scope(pharmacy_id: str):
+    """Bind a tenant for the duration of a block, then restore what was there before.
+
+    Restoring rather than clearing matters for the jobs loop, which sets a tenant per
+    iteration: an inner scope must not leave the outer one unset. Reset in a finally so an
+    exception cannot leave a tenant bound to a worker that is about to serve someone else.
+    """
+    token = _current.set(str(pharmacy_id))
+    try:
+        yield pharmacy_id
+    finally:
+        _current.reset(token)
 
 
 @dataclass(frozen=True)

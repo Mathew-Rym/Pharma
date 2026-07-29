@@ -13,15 +13,48 @@ from reports import build_report_pdf, get_expiry_risk, get_reorder_suggestions
 from utils import from_pieces, kes
 from wa import send_document, send_text
 
+import tenancy
+from tenancy import pid          # tenant comes from the request, not from .env
+
 log = logging.getLogger(__name__)
-PID = settings.PHARMACY_ID
+
+
+def for_every_tenant(job_fn) -> list[dict]:
+    """Run a job once per paired tenant, each with its own tenant bound.
+
+    Three specifics that matter:
+
+    * Only tenants with a paired device. An unpaired pharmacy cannot receive the alert, so
+      running the job for it produces sends that must fail wa.compose()'s device check --
+      noise that looks like a bug. Skip at selection instead.
+    * Platform rows are excluded: no inventory, nobody to alert.
+    * Each tenant is caught separately. One bad row must not abort the loop, or a single
+      pharmacy with dirty data silences alerts for every other pharmacy -- and cron
+      failures are invisible by nature, which is the whole reason job_runs exists.
+    """
+    tenants = q("""select id, name from pharmacies
+                    where kind = 'tenant' and gowa_device_id is not null
+                    order by name""")
+    if not tenants:
+        log.warning("no paired tenants; %s did not run", getattr(job_fn, "__name__", job_fn))
+        return []
+    out = []
+    for t in tenants:
+        try:
+            with tenancy.pharmacy_scope(str(t["id"])):
+                out.append({"pharmacy": t["name"], **(job_fn() or {})})
+        except Exception as e:
+            log.exception("job failed for pharmacy %s", t["name"])
+            out.append({"pharmacy": t["name"], "status": "error",
+                        "error": f"{type(e).__name__}: {e}"})
+    return out
 
 
 def _staff(roles: tuple[str, ...]) -> list[dict]:
     return q(
         """select phone, name, role from staff
             where pharmacy_id=%s and is_active and role = any(%s)""",
-        (PID, list(roles)),
+        (pid(), list(roles)),
     )
 
 
@@ -32,7 +65,7 @@ def _run(job: str, fn) -> dict:
     # Under RLS a null would fail the WITH CHECK outright and every cron job would
     # start erroring the moment isolation is switched on.
     row = ex1("""insert into job_runs (pharmacy_id, job, status)
-                 values (%s,%s,'running') returning id""", (PID, job))
+                 values (%s,%s,'running') returning id""", (pid(), job))
     try:
         detail = fn() or {}
         ex("update job_runs set status='ok', detail=%s, ended_at=now() where id=%s",
@@ -55,7 +88,7 @@ def expiry_sweep() -> dict:
                      from v_expiry_risk
                     where pharmacy_id=%s and days_left <= %s and days_left > %s
                     order by expiry_date""",
-                (PID, days, days - 30 if days > 30 else -3650),
+                (pid(), days, days - 30 if days > 30 else -3650),
             )
             buckets[days] = rows
 
@@ -91,7 +124,7 @@ def expiry_sweep() -> dict:
 
         ex("""insert into alerts (pharmacy_id, kind, severity, payload, sent_to, sent_at)
               values (%s,'expiry_90','warn',%s,%s, now())""",
-           (PID, json.dumps({"count": count, "value": total}),
+           (pid(), json.dumps({"count": count, "value": total}),
             [s["phone"] for s in recipients]))
         return {"batches": count, "value_at_risk": total}
 
@@ -115,7 +148,7 @@ def low_stock_check() -> dict:
                                                coalesce(v.avg_daily,0) * 14)
                   and coalesce(v.avg_daily,0) > 0
                 order by s.qty_pieces / nullif(v.avg_daily,0) asc""",
-            (PID,),
+            (pid(),),
         )
         if not rows:
             return {"items": 0}
@@ -134,7 +167,7 @@ def low_stock_check() -> dict:
                 """insert into purchase_orders (pharmacy_id, supplier_id, status, reason,
                                                 total_estimate)
                    values (%s,%s,'awaiting_approval',%s,%s) returning id""",
-                (PID, sup_id, json.dumps({"trigger": "reorder_level"}), est),
+                (pid(), sup_id, json.dumps({"trigger": "reorder_level"}), est),
             )
             for i in items:
                 qty = _suggest_qty(i)
@@ -180,13 +213,13 @@ def daily_digest() -> dict:
                 where o.pharmacy_id=%s
                   and o.status in ('paid','packed','dispatched','delivered')
                   and o.created_at::date = %s""",
-            (PID, today),
+            (pid(), today),
         )
         recv = q1(
             """select count(*) as n, coalesce(sum(net_total),0) as v
                  from grns where pharmacy_id=%s and status='approved'
                   and approved_at::date = %s""",
-            (PID, today),
+            (pid(), today),
         )
         top = q(
             """select p.name, -sum(m.delta_pieces) as pieces
@@ -194,12 +227,12 @@ def daily_digest() -> dict:
                  join batches b on b.id=m.batch_id join products p on p.id=b.product_id
                 where m.pharmacy_id=%s and m.reason='sale' and m.created_at::date=%s
                 group by p.name order by pieces desc limit 5""",
-            (PID, today),
+            (pid(), today),
         )
         pending = q1(
             """select count(*) as n from prescriptions
                 where pharmacy_id=%s and status='pending_verification'""",
-            (PID,),
+            (pid(),),
         )
         msg = (f"🌙 *{today:%A %d %b} summary*\n\n"
                f"• Revenue: {kes(fin['revenue'])} from {fin['orders']} order(s)\n"
@@ -241,7 +274,7 @@ def refill_reminders() -> dict:
                   and c.marketing_opt_in = true
                   and o.created_at::date = current_date - 25
                 limit 50""",
-            (PID,),
+            (pid(),),
         )
         for r in rows:
             send_text(r["phone"],
@@ -286,7 +319,7 @@ def reconcile() -> dict:
                 group by b.id, b.qty_pieces
                having b.qty_pieces <> coalesce(sum(m.delta_pieces),0)
                 limit 20""",
-            (PID,),
+            (pid(),),
         )
         if drift:
             log.error("LEDGER DRIFT on %s batches: %s", len(drift), drift[:3])
@@ -312,7 +345,7 @@ def variance_report() -> dict:
         from agent_api import reconciliation_summary
         rows = q("""select count(*) as n, coalesce(sum(abs(variance_value)),0) as v
                       from stock_reconciliation
-                     where pharmacy_id=%s and status='open' and variance <> 0""", (PID,))
+                     where pharmacy_id=%s and status='open' and variance <> 0""", (pid(),))
         if not rows or rows[0]["n"] == 0:
             return {"variances": 0}
         summary = reconciliation_summary()

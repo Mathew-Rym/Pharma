@@ -21,6 +21,7 @@ import httpx
 
 from config import settings
 from db import ex, q1
+from tenancy import pid
 from safety import GateBlocked, check_gates
 from utils import norm_phone
 
@@ -204,18 +205,13 @@ def send_for(pharmacy_id, phone: str, msg_type: str, body: str,
 
 
 # --------------------------------------------------------- transitional wrappers
-# These keep the pre-multitenant signature `send_text(phone, body)` working for the 105
-# existing call sites across nine modules. They resolve the tenant from
-# settings.PHARMACY_ID, which item #4 removes -- at which point every caller passes its
-# own pharmacy_id and these wrappers are deleted.
-#
-# This is a transitional path, not a fallback: it is pinned to the single-tenant constant
-# that still exists rather than picking a device when the answer is unknown. It is already
-# strictly safer than what it replaces, because the device now comes from the pharmacy row
-# and goes through the slot/JID guard instead of an env var nobody re-checked.
+# These keep the signature `send_text(phone, body)` working for the 105 existing call
+# sites across nine modules. The tenant now comes from the contextvar the router (or the
+# jobs loop) bound, so a caller outside any resolved tenant raises NoTenant rather than
+# silently sending as whichever pharmacy happened to be in .env.
 def send_text(phone: str, body: str) -> None:
     try:
-        send_for(settings.PHARMACY_ID, phone, "text", body)
+        send_for(pid(), phone, "text", body)
     except (UnroutableMessage, GateBlocked) as e:
         log.warning("send_text blocked to %s: %s", phone, e)
 
@@ -225,7 +221,7 @@ def send_document(phone: str, url: str, filename: str, caption: str = "") -> Non
     # GOWA has no filename field for the *_url path; it derives one from the URL, so the
     # human-readable name rides along in the caption.
     try:
-        send_for(settings.PHARMACY_ID, phone, "document", caption or filename, url)
+        send_for(pid(), phone, "document", caption or filename, url)
     except (UnroutableMessage, GateBlocked) as e:
         log.warning("send_document blocked to %s: %s", phone, e)
 
@@ -234,7 +230,7 @@ def send_image(phone: str, url: str, caption: str = "") -> None:
     """Used to forward a prescription photo to the pharmacist's own phone, where
     native pinch-zoom beats anything we would build in a dashboard."""
     try:
-        send_for(settings.PHARMACY_ID, phone, "image", caption, url)
+        send_for(pid(), phone, "image", caption, url)
     except (UnroutableMessage, GateBlocked) as e:
         log.warning("send_image blocked to %s: %s", phone, e)
 
@@ -245,21 +241,21 @@ def send_image(phone: str, url: str, caption: str = "") -> None:
 # dispatching, which is evidence rather than an assertion by the sender.
 def reply_text(phone: str, body: str) -> None:
     try:
-        send_for(settings.PHARMACY_ID, phone, "text", body)
+        send_for(pid(), phone, "text", body)
     except (UnroutableMessage, GateBlocked) as e:
         log.warning("reply_text blocked to %s: %s", phone, e)
 
 
 def reply_document(phone: str, url: str, filename: str, caption: str = "") -> None:
     try:
-        send_for(settings.PHARMACY_ID, phone, "document", caption or filename, url)
+        send_for(pid(), phone, "document", caption or filename, url)
     except (UnroutableMessage, GateBlocked) as e:
         log.warning("reply_document blocked to %s: %s", phone, e)
 
 
 def reply_image(phone: str, url: str, caption: str = "") -> None:
     try:
-        send_for(settings.PHARMACY_ID, phone, "image", caption, url)
+        send_for(pid(), phone, "image", caption, url)
     except (UnroutableMessage, GateBlocked) as e:
         log.warning("reply_image blocked to %s: %s", phone, e)
 

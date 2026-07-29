@@ -28,7 +28,7 @@ from utils import kes, norm_phone
 from wa import reply_text, send_text
 
 log = logging.getLogger(__name__)
-PID = settings.PHARMACY_ID
+from tenancy import pid          # tenant comes from the request, not from .env
 
 # Safaricom's confirmation SMS wording has varied over the years, so match loosely
 # on the pieces that have stayed stable: a receipt code, an amount, and a keyword.
@@ -93,7 +93,7 @@ def handle_forwarded_sms(phone: str, text: str) -> bool:
         ex("""insert into payments (pharmacy_id, method, amount, phone, status,
                     mpesa_receipt, source, sms_text)
               values (%s,'mpesa_paybill',%s,%s,'success',%s,'sms_forward',%s)""",
-           (PID, parsed["amount"], norm_phone(phone), parsed["receipt"], text[:1000]))
+           (pid(), parsed["amount"], norm_phone(phone), parsed["receipt"], text[:1000]))
         reply_text(phone,
                   f"Thank you — we have logged {kes(parsed['amount'])} "
                   f"({parsed['receipt']}). We could not match it to an open order "
@@ -109,7 +109,7 @@ def handle_forwarded_sms(phone: str, text: str) -> bool:
                  status, mpesa_receipt, source, sms_text)
            values (%s,%s,'mpesa_paybill',%s,%s,'success',%s,'sms_forward',%s)
            returning id""",
-        (PID, order["id"], paid, norm_phone(phone), parsed["receipt"], text[:1000]))
+        (pid(), order["id"], paid, norm_phone(phone), parsed["receipt"], text[:1000]))
 
     if abs(paid - expected) > 1.0:
         reply_text(phone,
@@ -145,7 +145,7 @@ def _match_order(phone: str, parsed: dict) -> dict | None:
                      where o.pharmacy_id=%s
                        and upper(left(o.id::text, 8)) = %s
                        and o.status in ('awaiting_payment','quoted')
-                     limit 1""", (PID, parsed["account"][:8]))
+                     limit 1""", (pid(), parsed["account"][:8]))
         if row:
             return row
 
@@ -160,12 +160,12 @@ def _match_order(phone: str, parsed: dict) -> dict | None:
     return q1("""select o.* from orders o join customers c on c.id=o.customer_id
                   where c.pharmacy_id=%s and c.phone=%s
                     and o.status in ('awaiting_payment','quoted')
-                  order by o.created_at desc limit 1""", (PID, norm_phone(phone)))
+                  order by o.created_at desc limit 1""", (pid(), norm_phone(phone)))
 
 
 def _alert_staff(msg: str) -> None:
     for s in q("""select phone from staff where pharmacy_id=%s and is_active
-                   and role in ('owner','manager','pharmacist')""", (PID,)):
+                   and role in ('owner','manager','pharmacist')""", (pid(),)):
         send_text(s["phone"], msg)
 
 
@@ -174,4 +174,4 @@ def unmatched_payments() -> list[dict]:
     return q("""select id, amount, phone, mpesa_receipt, created_at, sms_text
                   from payments
                  where pharmacy_id=%s and order_id is null and status='success'
-                 order by created_at desc limit 50""", (PID,))
+                 order by created_at desc limit 50""", (pid(),))

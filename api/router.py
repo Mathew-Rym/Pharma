@@ -7,18 +7,16 @@ receive a delivery.
 import json
 import logging
 
-from config import settings
+import tenancy
 from db import ex, q, q1
 from llm import chat
 from reports import TOOLS, run_tool
 from safety import record_inbound
-from state import clear_state, get_state, set_state
-from tenant import resolve_tenant
+from state import clear_state, get_state
 from utils import norm_phone
-from wa import reply_text, send_text
+from wa import reply_text
 
 log = logging.getLogger(__name__)
-PID = settings.PHARMACY_ID
 
 STAFF_SYSTEM = """You are Pharma OS, the operations assistant for a Kenyan retail pharmacy.
 You are talking to a staff member on WhatsApp.
@@ -55,10 +53,60 @@ def handle_inbound(msg: dict) -> None:
     if not phone:
         return
 
-    # Resolve which pharmacy this message is for.
-    # Try: msg-level override (set by webhook) > tenant resolver > env fallback.
-    resolved_pid = msg.get("pharmacy_id") or resolve_tenant(phone) or PID
+    # Which pharmacy is this message for?
+    #
+    # 1. The webhook's device_id, when it maps to a tenant. Strongest signal: it is OUR
+    #    number and the sender cannot influence it.
+    # 2. Otherwise the sender's identity, which is all we have while one number serves
+    #    several pharmacies.
+    #
+    # There is deliberately no third fallback to a configured pharmacy. That was the
+    # `or pid()` this replaces, and it is how one pharmacy's customer ends up writing into
+    # another pharmacy's data with every log line looking correct.
+    resolved_pid = msg.get("pharmacy_id")
+    if not resolved_pid:
+        candidates = tenancy.resolve_by_sender(phone)
+        if len(candidates) == 1:
+            resolved_pid = candidates[0]
+        elif len(candidates) > 1:
+            # Known at several pharmacies. Ask rather than guess -- guessing locks them
+            # into whichever tenant was created first, invisibly and permanently.
+            _ask_which_pharmacy(phone, candidates)
+            return
+        else:
+            _greet_unknown(phone)
+            return
 
+    with tenancy.pharmacy_scope(resolved_pid):
+        _dispatch(phone, msg, resolved_pid)
+
+
+def _ask_which_pharmacy(phone: str, candidates: list[str]) -> None:
+    """One reply, from the first candidate, listing the options.
+
+    Sending from every candidate would mean several pharmacies messaging one person at
+    once, which is both confusing and exactly the burst pattern that gets numbers banned.
+    """
+    names = q("""select id, name from pharmacies where id = any(%s) order by name""",
+              (candidates,))
+    listing = "\n".join(f"{i}. {r['name']}" for i, r in enumerate(names, 1))
+    with tenancy.pharmacy_scope(str(names[0]["id"])):
+        reply_text(phone, "You're registered at more than one pharmacy. "
+                          f"Which one?\n\n{listing}\n\nReply with the number.")
+
+
+def _greet_unknown(phone: str) -> None:
+    """No relationship anywhere.
+
+    Cannot reply: the anti-ban gates require a relationship, and inventing a customer row
+    to satisfy them would let anyone who texts create data in a pharmacy of their choosing.
+    Logged so it is visible rather than silent.
+    """
+    log.info("unresolved sender %s -- no pharmacy relationship; not replying", phone)
+
+
+def _dispatch(phone: str, msg: dict, resolved_pid: str) -> None:
+    """Everything below runs with the tenant bound, so pid() is correct throughout."""
     # Record inbound — this opens Gate 3 for future replies to this phone
     record_inbound(phone, resolved_pid)
 
