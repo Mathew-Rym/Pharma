@@ -48,12 +48,17 @@ jobs:
           esac
 
       - name: Call the API
+        env:
+          API_URL: ${{ secrets.API_URL || vars.API_URL }}
+          SHARED_SECRET: ${{ secrets.SHARED_SECRET || vars.SHARED_SECRET }}
         run: |
           JOB="${{ steps.pick.outputs.job }}"
+          : "${API_URL:?API_URL is required (set as Actions secret or variable)}"
+          : "${SHARED_SECRET:?SHARED_SECRET is required (set as Actions secret or variable)}"
           echo "Running $JOB"
           code=$(curl -sS -o /tmp/out.json -w '%{http_code}' \
-            -X POST "${{ secrets.API_URL }}/jobs/$JOB" \
-            -H "x-dishii-secret: ${{ secrets.SHARED_SECRET }}" \
+            -X POST "$API_URL/jobs/$JOB" \
+            -H "x-dishii-secret: $SHARED_SECRET" \
             --max-time 300)
           echo "HTTP $code"
           cat /tmp/out.json
