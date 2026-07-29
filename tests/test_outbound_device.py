@@ -30,6 +30,17 @@ db = pytest.mark.skipif(not DB, reason="DATABASE_URL not set")
 RECIPIENTS = ("254700000009", "254713755274")
 
 
+@pytest.fixture(autouse=True)
+def gate_one_off(monkeypatch):
+    """These tests are about which device a message leaves by, not about Gate 1.
+
+    With a WA_ALLOWLIST set in .env, Gate 1 refuses these fixture numbers before compose
+    reaches the device logic -- so the result would depend on the developer's environment.
+    """
+    from config import settings
+    monkeypatch.setattr(settings, "WA_ALLOWLIST", "")
+
+
 @pytest.fixture
 def two_tenants():
     """Two pharmacies, each bound to its own GOWA slot and JID.

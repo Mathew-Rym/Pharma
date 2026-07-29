@@ -442,8 +442,14 @@ from config import settings
 from db import q
 
 print("\nWhatsApp safety posture\n")
-allow = [p for p in settings.WA_ALLOWLIST.split(",") if p.strip()]
-print(f"  Gate 1 allowlist        {'ON — only ' + str(len(allow)) + ' number(s) can receive' if allow else 'OFF (production) — any related number can receive'}")
+allow = [p.strip() for p in settings.WA_ALLOWLIST.split(",") if p.strip()]
+if allow:
+    print(f"  Gate 1 allowlist        ON — ONLY these {len(allow)} number(s) can receive:")
+    for a in allow:
+        print(f"                            {a}")
+    print("                          ** add every demo participant here or they get silence **")
+else:
+    print("  Gate 1 allowlist        OFF (production) — any related number can receive")
 print(f"  Gate 2 relationship     ON — recipient must be a customer/staff/supplier")
 print(f"  Gate 3 chat established ON — recipient must have messaged us first")
 print(f"  Gate 4 rate limit       {settings.WA_RATE_LIMIT_HOUR}/hour, {settings.WA_NEW_CHAT_LIMIT_HOUR} new chats/hour, per device")

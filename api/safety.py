@@ -23,7 +23,10 @@ from utils import norm_phone
 
 log = logging.getLogger(__name__)
 
-_allowlist_cache: Set[str] | None = None
+# Keyed on the raw setting, not a bare set. Caching only the parsed set meant a changed
+# WA_ALLOWLIST needed a process restart to take effect -- so widening the list before a
+# demo would look like it had worked while the old list was still enforced.
+_allowlist_cache: dict = {"raw": None, "set": set()}
 
 
 class GateBlocked(RuntimeError):
@@ -44,15 +47,12 @@ def _get_allowlist() -> Set[str]:
     Production: WA_ALLOWLIST unset → empty set → gate skipped.
     Dev/Test: WA_ALLOWLIST="254777602338,254700111111" → gate active.
     """
-    global _allowlist_cache
-    if _allowlist_cache is None:
-        raw = settings.WA_ALLOWLIST
-        if not raw:
-            _allowlist_cache = set()
-        else:
-            _allowlist_cache = {norm_phone(p.strip())
-                                for p in raw.split(",") if p.strip()}
-    return _allowlist_cache
+    raw = settings.WA_ALLOWLIST or ""
+    if _allowlist_cache["raw"] != raw:
+        _allowlist_cache["raw"] = raw
+        _allowlist_cache["set"] = {norm_phone(p.strip())
+                                   for p in raw.split(",") if p.strip()}
+    return _allowlist_cache["set"]
 
 
 def check_allowlist(phone: str) -> None:

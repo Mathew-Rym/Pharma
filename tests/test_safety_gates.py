@@ -46,6 +46,40 @@ def test_the_real_kenyan_formats_still_normalise():
 
 
 # ------------------------------------------------------------------ gates
+@pytest.fixture(autouse=True)
+def gate_one_off(monkeypatch):
+    """Neutralise Gate 1 for tests that are about Gates 2-4.
+
+    Otherwise the suite's result depends on whatever WA_ALLOWLIST the developer happens to
+    have in .env: with it set, Gate 1 short-circuits and the gate under test never runs.
+    Gate 1 has its own test below, which sets the list deliberately.
+    """
+    from config import settings
+    monkeypatch.setattr(settings, "WA_ALLOWLIST", "")
+
+
+@db
+def test_gate_one_blocks_anyone_not_on_the_allowlist(monkeypatch):
+    """The dev/staging guard: with a list set, nothing reaches anyone else.
+
+    This is what makes an accidental send to a stranger impossible while building, and it
+    must take effect from the setting alone -- no restart, or widening the list before a
+    demo would appear to work while the old list was still enforced.
+    """
+    import safety
+    from config import settings
+
+    monkeypatch.setattr(settings, "WA_ALLOWLIST", "254700000001")
+    safety.check_allowlist("254700000001")            # listed → fine
+    with pytest.raises(safety.GateBlocked) as e:
+        safety.check_allowlist("254799111222")
+    assert e.value.gate == "allowlist"
+
+    # widening it must apply immediately, without a process restart
+    monkeypatch.setattr(settings, "WA_ALLOWLIST", "254700000001,254799111222")
+    safety.check_allowlist("254799111222")
+
+
 @pytest.fixture
 def tenant():
     from db import ex, q1
