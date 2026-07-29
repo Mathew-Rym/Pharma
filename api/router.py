@@ -13,6 +13,7 @@ from llm import chat
 from reports import TOOLS, run_tool
 from safety import record_inbound
 from state import clear_state, get_state, set_state
+from tenant import resolve_tenant
 from utils import norm_phone
 from wa import reply_text, send_text
 
@@ -54,8 +55,12 @@ def handle_inbound(msg: dict) -> None:
     if not phone:
         return
 
+    # Resolve which pharmacy this message is for.
+    # Try: msg-level override (set by webhook) > tenant resolver > env fallback.
+    resolved_pid = msg.get("pharmacy_id") or resolve_tenant(phone) or PID
+
     # Record inbound — this opens Gate 3 for future replies to this phone
-    record_inbound(phone, PID)
+    record_inbound(phone, resolved_pid)
 
     # idempotency — Baileys re-delivers on reconnect
     if msg.get("wa_id"):
@@ -70,13 +75,13 @@ def handle_inbound(msg: dict) -> None:
                                     body, media_path, handled)
            values (%s,%s,'in',%s,%s,%s,%s,false)
            on conflict (wa_id) do nothing""",
-        (PID, msg.get("wa_id"), phone, msg.get("type", "text"),
+        (resolved_pid, msg.get("wa_id"), phone, msg.get("type", "text"),
          text[:4000], msg.get("media_path")),
     )
 
     staff = q1(
         "select * from staff where phone=%s and pharmacy_id=%s and is_active",
-        (phone, PID),
+        (phone, resolved_pid),
     )
     try:
         if staff:

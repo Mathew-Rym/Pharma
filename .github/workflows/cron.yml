@@ -56,11 +56,24 @@ jobs:
       - name: Call the API
         run: |
           JOB="${{ steps.pick.outputs.job }}"
-          echo "Running $JOB"
+          if [ -z "$JOB" ]; then
+            JOB="expiry_sweep"
+          fi
+          API_URL="${{ secrets.API_URL }}"
+          if [ -z "$API_URL" ]; then
+            echo "::warning::API_URL secret is not configured in GitHub repository secrets. Skipping cron API call."
+            exit 0
+          fi
+          echo "Running $JOB at $API_URL"
           code=$(curl -sS -o /tmp/out.json -w '%{http_code}' \
-            -X POST "${{ secrets.API_URL }}/jobs/$JOB" \
+            -X POST "${API_URL}/jobs/$JOB" \
             -H "x-pharmaos-secret: ${{ secrets.SHARED_SECRET }}" \
-            --max-time 300)
+            --max-time 300 || echo "000")
           echo "HTTP $code"
-          cat /tmp/out.json
-          test "$code" = "200"
+          if [ -f /tmp/out.json ]; then
+            cat /tmp/out.json
+          fi
+          if [ "$code" != "200" ]; then
+            echo "::error::Cron job $JOB failed with HTTP $code"
+            exit 1
+          fi

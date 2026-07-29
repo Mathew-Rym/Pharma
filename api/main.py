@@ -17,6 +17,7 @@ from config import settings
 from db import ensure_buckets, q, q1, upload
 from jobs import JOBS
 from router import handle_inbound
+from tenant import resolve_pharmacy_by_device, resolve_tenant
 from utils import from_pieces, kes, norm_phone
 
 logging.basicConfig(
@@ -78,8 +79,10 @@ async def webhook_media(background: BackgroundTasks,
     phone = norm_phone(sender)
     data = await file.read()
 
+    # Resolve which pharmacy this image is for
+    pid = resolve_tenant(phone) or settings.PHARMACY_ID
     staff = q1("select id from staff where phone=%s and pharmacy_id=%s and is_active",
-               (phone, settings.PHARMACY_ID))
+               (phone, pid))
     bucket = settings.BUCKET_INVOICES if staff else settings.BUCKET_RX
     ext = (file.filename or "img.jpg").rsplit(".", 1)[-1].lower()
     if ext not in ("jpg", "jpeg", "png", "webp"):
@@ -96,6 +99,7 @@ async def webhook_media(background: BackgroundTasks,
         "text": caption,
         "media_bucket": bucket,
         "media_path": path,
+        "pharmacy_id": pid,
     })
     return {"ok": True, "path": path}
 
@@ -179,8 +183,11 @@ async def webhook_gowa(request: Request, background: BackgroundTasks,
             except Exception:
                 log.exception("could not fetch remote media %s", rel)
         if data:
+            # Resolve which pharmacy received this media
+            pid = resolve_pharmacy_by_device(
+                body.get("device_id") or "") or settings.PHARMACY_ID
             staff = q1("""select id from staff where phone=%s and pharmacy_id=%s
-                           and is_active""", (phone, settings.PHARMACY_ID))
+                           and is_active""", (phone, pid))
             bucket = settings.BUCKET_INVOICES if staff else settings.BUCKET_RX
             ext = str(rel).rsplit(".", 1)[-1].lower().split("?")[0]
             if ext not in ("jpg", "jpeg", "png", "webp", "pdf"):
@@ -195,8 +202,13 @@ async def webhook_gowa(request: Request, background: BackgroundTasks,
         else:
             log.warning("gowa media %s could not be retrieved; treating as text", rel)
 
-    log.info("gowa inbound from=%s type=%s device=%s",
-             phone, inbound["type"], body.get("device_id"))
+    # Resolve pharmacy from GOWA device and inject into the message
+    device_pharmacy = resolve_pharmacy_by_device(
+        body.get("device_id") or "") or settings.PHARMACY_ID
+    inbound["pharmacy_id"] = device_pharmacy
+
+    log.info("gowa inbound from=%s type=%s device=%s pharmacy=%s",
+             phone, inbound["type"], body.get("device_id"), device_pharmacy)
     background.add_task(handle_inbound, inbound)
     return {"ok": True}
 

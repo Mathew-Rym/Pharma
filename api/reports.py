@@ -129,14 +129,15 @@ def _period_bounds(period: str, start: str | None = None, end: str | None = None
 
 
 def get_stock(product_query: str | None = None, low_stock_only: bool = False,
-              limit: int = 15) -> str:
+              limit: int = 15, pharmacy_id: str | None = None) -> str:
+    pid = pharmacy_id or PID
     if product_query:
         rows = q(
             """select name, legacy_code, pack_size, qty_pieces, earliest_expiry, sell_price
                  from v_stock_on_hand
                 where pharmacy_id = %s and (name ilike %s or similarity(name,%s) > 0.3)
                 order by similarity(name,%s) desc limit %s""",
-            (PID, f"%{product_query}%", product_query, product_query, limit),
+            (pid, f"%{product_query}%", product_query, product_query, limit),
         )
         if not rows:
             return f"No product matching '{product_query}'."
@@ -152,7 +153,7 @@ def get_stock(product_query: str | None = None, low_stock_only: bool = False,
              from v_stock_on_hand
             where pharmacy_id = %s and qty_pieces <= greatest(reorder_level_pieces, 0)
             order by qty_pieces asc limit %s""",
-        (PID, limit),
+        (pid, limit),
     )
     if not rows:
         return "Nothing is below its reorder level."
@@ -163,13 +164,14 @@ def get_stock(product_query: str | None = None, low_stock_only: bool = False,
     )
 
 
-def get_expiry_risk(days: int = 90, limit: int = 20) -> str:
+def get_expiry_risk(days: int = 90, limit: int = 20, pharmacy_id: str | None = None) -> str:
+    pid = pharmacy_id or PID
     rows = q(
         """select name, batch_no, expiry_date, qty_pieces, value_at_risk, days_left
              from v_expiry_risk
             where pharmacy_id = %s and days_left <= %s
             order by expiry_date limit %s""",
-        (PID, days, limit),
+        (pid, days, limit),
     )
     if not rows:
         return f"Nothing expiring in the next {days} days."
@@ -184,7 +186,8 @@ def get_expiry_risk(days: int = 90, limit: int = 20) -> str:
 
 
 def get_sales_summary(period: str = "today", start: str | None = None,
-                      end: str | None = None) -> str:
+                      end: str | None = None, pharmacy_id: str | None = None) -> str:
+    pid = pharmacy_id or PID
     s, e = _period_bounds(period, start, end)
     row = q1(
         """select count(distinct o.id) as orders,
@@ -193,14 +196,14 @@ def get_sales_summary(period: str = "today", start: str | None = None,
              from orders o
             where o.pharmacy_id = %s and o.status in ('paid','packed','dispatched','delivered')
               and o.created_at::date between %s and %s""",
-        (PID, s, e),
+        (pid, s, e),
     )
     units = q1(
         """select coalesce(-sum(m.delta_pieces),0) as pieces
              from stock_movements m
             where m.pharmacy_id = %s and m.reason='sale'
               and m.created_at::date between %s and %s""",
-        (PID, s, e),
+        (pid, s, e),
     )
     return (f"{s:%d %b} – {e:%d %b %Y}\n"
             f"• Revenue: {kes(row['revenue'])}\n"
@@ -209,7 +212,9 @@ def get_sales_summary(period: str = "today", start: str | None = None,
             f"• Units dispensed: {units['pieces']}")
 
 
-def get_top_products(days: int = 30, limit: int = 10, by: str = "value") -> str:
+def get_top_products(days: int = 30, limit: int = 10, by: str = "value",
+                     pharmacy_id: str | None = None) -> str:
+    pid = pharmacy_id or PID
     order_col = "value" if by == "value" else "pieces"
     rows = q(
         f"""select p.name,
@@ -222,7 +227,7 @@ def get_top_products(days: int = 30, limit: int = 10, by: str = "value") -> str:
                and m.created_at > now() - (%s || ' days')::interval
              group by p.id, p.name
              order by {order_col} desc limit %s""",
-        (PID, str(days), limit),
+        (pid, str(days), limit),
     )
     if not rows:
         return f"No sales recorded in the last {days} days."
@@ -233,14 +238,16 @@ def get_top_products(days: int = 30, limit: int = 10, by: str = "value") -> str:
 
 
 def find_supplier(supplier_name: str | None = None,
-                  product_query: str | None = None) -> str:
+                  product_query: str | None = None,
+                  pharmacy_id: str | None = None) -> str:
+    pid = pharmacy_id or PID
     if supplier_name:
         rows = q(
             """select name, phone, alt_phone, rep_name, email, mpesa_paybill
                  from suppliers
                 where pharmacy_id=%s and (name ilike %s or similarity(name,%s) > 0.3)
                 order by similarity(name,%s) desc limit 5""",
-            (PID, f"%{supplier_name}%", supplier_name, supplier_name),
+            (pid, f"%{supplier_name}%", supplier_name, supplier_name),
         )
     elif product_query:
         rows = q(
@@ -253,11 +260,11 @@ def find_supplier(supplier_name: str | None = None,
                 where g.pharmacy_id = %s
                   and (p.name ilike %s or similarity(p.name,%s) > 0.3)
                 limit 5""",
-            (PID, f"%{product_query}%", product_query),
+            (pid, f"%{product_query}%", product_query),
         )
     else:
         rows = q("select name, phone, rep_name from suppliers where pharmacy_id=%s "
-                 "order by name limit 25", (PID,))
+                 "order by name limit 25", (pid,))
     if not rows:
         return "No supplier found for that."
     out = []
@@ -275,7 +282,8 @@ def find_supplier(supplier_name: str | None = None,
     return "\n".join(out)
 
 
-def get_reorder_suggestions(limit: int = 20) -> str:
+def get_reorder_suggestions(limit: int = 20, pharmacy_id: str | None = None) -> str:
+    pid = pharmacy_id or PID
     rows = q(
         """select s.name, s.pack_size, s.qty_pieces, s.reorder_level_pieces,
                   coalesce(v.avg_daily, 0) as avg_daily,
@@ -289,7 +297,7 @@ def get_reorder_suggestions(limit: int = 20) -> str:
             order by case when coalesce(v.avg_daily,0) > 0
                           then s.qty_pieces / v.avg_daily else 9999 end asc
             limit %s""",
-        (PID, limit),
+        (pid, limit),
     )
     if not rows:
         return "Nothing needs reordering right now."
@@ -621,11 +629,17 @@ TOOL_IMPLS = {
 }
 
 
-def run_tool(name: str, args: dict, phone: str) -> str:
+def run_tool(name: str, args: dict, phone: str, pharmacy_id: str | None = None) -> str:
     """Execute a tool. generate_report_pdf has a side effect (sends a document)."""
+    pid = pharmacy_id
+    if not pid and phone:
+        from tenant import resolve_tenant
+        pid = resolve_tenant(phone)
+    pid = pid or PID
+
     if name == "generate_report_pdf":
         from wa import send_document
-        path, fname = build_report_pdf(args.get("period", "month"))
+        path, fname = build_report_pdf(args.get("period", "month"), pharmacy_id=pid)
         url = signed_url(settings.BUCKET_DOCS, path, 86400)
         send_document(phone, url, fname, "Your Pharma OS report")
         return "Report PDF generated and sent to the user as a WhatsApp document."
@@ -633,7 +647,7 @@ def run_tool(name: str, args: dict, phone: str) -> str:
     if not fn:
         return f"Unknown tool {name}"
     try:
-        return fn(**args)
+        return fn(**args, pharmacy_id=pid)
     except Exception as e:
         log.exception("tool %s failed", name)
         return f"Tool error: {type(e).__name__}: {e}"
