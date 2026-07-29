@@ -5,6 +5,8 @@ The webhook is an unauthenticated-by-URL entry point that can drive stock moveme
 own default secret is the literal string "secret" -- so these tests exist mostly to
 make sure the signature check cannot regress into a no-op.
 """
+from __future__ import annotations
+
 import hashlib
 import hmac
 import json

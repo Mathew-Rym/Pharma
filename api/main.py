@@ -57,9 +57,10 @@ def health():
 # ============================================================ WhatsApp webhook
 @app.post("/webhook")
 async def webhook(request: Request, background: BackgroundTasks,
-                  x_pharmaos_secret: str | None = Header(None)):
+                  x_pharmaos_secret: str | None = Header(None),
+                  x_dishii_secret: str | None = Header(None)):
     """Text messages from the gateway. Returns immediately."""
-    _auth(x_pharmaos_secret)
+    _auth(x_pharmaos_secret or x_dishii_secret)
     body = await request.json()
     log.info("inbound text from=%s", body.get("from"))
     background.add_task(handle_inbound, body)
@@ -69,13 +70,14 @@ async def webhook(request: Request, background: BackgroundTasks,
 @app.post("/webhook/media")
 async def webhook_media(background: BackgroundTasks,
                         x_pharmaos_secret: str | None = Header(None),
+                        x_dishii_secret: str | None = Header(None),
                         wa_id: str = Form(...),
                         sender: str = Form(...),
                         msg_type: str = Form("image"),
                         caption: str = Form(""),
                         file: UploadFile = File(...)):
     """Images arrive as multipart so Supabase credentials stay in one service."""
-    _auth(x_pharmaos_secret)
+    _auth(x_pharmaos_secret or x_dishii_secret)
     phone = norm_phone(sender)
     data = await file.read()
 
@@ -231,8 +233,9 @@ async def mpesa_callback(request: Request):
 
 # ============================================================ cron jobs
 @app.post("/jobs/{name}")
-def run_job(name: str, x_pharmaos_secret: str | None = Header(None)):
-    _auth(x_pharmaos_secret)
+def run_job(name: str, x_pharmaos_secret: str | None = Header(None),
+            x_dishii_secret: str | None = Header(None)):
+    _auth(x_pharmaos_secret or x_dishii_secret)
     fn = JOBS.get(name)
     if not fn:
         raise HTTPException(404, f"unknown job. available: {list(JOBS)}")
@@ -295,14 +298,15 @@ def verify(token: str):
 # ============================================================ dev helper
 @app.post("/dev/simulate")
 async def simulate(request: Request, background: BackgroundTasks,
-                   x_pharmaos_secret: str | None = Header(None)):
+                   x_pharmaos_secret: str | None = Header(None),
+                   x_dishii_secret: str | None = Header(None)):
     """Fire a fake inbound message without WhatsApp. Invaluable for testing.
 
     curl -X POST $API/dev/simulate -H "x-pharmaos-secret: $S" \
          -H 'content-type: application/json' \
          -d '{"from":"254700000001","text":"EXPIRY"}'
     """
-    _auth(x_pharmaos_secret)
+    _auth(x_pharmaos_secret or x_dishii_secret)
     body = await request.json()
     body.setdefault("wa_id", f"sim-{uuid.uuid4().hex[:12]}")
     body.setdefault("type", "text")
