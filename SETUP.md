@@ -166,14 +166,25 @@ This is the step that decides whether the demo works. It prints:
 * who can be messaged (they have texted the bot before)
 * who is related but **not reachable** because they never texted in
 
-Two things silence a participant, and both look identical to a broken bot:
+### Which gate grants access, and who grants it
 
-1. **Not on `WA_ALLOWLIST`.** Add them to `.env`. Takes effect immediately, no restart.
-2. **Never messaged the bot.** They must send one message first. The system deliberately
-   refuses to message anyone who has not — that is what stops the number being banned.
+| | Gate 1 · allowlist | Gate 3 · chat established |
+|---|---|---|
+| Granted by | you, editing `WA_ALLOWLIST` | them, texting the bot |
+| Automatic | never — the code only reads it | yes, on their first message |
+| When to use | while developing | always on |
 
-So for every demo participant: **add their number to the allowlist, and have them text the
-bot once.**
+**Gate 1 is off by default** (`WA_ALLOWLIST=` empty), which is the production posture. In
+that state **texting the bot once is all a participant needs** — Gate 3 records it and they
+become reachable. Strangers are still refused by Gate 2 and cold numbers by Gate 3.
+
+Turn Gate 1 on only while building, when an accidental send to a real number would be
+costly: a seed script holding live numbers, or a test that really sends. It is deliberately
+manual — auto-populating it on inbound would make it identical to Gate 3 and it would stop
+being a second layer.
+
+With Gate 1 ON, a participant needs BOTH an `.env` entry and an inbound message, and
+forgetting the entry looks exactly like a broken bot. That is the trade-off.
 
 ---
 
