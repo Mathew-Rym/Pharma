@@ -54,12 +54,14 @@ jobs:
           esac
 
       - name: Call the API
+        env:
+          API_URL: ${{ secrets.API_URL }}
+          SHARED_SECRET: ${{ secrets.SHARED_SECRET }}
         run: |
           JOB="${{ steps.pick.outputs.job }}"
           if [ -z "$JOB" ]; then
             JOB="expiry_sweep"
           fi
-          API_URL="${{ secrets.API_URL }}"
           if [ -z "$API_URL" ]; then
             echo "::warning::API_URL secret is not configured in GitHub repository secrets. Skipping cron API call."
             exit 0
@@ -67,7 +69,8 @@ jobs:
           echo "Running $JOB at $API_URL"
           code=$(curl -sS -o /tmp/out.json -w '%{http_code}' \
             -X POST "${API_URL}/jobs/$JOB" \
-            -H "x-pharmaos-secret: ${{ secrets.SHARED_SECRET }}" \
+            -H "x-pharmaos-secret: ${SHARED_SECRET}" \
+            -H "x-dishii-secret: ${SHARED_SECRET}" \
             --max-time 300 || echo "000")
           echo "HTTP $code"
           if [ -f /tmp/out.json ]; then
