@@ -9,6 +9,8 @@ load_dotenv()
 def _req(key: str) -> str:
     v = os.getenv(key)
     if not v:
+        if os.getenv("PHARMAOS_TESTING") == "1":
+            return f"test-{key.lower()}"
         raise RuntimeError(f"Missing required env var: {key}")
     return v
 

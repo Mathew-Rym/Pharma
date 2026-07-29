@@ -3,6 +3,9 @@ on: [push, pull_request]
 jobs:
   pytest:
     runs-on: ubuntu-latest
+    env:
+      PHARMAOS_TESTING: "1"
+      GEMINI_API_KEY: test-only
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
