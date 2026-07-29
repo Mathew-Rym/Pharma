@@ -92,8 +92,8 @@ def send_code(phone_raw: str, q, ex) -> tuple[bool, str]:
     api = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "api")
     if api not in sys.path:
         sys.path.insert(0, api)
-    from wa import send_text
-    send_text(phone,
+    from wa import reply_text
+    reply_text(phone,
               f"*{code}* is your Pharma OS sign-in code.\n\n"
               f"It expires in {CODE_TTL_MIN} minutes. If you did not try to sign in, "
               f"ignore this message and tell the owner.")

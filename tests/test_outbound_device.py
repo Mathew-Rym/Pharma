@@ -27,9 +27,18 @@ DB = bool(os.getenv("DATABASE_URL"))
 db = pytest.mark.skipif(not DB, reason="DATABASE_URL not set")
 
 
+RECIPIENTS = ("254700000009", "254713755274")
+
+
 @pytest.fixture
 def two_tenants():
-    """Two pharmacies, each bound to its own GOWA slot and JID."""
+    """Two pharmacies, each bound to its own GOWA slot and JID.
+
+    Each also has the test recipients as customers WITH inbound history, because
+    compose() now runs the anti-ban gates: a recipient who is a stranger, or who never
+    messaged first, is refused. These tests are about which device a message leaves by,
+    so the conversation has to already exist for them to reach that code at all.
+    """
     from db import ex, q1
     mark = secrets.token_hex(3).lower()
     made = {}
@@ -38,13 +47,20 @@ def two_tenants():
                     values (%s,%s,%s,%s,'tenant') returning id""",
                  (f"OUT-{side.upper()}-{mark}", f"2547{side*2}000{mark[:3]}",
                   f"2547{side*2}000{mark[:3]}@s.whatsapp.net", f"slot-{side}-{mark}"))
-        made[side] = {"pid": str(row["id"]),
+        pid = str(row["id"])
+        for phone in RECIPIENTS:
+            ex("insert into customers (pharmacy_id, phone) values (%s,%s)", (pid, phone))
+            ex("""insert into inbound_history (pharmacy_id, phone)
+                  values (%s,%s) on conflict do nothing""", (pid, phone))
+        made[side] = {"pid": pid,
                       "slot": f"slot-{side}-{mark}",
                       "jid": f"2547{side*2}000{mark[:3]}@s.whatsapp.net"}
     yield made
     for side in ("a", "b"):
-        ex("delete from wa_messages where pharmacy_id=%s", (made[side]["pid"],))
-        ex("delete from pharmacies where id=%s", (made[side]["pid"],))
+        pid = made[side]["pid"]
+        for t in ("inbound_history", "wa_messages", "customers"):
+            ex(f"delete from {t} where pharmacy_id=%s", (pid,))
+        ex("delete from pharmacies where id=%s", (pid,))
 
 
 @db

@@ -21,6 +21,7 @@ import httpx
 
 from config import settings
 from db import ex, q1
+from safety import GateBlocked, check_gates
 from utils import norm_phone
 
 log = logging.getLogger(__name__)
@@ -43,6 +44,10 @@ def compose(pharmacy_id, phone: str, msg_type: str, body: str,
     The device is resolved HERE, not at send time. Everything deferred -- cron alerts,
     SLA escalations, retries -- runs with no request context, so a sender that resolves
     the device itself has nothing correct to resolve from.
+
+    Safety gates are checked HERE, before the row is written. A GateBlocked exception
+    means the message is too risky for WhatsApp compliance and must not be sent.
+
     """
     phone = norm_phone(phone)
     if not phone:
@@ -55,6 +60,9 @@ def compose(pharmacy_id, phone: str, msg_type: str, body: str,
     if not ph["gowa_device_id"]:
         raise UnroutableMessage(
             f"pharmacy {pharmacy_id} has no paired device; refusing to guess one")
+
+    # ---- safety gates ----
+    check_gates(phone, str(pharmacy_id), ph["gowa_device_id"])
 
     row = q1("""insert into wa_messages
                   (pharmacy_id, direction, to_phone, msg_type, body, media_path,
@@ -208,8 +216,8 @@ def send_for(pharmacy_id, phone: str, msg_type: str, body: str,
 def send_text(phone: str, body: str) -> None:
     try:
         send_for(settings.PHARMACY_ID, phone, "text", body)
-    except UnroutableMessage:
-        log.exception("send_text unroutable to %s", phone)
+    except (UnroutableMessage, GateBlocked) as e:
+        log.warning("send_text blocked to %s: %s", phone, e)
 
 
 def send_document(phone: str, url: str, filename: str, caption: str = "") -> None:
@@ -218,8 +226,8 @@ def send_document(phone: str, url: str, filename: str, caption: str = "") -> Non
     # human-readable name rides along in the caption.
     try:
         send_for(settings.PHARMACY_ID, phone, "document", caption or filename, url)
-    except UnroutableMessage:
-        log.exception("send_document unroutable to %s", phone)
+    except (UnroutableMessage, GateBlocked) as e:
+        log.warning("send_document blocked to %s: %s", phone, e)
 
 
 def send_image(phone: str, url: str, caption: str = "") -> None:
@@ -227,8 +235,33 @@ def send_image(phone: str, url: str, caption: str = "") -> None:
     native pinch-zoom beats anything we would build in a dashboard."""
     try:
         send_for(settings.PHARMACY_ID, phone, "image", caption, url)
-    except UnroutableMessage:
-        log.exception("send_image unroutable to %s", phone)
+    except (UnroutableMessage, GateBlocked) as e:
+        log.warning("send_image blocked to %s: %s", phone, e)
+
+
+# --------------------------------------------------------- reply wrappers
+# Named for the caller's intent, and kept because router.py reads better with them. They
+# do NOT bypass any gate: Gate 3 opens because handle_inbound recorded the inbound before
+# dispatching, which is evidence rather than an assertion by the sender.
+def reply_text(phone: str, body: str) -> None:
+    try:
+        send_for(settings.PHARMACY_ID, phone, "text", body)
+    except (UnroutableMessage, GateBlocked) as e:
+        log.warning("reply_text blocked to %s: %s", phone, e)
+
+
+def reply_document(phone: str, url: str, filename: str, caption: str = "") -> None:
+    try:
+        send_for(settings.PHARMACY_ID, phone, "document", caption or filename, url)
+    except (UnroutableMessage, GateBlocked) as e:
+        log.warning("reply_document blocked to %s: %s", phone, e)
+
+
+def reply_image(phone: str, url: str, caption: str = "") -> None:
+    try:
+        send_for(settings.PHARMACY_ID, phone, "image", caption, url)
+    except (UnroutableMessage, GateBlocked) as e:
+        log.warning("reply_image blocked to %s: %s", phone, e)
 
 
 def broadcast(phones: list[str], body: str) -> None:

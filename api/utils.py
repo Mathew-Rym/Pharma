@@ -13,6 +13,14 @@ def norm_phone(raw: str) -> str:
     0713755274        -> 254713755274
     +254 713 755 274  -> 254713755274
     254713755274@s.whatsapp.net -> 254713755274
+
+    A 10-digit string beginning 7 or 1 is returned UNCHANGED, deliberately. It is not a
+    valid Kenyan format -- mobiles are 9 significant digits, optionally with a leading 0
+    -- so there is no way to know which digit is spurious. An earlier version dropped the
+    first one ("7137552744" -> "254137552744"), which does not fail: it produces a real,
+    validating number belonging to somebody else. The message then reaches a stranger who
+    never contacted the pharmacy, which is exactly what gets a WhatsApp number reported
+    and banned. Leave it malformed and let is_valid_ke_mobile() reject it.
     """
     if not raw:
         return ""
@@ -20,12 +28,21 @@ def norm_phone(raw: str) -> str:
     s = re.sub(r"\D", "", s)                   # digits only
     if s.startswith("0"):
         s = "254" + s[1:]
-    elif s.startswith("7") or s.startswith("1"):
-        if len(s) == 9:                        # 713755274
-            s = "254" + s
+    elif (s.startswith("7") or s.startswith("1")) and len(s) == 9:
+        s = "254" + s                          # 713755274
     elif s.startswith("254254"):
         s = s[3:]
+    # Already 12 digits starting with 254 → keep as-is
     return s
+
+
+def is_valid_ke_mobile(phone: str) -> bool:
+    """Check if a normalised phone looks like a valid Kenyan mobile number.
+
+    Valid Kenyan mobiles are 12 digits starting with 2547 or 2541.
+    """
+    p = norm_phone(phone)
+    return bool(p) and len(p) == 12 and p.startswith("254") and p[3] in "17"
 
 
 def pretty_phone(p: str) -> str:

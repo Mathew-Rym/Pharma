@@ -477,8 +477,14 @@ PYEOF
 
 migrate)
   "$PY" - <<'PYEOF'
-import os, glob, psycopg
-files = ["db/schema.sql"] + sorted(glob.glob("db/schema_v*.sql"))
+import os, glob, re, psycopg
+# Sort by the NUMBER, not the string. Lexicographically "schema_v10.sql" sorts before
+# "schema_v2.sql", so plain sorted() applied v10 second -- before the eight migrations it
+# builds on. That is silent on an already-migrated database and breaks a fresh install.
+def _ver(path):
+    m = re.search(r"schema_v(\d+)\.sql$", path)
+    return int(m.group(1)) if m else 0
+files = ["db/schema.sql"] + sorted(glob.glob("db/schema_v*.sql"), key=_ver)
 conn = psycopg.connect(os.environ["DATABASE_URL"])
 for f in files:
     try:

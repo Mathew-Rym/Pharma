@@ -12,7 +12,7 @@ from db import apply_movement, download, ex, ex1, q, q1, tx
 from llm import count_delivery, extract_invoice
 from state import clear_state, get_state, set_state
 from utils import from_pieces, kes, parse_date_loose, parse_expiry, parse_wp, to_pieces
-from wa import send_text
+from wa import reply_text
 
 log = logging.getLogger(__name__)
 PID = settings.PHARMACY_ID
@@ -24,7 +24,7 @@ def add_page(phone: str, storage_path: str) -> None:
     pages = st["context"].get("pages", []) if st["flow"] == "grn_collect" else []
     pages.append(storage_path)
     set_state(phone, "grn_collect", {"pages": pages})
-    send_text(
+    reply_text(
         phone,
         f"Page {len(pages)} received. Send more pages, or reply *DONE* to process.",
     )
@@ -35,24 +35,24 @@ def process_pages(phone: str, staff: dict) -> None:
     st = get_state(phone)
     pages = st["context"].get("pages", [])
     if not pages:
-        send_text(phone, "No invoice pages yet. Send a photo of the supplier invoice first.")
+        reply_text(phone, "No invoice pages yet. Send a photo of the supplier invoice first.")
         return
 
-    send_text(phone, f"Reading {len(pages)} page(s)... this takes about 30 seconds.")
+    reply_text(phone, f"Reading {len(pages)} page(s)... this takes about 30 seconds.")
     try:
         images = [download(settings.BUCKET_INVOICES, p) for p in pages]
         data = extract_invoice(images)
     except Exception as e:
         log.exception("invoice extraction failed")
         clear_state(phone)
-        send_text(phone, f"Could not read that invoice ({type(e).__name__}). "
+        reply_text(phone, f"Could not read that invoice ({type(e).__name__}). "
                          "Try again with better light, or type HELP.")
         return
 
     grn_id = _persist(data, pages, staff)
     if not grn_id:
         clear_state(phone)
-        send_text(phone, "That did not look like a supplier invoice. Nothing was saved.")
+        reply_text(phone, "That did not look like a supplier invoice. Nothing was saved.")
         return
 
     # duplicate guard — two staff receiving the same delivery from two phones
@@ -66,7 +66,7 @@ def process_pages(phone: str, staff: dict) -> None:
     )
     if dup:
         when = dup["approved_at"].strftime("%d %b %H:%M") if dup["approved_at"] else "earlier"
-        send_text(phone, f"Invoice {data.get('invoice_no')} was already received by "
+        reply_text(phone, f"Invoice {data.get('invoice_no')} was already received by "
                          f"{dup['who'] or 'someone'} at {when}. Nothing was changed.")
         clear_state(phone)
         return
@@ -78,7 +78,7 @@ def process_pages(phone: str, staff: dict) -> None:
     ex1("update grns set status='awaiting_count' where id=%s returning id", (grn_id,))
     set_state(phone, "grn_goods", {"grn_id": grn_id, "goods": []})
     n = len(q("select 1 from grn_lines where grn_id=%s", (grn_id,)))
-    send_text(phone,
+    reply_text(phone,
               f"Read {n} line(s) from invoice {data.get('invoice_no') or '—'}.\n\n"
               f"📦 *Now photograph the goods.*\n"
               f"Lay the packs out so they are all visible — flat on the counter beats a "
@@ -94,7 +94,7 @@ def add_goods_photo(phone: str, storage_path: str) -> None:
     goods.append(storage_path)
     set_state(phone, "grn_goods",
               {"grn_id": st["context"].get("grn_id"), "goods": goods})
-    send_text(phone, f"Goods photo {len(goods)} received. Send more, or reply *COUNT* "
+    reply_text(phone, f"Goods photo {len(goods)} received. Send more, or reply *COUNT* "
                      f"to count them.")
 
 
@@ -110,7 +110,7 @@ def handle_goods_reply(phone: str, staff: dict, text: str) -> bool:
     if up in ("CANCEL", "STOP"):
         ex1("update grns set status='rejected' where id=%s returning id", (grn_id,))
         clear_state(phone)
-        send_text(phone, "Discarded. No stock was changed.")
+        reply_text(phone, "Discarded. No stock was changed.")
         return True
 
     if up == "SKIP":
@@ -123,7 +123,7 @@ def handle_goods_reply(phone: str, staff: dict, text: str) -> bool:
         return True
 
     if up in ("COUNT", "DONE", "OK") and goods:
-        send_text(phone, f"Counting {len(goods)} photo(s)…")
+        reply_text(phone, f"Counting {len(goods)} photo(s)…")
         try:
             note, needs_more = apply_vision_count(grn_id, goods, return_flag=True)
         except Exception as e:
@@ -138,7 +138,7 @@ def handle_goods_reply(phone: str, staff: dict, text: str) -> bool:
         if needs_more and not st["context"].get("recounted"):
             set_state(phone, "grn_goods",
                       {"grn_id": grn_id, "goods": goods, "recounted": True})
-            send_text(phone, note + "\n\n📷 *Send another photo* covering the items "
+            reply_text(phone, note + "\n\n📷 *Send another photo* covering the items "
                                     "above and reply *COUNT* again, or reply *SKIP* to "
                                     "move on and check them by hand.")
             return True
@@ -147,7 +147,7 @@ def handle_goods_reply(phone: str, staff: dict, text: str) -> bool:
         return True
 
     if up in ("COUNT", "DONE", "OK"):
-        send_text(phone, "Send a photo of the goods first, or reply *SKIP* to receive "
+        reply_text(phone, "Send a photo of the goods first, or reply *SKIP* to receive "
                          "on the invoice quantities.")
         return True
 
@@ -157,7 +157,7 @@ def handle_goods_reply(phone: str, staff: dict, text: str) -> bool:
 def _to_review(phone: str, grn_id: str, note: str) -> None:
     ex1("update grns set status='needs_review' where id=%s returning id", (grn_id,))
     set_state(phone, "grn_review", {"grn_id": grn_id})
-    send_text(phone, note + "\n\n" + render_summary(grn_id))
+    reply_text(phone, note + "\n\n" + render_summary(grn_id))
 
 
 def apply_vision_count(grn_id: str, goods_paths: list[str], return_flag: bool = False):
@@ -465,7 +465,7 @@ def handle_review(phone: str, staff: dict, text: str) -> None:
     grn_id = st["context"].get("grn_id")
     if not grn_id:
         clear_state(phone)
-        send_text(phone, "That review session expired. Please send the invoice again.")
+        reply_text(phone, "That review session expired. Please send the invoice again.")
         return
 
     t = text.strip()
@@ -474,7 +474,7 @@ def handle_review(phone: str, staff: dict, text: str) -> None:
     if up in ("CANCEL", "STOP"):
         ex1("update grns set status='rejected' where id=%s returning id", (grn_id,))
         clear_state(phone)
-        send_text(phone, "Discarded. No stock was changed.")
+        reply_text(phone, "Discarded. No stock was changed.")
         return
 
     if up == "OK":
@@ -488,7 +488,7 @@ def handle_review(phone: str, staff: dict, text: str) -> None:
             wp = parse_wp(right)
             if wp:
                 _set_counted(grn_id, int(left.strip()), wp)
-                send_text(phone, f"Line {left.strip()} counted as {right.strip()}. "
+                reply_text(phone, f"Line {left.strip()} counted as {right.strip()}. "
                                  "More corrections, or reply *OK*.")
                 return
 
@@ -502,29 +502,29 @@ def handle_review(phone: str, staff: dict, text: str) -> None:
         if kind == "EXP" and val:
             d = parse_expiry(val)
             if not d:
-                send_text(phone, "Could not read that date. Use format *06/2028*.")
+                reply_text(phone, "Could not read that date. Use format *06/2028*.")
                 return
             _update_line(grn_id, line_no, "expiry_date", d, "missing_expiry")
-            send_text(phone, f"Line {line_no} expiry set to {d.strftime('%b %Y')}. "
+            reply_text(phone, f"Line {line_no} expiry set to {d.strftime('%b %Y')}. "
                              "More corrections, or reply *OK*.")
             return
 
         if kind == "BATCH" and val:
             _update_line(grn_id, line_no, "batch_no", val, "missing_batch")
-            send_text(phone, f"Line {line_no} batch set to {val}. "
+            reply_text(phone, f"Line {line_no} batch set to {val}. "
                              "More corrections, or reply *OK*.")
             return
 
         if kind == "NEW":
             name = _create_product_from_line(grn_id, line_no)
             if name:
-                send_text(phone, f"Added *{name}* to your product list and linked line "
+                reply_text(phone, f"Added *{name}* to your product list and linked line "
                                  f"{line_no}. More corrections, or reply *OK*.")
             else:
-                send_text(phone, f"Could not find line {line_no}.")
+                reply_text(phone, f"Could not find line {line_no}.")
             return
 
-    send_text(phone,
+    reply_text(phone,
               "I did not understand that. Options:\n"
               "• *OK* — receive into stock\n"
               "• *5:2W* — line 5, physical count 2 packs\n"
@@ -612,13 +612,13 @@ def approve(grn_id: str, staff: dict, phone: str) -> None:
     unmatched = [l for l in lines if not l["product_id"]]
     if unmatched:
         nums = ", ".join(str(l["line_no"]) for l in unmatched[:8])
-        send_text(phone, f"Cannot receive yet — line(s) {nums} are not linked to a product. "
+        reply_text(phone, f"Cannot receive yet — line(s) {nums} are not linked to a product. "
                          f"Reply *{unmatched[0]['line_no']} NEW* to add, for each.")
         return
 
     g = q1("select * from grns where id=%s", (grn_id,))
     if g["status"] == "approved":
-        send_text(phone, "This invoice was already received.")
+        reply_text(phone, "This invoice was already received.")
         clear_state(phone)
         return
 
@@ -716,14 +716,14 @@ def approve(grn_id: str, staff: dict, phone: str) -> None:
     if no_expiry:
         msg.append(f"⚠️ {no_expiry} line(s) saved without an expiry date. "
                    "Add them on the dashboard when you can.")
-    send_text(phone, "\n\n".join(msg))
+    reply_text(phone, "\n\n".join(msg))
 
     owner = q1(
         "select phone from staff where pharmacy_id=%s and role='owner' and is_active limit 1",
         (PID,),
     )
     if owner and owner["phone"] != phone:
-        send_text(owner["phone"],
+        reply_text(owner["phone"],
                   f"📦 Stock received: {g['invoice_no'] or 'invoice'} · "
                   f"{kes(g['net_total'] or g['parsed_total'])} · {received} lines · "
                   f"by {staff['name']}"

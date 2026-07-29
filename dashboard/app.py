@@ -104,7 +104,7 @@ def _set_order_status(order_id, new_status: str, actor: dict,
                       phone: str | None, code: str | None):
     """Status change + customer notification + who did it."""
     _api()
-    from wa import send_text
+    from wa import reply_text
     ex("update orders set status=%s where id=%s", (new_status, order_id))
     # A zero-delta movement is an audit breadcrumb, not a stock change: it records
     # who moved the order and when without touching batch quantities, so the
@@ -118,10 +118,10 @@ def _set_order_status(order_id, new_status: str, actor: dict,
         order_id))
     if phone:
         if new_status == "dispatched":
-            send_text(phone, "🛵 Your order is on the way."
+            reply_text(phone, "🛵 Your order is on the way."
                              + (f" Give the rider code *{code}*." if code else ""))
         elif new_status == "delivered":
-            send_text(phone, "✅ Delivered. Thank you for choosing us. "
+            reply_text(phone, "✅ Delivered. Thank you for choosing us. "
                              "Reply *POINTS* to see your loyalty balance.")
 
 
@@ -517,10 +517,10 @@ elif page == "Purchase orders":
                              type="primary"):
                     import sys
                     sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "api"))
-                    from wa import send_text
+                    from wa import reply_text
                     body = "\n".join(f"• {l['name']} — {wp(l['qty_pieces'], l['pack_size'])}"
                                      for l in lines)
-                    send_text(po["phone"],
+                    reply_text(po["phone"],
                               f"Purchase order from our pharmacy:\n\n{body}\n\n"
                               f"Please confirm availability and delivery date.")
                     ex("""update purchase_orders set status='sent', approved_by=%s,

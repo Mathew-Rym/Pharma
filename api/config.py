@@ -57,6 +57,14 @@ class Settings:
     # GOWA side and mirror it here.
     GOWA_WEBHOOK_SECRET = os.getenv("GOWA_WEBHOOK_SECRET", "secret")
 
+    # --- anti-ban safety gates ---
+    # Comma-separated phone numbers. When set, ONLY these numbers can receive
+    # messages. Leave empty in production (gate is skipped when empty).
+    WA_ALLOWLIST = os.getenv("WA_ALLOWLIST", "")
+    # Per-device-per-hour caps. These are deliberately conservative.
+    WA_RATE_LIMIT_HOUR = int(os.getenv("WA_RATE_LIMIT_HOUR", "80"))
+    WA_NEW_CHAT_LIMIT_HOUR = int(os.getenv("WA_NEW_CHAT_LIMIT_HOUR", "15"))
+
     # --- tenant (single pharmacy for the pilot) ---
     PHARMACY_ID = _req("PHARMACY_ID")
 

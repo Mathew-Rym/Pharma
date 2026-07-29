@@ -25,7 +25,7 @@ from config import settings
 from db import ex, ex1, q, q1
 from state import clear_state, get_state
 from utils import kes, norm_phone
-from wa import send_text
+from wa import reply_text, send_text
 
 log = logging.getLogger(__name__)
 PID = settings.PHARMACY_ID
@@ -76,7 +76,7 @@ def handle_forwarded_sms(phone: str, text: str) -> bool:
 
     parsed = parse_mpesa_sms(text)
     if not parsed["receipt"] or not parsed["amount"]:
-        send_text(phone, "That looks like an M-Pesa message but I could not read the "
+        reply_text(phone, "That looks like an M-Pesa message but I could not read the "
                          "code and amount clearly. Please forward it again, or reply "
                          "with the code and amount.")
         return True
@@ -85,7 +85,7 @@ def handle_forwarded_sms(phone: str, text: str) -> bool:
     dup = q1("select id, order_id from payments where mpesa_receipt=%s",
              (parsed["receipt"],))
     if dup:
-        send_text(phone, f"We have already recorded receipt {parsed['receipt']}.")
+        reply_text(phone, f"We have already recorded receipt {parsed['receipt']}.")
         return True
 
     order = _match_order(phone, parsed)
@@ -94,7 +94,7 @@ def handle_forwarded_sms(phone: str, text: str) -> bool:
                     mpesa_receipt, source, sms_text)
               values (%s,'mpesa_paybill',%s,%s,'success',%s,'sms_forward',%s)""",
            (PID, parsed["amount"], norm_phone(phone), parsed["receipt"], text[:1000]))
-        send_text(phone,
+        reply_text(phone,
                   f"Thank you — we have logged {kes(parsed['amount'])} "
                   f"({parsed['receipt']}). We could not match it to an open order "
                   f"automatically, so a member of staff will confirm shortly.")
@@ -112,7 +112,7 @@ def handle_forwarded_sms(phone: str, text: str) -> bool:
         (PID, order["id"], paid, norm_phone(phone), parsed["receipt"], text[:1000]))
 
     if abs(paid - expected) > 1.0:
-        send_text(phone,
+        reply_text(phone,
                   f"We received {kes(paid)} but the order total is {kes(expected)}. "
                   f"A member of staff will call you to sort out the difference.")
         _alert_staff(f"⚠️ Payment mismatch on order {str(order['id'])[:8].upper()}: "
@@ -126,7 +126,7 @@ def handle_forwarded_sms(phone: str, text: str) -> bool:
         on_payment_success(str(order["id"]), parsed["receipt"])
     except Exception:
         log.exception("post-payment processing failed")
-        send_text(phone, f"Payment {parsed['receipt']} received, thank you. "
+        reply_text(phone, f"Payment {parsed['receipt']} received, thank you. "
                          "We are preparing your order.")
     clear_state(phone)
 

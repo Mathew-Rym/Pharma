@@ -31,7 +31,7 @@ from config import settings
 from db import ex, ex1, q, q1, signed_url
 from state import clear_state, get_state, set_state
 from utils import from_pieces, kes
-from wa import send_document, send_image, send_text
+from wa import reply_document, reply_image, reply_text, send_text
 
 log = logging.getLogger(__name__)
 PID = settings.PHARMACY_ID
@@ -116,13 +116,13 @@ def present_numbered_list(phone: str, rx_id: str, drugs: list[dict]) -> None:
     have = [it for it in items if it["available"]]
     if not have:
         clear_state(phone)
-        send_text(phone,
+        reply_text(phone,
                   "We read your prescription but none of the items are in stock right "
                   "now. We will call you when they arrive, or you can reply *CALL* to "
                   "speak to a pharmacist.")
         return
 
-    send_text(
+    reply_text(
         phone,
         "Here is what we read from your prescription:\n\n"
         + "\n".join(lines)
@@ -138,7 +138,7 @@ def handle_selection(phone: str, text: str) -> None:
     rx_id = st["context"].get("rx_id")
     if not items:
         clear_state(phone)
-        send_text(phone, "That session expired. Please send your prescription again.")
+        reply_text(phone, "That session expired. Please send your prescription again.")
         return
 
     up = text.strip().upper()
@@ -150,7 +150,7 @@ def handle_selection(phone: str, text: str) -> None:
         chosen = [it for it in available if it["n"] in nums]
 
     if not chosen:
-        send_text(phone,
+        reply_text(phone,
                   "I did not catch which items you want. Reply with the numbers, "
                   "e.g. *1,3*, or *ALL*.")
         return
@@ -162,7 +162,7 @@ def handle_selection(phone: str, text: str) -> None:
                    returning id""",
                 (PID, rx_id, secrets.token_urlsafe(16), PID, phone))
     if not order:
-        send_text(phone, "Something went wrong creating your order. Please try again.")
+        reply_text(phone, "Something went wrong creating your order. Please try again.")
         return
 
     subtotal = 0.0
@@ -192,7 +192,7 @@ def handle_selection(phone: str, text: str) -> None:
        (subtotal, settings.DELIVERY_FEE, total, order["id"]))
 
     set_state(phone, "rx_waiting_pharmacist", {"order_id": str(order["id"])}, ttl_min=240)
-    send_text(phone,
+    reply_text(phone,
               "Thank you. Your order:\n\n"
               + "\n".join(f"• {it['name']} — {kes(it['line_total'])}" for it in chosen)
               + f"\n\nSubtotal {kes(subtotal)} + delivery {kes(settings.DELIVERY_FEE)}\n"
@@ -260,8 +260,8 @@ def notify_pharmacist(rx_id: str, order_id: str) -> None:
     url = signed_url(settings.BUCKET_RX, rx["image_path"], 7200)
     for s in on_duty:
         if url:
-            send_image(s["phone"], url, caption="Prescription to verify")
-        send_text(s["phone"], text)
+            reply_image(s["phone"], url, caption="Prescription to verify")
+        reply_text(s["phone"], text)
         set_state(s["phone"], "pharmacist_review",
                   {"rx_id": str(rx_id), "order_id": str(order_id)}, ttl_min=240)
 
@@ -291,7 +291,7 @@ def handle_pharmacist_reply(phone: str, staff: dict, text: str) -> bool:
         pin = re.sub(r"[^0-9]", "", up.replace("APPROVE", "", 1))
         ok, msg = check_pin(staff, pin)
         if not ok:
-            send_text(phone, msg)
+            reply_text(phone, msg)
             return True
         _do_approve(rx_id, order_id, staff, phone)
         return True
@@ -306,11 +306,11 @@ def handle_pharmacist_reply(phone: str, staff: dict, text: str) -> bool:
 
 def _do_approve(rx_id: str, order_id: str, staff: dict, phone: str) -> None:
     if staff["role"] not in ("pharmacist", "owner", "manager"):
-        send_text(phone, "Your role cannot verify prescriptions.")
+        reply_text(phone, "Your role cannot verify prescriptions.")
         return
     already = q1("select status, verified_by from prescriptions where id=%s", (rx_id,))
     if already and already["status"] == "verified":
-        send_text(phone, "This prescription was already verified.")
+        reply_text(phone, "This prescription was already verified.")
         clear_state(phone)
         return
 
@@ -323,12 +323,12 @@ def _do_approve(rx_id: str, order_id: str, staff: dict, phone: str) -> None:
     cust = q1("select * from customers where id=%s", (order["customer_id"],))
     ph = q1("select mpesa_paybill from pharmacies where id=%s", (PID,))
 
-    send_text(phone, f"✅ Verified and released. Recorded against {staff['name']}"
+    reply_text(phone, f"✅ Verified and released. Recorded against {staff['name']}"
                      + (f" (PPB {staff['ppb_reg_no']})" if staff.get("ppb_reg_no") else "")
                      + f" at {datetime.now():%H:%M}.")
 
     set_state(cust["phone"], "awaiting_payment", {"order_id": str(order_id)}, ttl_min=180)
-    send_text(cust["phone"],
+    reply_text(cust["phone"],
               f"✅ *Approved by our pharmacist.*\n\n"
               f"Amount due: *{kes(order['total'])}*\n\n"
               f"Reply *PAY* and we will send an M-Pesa request to this number.\n\n"
@@ -347,9 +347,9 @@ def _do_reject(rx_id: str, order_id: str, staff: dict, phone: str, reason: str) 
     order = q1("select customer_id from orders where id=%s", (order_id,))
     cust = q1("select phone from customers where id=%s", (order["customer_id"],))
     clear_state(cust["phone"])
-    send_text(phone, f"Rejected and the patient has been told. Recorded against "
+    reply_text(phone, f"Rejected and the patient has been told. Recorded against "
                      f"{staff['name']}.")
-    send_text(cust["phone"],
+    reply_text(cust["phone"],
               f"Our pharmacist could not dispense against this prescription.\n\n"
               f"Reason: {reason}\n\n"
               f"Please call us or visit the pharmacy so we can help properly.")
@@ -378,7 +378,7 @@ def send_po_for_approval(po_id: str) -> None:
     for s in q("""select phone from staff where pharmacy_id=%s and is_active
                    and role in ('owner','manager')""", (PID,)):
         set_state(s["phone"], "po_review", {"po_id": str(po_id)}, ttl_min=1440)
-        send_text(s["phone"], body)
+        reply_text(s["phone"], body)
 
 
 def handle_po_reply(phone: str, staff: dict, text: str) -> bool:
@@ -392,7 +392,7 @@ def handle_po_reply(phone: str, staff: dict, text: str) -> bool:
         pin = re.sub(r"[^0-9]", "", up.replace("OKPO", "", 1))
         ok, msg = check_pin(staff, pin)
         if not ok:
-            send_text(phone, msg)
+            reply_text(phone, msg)
             return True
 
         po = q1("""select po.*, s.name as supplier, s.phone as sup_phone
@@ -408,7 +408,7 @@ def handle_po_reply(phone: str, staff: dict, text: str) -> bool:
                   approved_at=now(), sent_at=now() where id=%s""", (staff["id"], po_id))
 
         if po["sup_phone"]:
-            send_text(po["sup_phone"],
+            reply_text(po["sup_phone"],
                       "Good day. Purchase order from our pharmacy:\n\n"
                       + "\n".join(f"• {l['name']} — "
                                   f"{from_pieces(l['qty_pieces'], l['pack_size'])}"
@@ -427,7 +427,7 @@ def handle_po_reply(phone: str, staff: dict, text: str) -> bool:
                 log.exception("PO pdf failed for %s; the text order was still sent",
                               po_id)
         clear_state(phone)
-        send_text(phone, f"✅ Sent to {po['supplier']}"
+        reply_text(phone, f"✅ Sent to {po['supplier']}"
                          + (f" on {po['sup_phone']}" if po["sup_phone"] else
                             " — no phone on file, please call them")
                          + f". Recorded against {staff['name']}.")
@@ -435,7 +435,7 @@ def handle_po_reply(phone: str, staff: dict, text: str) -> bool:
 
     if up == "EDITPO":
         clear_state(phone)
-        send_text(phone, "Open the dashboard → Purchase orders to change quantities, "
+        reply_text(phone, "Open the dashboard → Purchase orders to change quantities, "
                          "then approve there.")
         return True
 

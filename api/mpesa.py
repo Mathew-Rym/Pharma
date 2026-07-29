@@ -128,8 +128,8 @@ def handle_callback(body: dict) -> dict:
 
 
 def _notify_failure(pay: dict, reason: str) -> None:
-    from wa import send_text
+    from wa import reply_text
     if pay.get("phone"):
-        send_text(pay["phone"],
-                  f"Payment was not completed ({reason}). Reply *PAY* to try again, "
-                  "or send the money to our Paybill and we will confirm manually.")
+        reply_text(pay["phone"],
+                   f"Payment was not completed ({reason}). Reply *PAY* to try again, "
+                   "or send the money to our Paybill and we will confirm manually.")

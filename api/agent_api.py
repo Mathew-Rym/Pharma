@@ -99,8 +99,8 @@ async def command_result(command_id: str, request: Request,
                   where id=%s returning command, reply_to""",
               ("done" if ok else "error", json.dumps(result), command_id))
     if row and row["reply_to"]:
-        from wa import send_text
-        send_text(row["reply_to"], _humanise(row["command"], ok, result))
+        from wa import reply_text
+        reply_text(row["reply_to"], _humanise(row["command"], ok, result))
     return {"ok": True}
 
 

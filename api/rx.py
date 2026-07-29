@@ -15,7 +15,7 @@ from db import apply_movement, download, ex, ex1, q, q1, signed_url, tx
 from llm import extract_prescription
 from state import clear_state, get_state, set_state
 from utils import from_pieces, kes, parse_date_loose
-from wa import send_document, send_text
+from wa import reply_document, reply_text, send_text
 
 log = logging.getLogger(__name__)
 PID = settings.PHARMACY_ID
@@ -36,7 +36,7 @@ def get_or_create_customer(phone: str) -> dict:
 def ask_consent(phone: str) -> None:
     """Kenya Data Protection Act 2019 — explicit consent before we store health data."""
     set_state(phone, "awaiting_consent", {}, ttl_min=1440)
-    send_text(
+    reply_text(
         phone,
         "Hello! This is the pharmacy's automated assistant.\n\n"
         "To take your order we need to save your phone number, your name and your "
@@ -53,7 +53,7 @@ def record_consent(phone: str) -> None:
         (PID, phone),
     )
     clear_state(phone)
-    send_text(phone,
+    reply_text(phone,
               "Thank you. You can now:\n"
               "• Send a photo of your prescription\n"
               "• Ask if we have a medicine, e.g. *do you have amoxil*\n"
@@ -68,19 +68,19 @@ def receive_prescription(phone: str, storage_path: str) -> None:
         ask_consent(phone)
         return
 
-    send_text(phone, "Got your prescription. Reading it now, one moment...")
+    reply_text(phone, "Got your prescription. Reading it now, one moment...")
     try:
         img = download(settings.BUCKET_RX, storage_path)
         data = extract_prescription([img])
     except Exception as e:
         log.exception("rx extraction failed")
-        send_text(phone, "Sorry, we could not read that image clearly. "
+        reply_text(phone, "Sorry, we could not read that image clearly. "
                          "Please retake the photo in good light, flat on a table.")
         return
 
     drugs = data.get("drugs") or []
     if not drugs:
-        send_text(phone, "That does not look like a prescription. "
+        reply_text(phone, "That does not look like a prescription. "
                          "Please send a clear photo of the doctor's prescription.")
         return
 
@@ -198,7 +198,7 @@ def _notify_pharmacists(rx_id: str, cust: dict, drugs: list[dict], flags: list[s
     names = ", ".join(d.get("drug", "?") for d in drugs[:5])
     warn = f"\n⚠️ Flags: {', '.join(flags)}" if flags else ""
     for p in pharmacists:
-        send_text(p["phone"],
+        reply_text(p["phone"],
                   f"🩺 *Prescription awaiting your verification*\n"
                   f"Customer: {cust['phone']}\nItems: {names}{warn}\n\n"
                   f"Open the dashboard to review the image and approve or reject. "
@@ -237,7 +237,7 @@ def pharmacist_approve(rx_id: str, staff_id: str) -> None:
     )
     ph = q1("select mpesa_paybill from pharmacies where id=%s", (PID,))
     set_state(cust["phone"], "awaiting_confirm", {"order_id": str(order["id"])}, ttl_min=120)
-    send_text(
+    reply_text(
         cust["phone"],
         f"✅ *Verified by {staff['name']}"
         + (f" (PPB {staff['ppb_reg_no']})" if staff.get("ppb_reg_no") else "")
@@ -261,7 +261,7 @@ def pharmacist_reject(rx_id: str, staff_id: str, reason: str) -> None:
         ex("update orders set status='cancelled' where id=%s", (order["id"],))
         cust = q1("select phone from customers where id=%s", (order["customer_id"],))
         clear_state(cust["phone"])
-        send_text(cust["phone"],
+        reply_text(cust["phone"],
                   f"Our pharmacist could not dispense against this prescription.\n\n"
                   f"Reason: {reason}\n\nPlease call the pharmacy or visit us in person.")
 
@@ -271,28 +271,28 @@ def customer_confirm(phone: str) -> None:
     st = get_state(phone)
     order_id = st["context"].get("order_id")
     if not order_id:
-        send_text(phone, "There is no order waiting for confirmation. "
+        reply_text(phone, "There is no order waiting for confirmation. "
                          "Send your prescription to start a new one.")
         return
     order = q1("select * from orders where id=%s", (order_id,))
     if not order or order["status"] != "awaiting_payment":
-        send_text(phone, "That order is no longer awaiting payment.")
+        reply_text(phone, "That order is no longer awaiting payment.")
         clear_state(phone)
         return
     from mpesa import stk_push
     try:
         res = stk_push(phone, float(order["total"]), order_id)
         if res.get("ResponseCode") == "0":
-            send_text(phone, "📲 Check your phone and enter your M-Pesa PIN to pay "
+            reply_text(phone, "📲 Check your phone and enter your M-Pesa PIN to pay "
                              f"{kes(order['total'])}. We will confirm here automatically.")
         else:
             ph = q1("select mpesa_paybill from pharmacies where id=%s", (PID,))
-            send_text(phone, "The M-Pesa prompt failed to send. Please pay to Paybill "
+            reply_text(phone, "The M-Pesa prompt failed to send. Please pay to Paybill "
                              f"{ph['mpesa_paybill'] or '—'}, account "
                              f"{str(order_id)[:8].upper()}, amount {kes(order['total'])}.")
     except Exception:
         log.exception("stk push failed")
-        send_text(phone, "Payment system is briefly unavailable. Please try *CONFIRM* again "
+        reply_text(phone, "Payment system is briefly unavailable. Please try *CONFIRM* again "
                          "in a minute.")
 
 
@@ -326,13 +326,13 @@ def on_payment_success(order_id: str, receipt: str) -> None:
         path, fname = build_receipt_pdf(order_id)
         ex("update orders set receipt_pdf=%s where id=%s", (path, order_id))
         url = signed_url(settings.BUCKET_DOCS, path, 604800)
-        send_document(cust["phone"], url, fname,
+        reply_document(cust["phone"], url, fname,
                       f"Payment received ({receipt}). Thank you!")
     except Exception:
         log.exception("receipt pdf failed")
 
     clear_state(cust["phone"])
-    send_text(
+    reply_text(
         cust["phone"],
         f"✅ *Payment confirmed* · {receipt}\n\n"
         f"Your order is being packed. Delivery code: *{code}* — give this to the rider.\n"
@@ -343,7 +343,7 @@ def on_payment_success(order_id: str, receipt: str) -> None:
 
     for s in q("""select phone from staff where pharmacy_id=%s and is_active
                    and role in ('owner','manager','attendant')""", (PID,)):
-        send_text(s["phone"],
+        reply_text(s["phone"],
                   f"💰 Paid order {str(order_id)[:8].upper()} · {kes(order['total'])} · "
                   f"{cust['phone']} · code {code}. Pack and dispatch.")
 
@@ -359,7 +359,7 @@ def order_status(phone: str) -> None:
         (PID, phone),
     )
     if not o:
-        send_text(phone, "You have no orders with us yet.")
+        reply_text(phone, "You have no orders with us yet.")
         return
     human = {
         "awaiting_pharmacist": "Our pharmacist is verifying your prescription.",
@@ -371,7 +371,7 @@ def order_status(phone: str) -> None:
         "cancelled": "This order was cancelled.",
         "quoted": "Quote prepared, awaiting pharmacist review.",
     }
-    send_text(phone, f"Order {str(o['id'])[:8].upper()} · {kes(o['total'])}\n"
+    reply_text(phone, f"Order {str(o['id'])[:8].upper()} · {kes(o['total'])}\n"
                      f"{human.get(o['status'], o['status'])}")
 
 
@@ -383,5 +383,5 @@ def delete_my_data(phone: str) -> None:
            where customer_id in (select id from customers where pharmacy_id=%s and phone=%s)""",
        (PID, phone))
     clear_state(phone)
-    send_text(phone, "Your personal details and prescription contents have been removed. "
+    reply_text(phone, "Your personal details and prescription contents have been removed. "
                      "Payment records are kept as the law requires.")
