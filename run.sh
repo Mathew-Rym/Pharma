@@ -474,8 +474,12 @@ elif live[slot].get("jid"):
     sys.exit(0)
 
 print(f"\nAsking WhatsApp for a link code for +{phone} ...\n")
+# The query parameter is `phone`, NOT `phone_number` -- even though the validation error
+# GOWA returns when it is missing says "phone_number(): cannot be blank", which is the
+# internal field name and sends you straight to the wrong parameter. Verified against the
+# running container: ?phone=2547... returns {"pair_code": "XXXX-XXXX"}.
 r = httpx.get(f"{base}/app/login-with-code", auth=auth,
-              headers={"X-Device-Id": slot}, params={"phone_number": phone}, timeout=90)
+              headers={"X-Device-Id": slot}, params={"phone": phone}, timeout=90)
 res = (r.json() or {}).get("results") or {}
 code = res.get("pair_code") or res.get("code") or res.get("pairing_code")
 if not code:
