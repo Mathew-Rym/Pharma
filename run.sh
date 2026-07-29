@@ -433,6 +433,49 @@ except Exception as e:
 PYEOF
   ;;
 
+safety)
+  # A gate that is off looks exactly like a gate that is on until the number is banned.
+  # Print the posture so it is checkable in one command rather than inferred from .env.
+  "$PY" - <<'PYEOF'
+import sys; sys.path.insert(0, "api")
+from config import settings
+from db import q
+
+print("\nWhatsApp safety posture\n")
+allow = [p for p in settings.WA_ALLOWLIST.split(",") if p.strip()]
+print(f"  Gate 1 allowlist        {'ON — only ' + str(len(allow)) + ' number(s) can receive' if allow else 'OFF (production) — any related number can receive'}")
+print(f"  Gate 2 relationship     ON — recipient must be a customer/staff/supplier")
+print(f"  Gate 3 chat established ON — recipient must have messaged us first")
+print(f"  Gate 4 rate limit       {settings.WA_RATE_LIMIT_HOUR}/hour, {settings.WA_NEW_CHAT_LIMIT_HOUR} new chats/hour, per device")
+print(f"  Broadcast cap           {settings.WA_BROADCAST_MAX} recipients, {settings.WA_PACE_MIN_SECS}-{settings.WA_PACE_MAX_SECS}s randomised gap")
+
+print("\nWho can currently be messaged (Gate 3 open)\n")
+rows = q("""select p.name, ih.phone, ih.message_count
+              from inbound_history ih join pharmacies p on p.id = ih.pharmacy_id
+             order by p.name, ih.phone""")
+for r in rows:
+    print(f"  {r['name']:22} {r['phone']:14} {r['message_count']} inbound")
+if not rows:
+    print("  (nobody — no outbound message can be sent until someone messages in)")
+
+print("\nRelated but NOT reachable — they have never messaged us\n")
+gaps = q("""select p.name, s.phone, 'staff' as kind from staff s
+              join pharmacies p on p.id = s.pharmacy_id
+             where not exists (select 1 from inbound_history ih
+                               where ih.pharmacy_id = s.pharmacy_id and ih.phone = s.phone)
+            union all
+            select p.name, c.phone, 'customer' from customers c
+              join pharmacies p on p.id = c.pharmacy_id
+             where not exists (select 1 from inbound_history ih
+                               where ih.pharmacy_id = c.pharmacy_id and ih.phone = c.phone)""")
+for r in gaps:
+    print(f"  {r['name']:22} {r['phone']:14} {r['kind']} — must message the bot first")
+if not gaps:
+    print("  (none)")
+print()
+PYEOF
+  ;;
+
 check)
   "$PY" - <<'PYEOF'
 import sys; sys.path.insert(0, "api")

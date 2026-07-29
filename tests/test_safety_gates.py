@@ -132,6 +132,41 @@ def test_being_on_the_staff_list_is_not_inbound_history(tenant):
 
 
 @db
+def test_broadcast_skips_recipients_the_gates_refuse(tenant, monkeypatch):
+    """Bulk sending is the single most ban-prone operation. One blocked recipient must
+    not abort the run, and must not be sent to either."""
+    import wa
+    from db import ex
+
+    ex("""insert into customers (pharmacy_id, phone) values (%s,'254711000111')""",
+       (tenant["pid"],))
+    ex("""insert into inbound_history (pharmacy_id, phone) values (%s,'254711000111')""",
+       (tenant["pid"],))
+    # second number is a total stranger -> Gate 2 refuses it
+    monkeypatch.setattr(wa, "_pause", lambda: None)
+    monkeypatch.setattr(wa, "deliver", lambda row_id: True)
+
+    result = wa.broadcast(tenant["pid"], ["254711000111", "254799888777"], "hi")
+
+    assert result["sent"] == 1
+    assert result["blocked"] == 1
+
+
+@db
+def test_broadcast_refuses_a_batch_larger_than_the_cap(tenant, monkeypatch):
+    """A caller passing 500 numbers is how the number gets banned in one afternoon.
+
+    Refuse the whole batch rather than sending the first N: a silent truncation reads
+    as success and the rest are quietly never delivered.
+    """
+    import wa
+
+    monkeypatch.setattr(wa.settings, "WA_BROADCAST_MAX", 3)
+    with pytest.raises(wa.UnroutableMessage):
+        wa.broadcast(tenant["pid"], [f"25471100{i:04d}" for i in range(10)], "hi")
+
+
+@db
 def test_refused_messages_do_not_count_towards_the_rate_limit(tenant, monkeypatch):
     """A message the slot/JID guard refused never reached WhatsApp.
 

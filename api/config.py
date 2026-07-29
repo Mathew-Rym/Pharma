@@ -64,6 +64,13 @@ class Settings:
     # Per-device-per-hour caps. These are deliberately conservative.
     WA_RATE_LIMIT_HOUR = int(os.getenv("WA_RATE_LIMIT_HOUR", "80"))
     WA_NEW_CHAT_LIMIT_HOUR = int(os.getenv("WA_NEW_CHAT_LIMIT_HOUR", "15"))
+    # Largest batch broadcast() will accept. Bulk sending is the fastest route to a ban,
+    # so a caller asking for more is refused outright rather than silently truncated.
+    WA_BROADCAST_MAX = int(os.getenv("WA_BROADCAST_MAX", "25"))
+    # Seconds between bulk sends, randomised within this range. A fixed interval is
+    # itself a bot signature; humans do not send every 1.5s exactly.
+    WA_PACE_MIN_SECS = float(os.getenv("WA_PACE_MIN_SECS", "4"))
+    WA_PACE_MAX_SECS = float(os.getenv("WA_PACE_MAX_SECS", "11"))
 
     # --- tenant (single pharmacy for the pilot) ---
     PHARMACY_ID = _req("PHARMACY_ID")

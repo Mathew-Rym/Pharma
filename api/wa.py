@@ -264,16 +264,52 @@ def reply_image(phone: str, url: str, caption: str = "") -> None:
         log.warning("reply_image blocked to %s: %s", phone, e)
 
 
-def broadcast(phones: list[str], body: str) -> None:
-    """Deliberately sequential and unthrottled-by-design-choice.
-
-    Both backends drive a real WhatsApp Web session, and fanning out concurrently is
-    how the number gets banned. Keep pilot volumes low and let this be slow.
-    """
+def _pause() -> None:
+    """Randomised gap between bulk sends. Patched out in tests."""
+    import random
     import time
-    for p in phones:
-        send_text(p, body)
-        time.sleep(1.5)
+    time.sleep(random.uniform(settings.WA_PACE_MIN_SECS, settings.WA_PACE_MAX_SECS))
+
+
+def broadcast(pharmacy_id, phones: list[str], body: str) -> dict:
+    """Send the same message to several recipients, from one pharmacy's device.
+
+    This is the most ban-prone operation in the system, so it is deliberately
+    inconvenient:
+
+      * Every recipient goes through the same gates as a single send. Being on a list
+        someone assembled is not consent.
+      * A batch larger than WA_BROADCAST_MAX is REFUSED, not truncated. Truncation
+        reads as success while the tail is silently never delivered.
+      * The gap between sends is randomised. The previous version slept exactly 1.5s,
+        which is both too fast and a bot signature in itself -- no human sends on a
+        metronome.
+      * A blocked recipient is skipped and counted, not fatal: one stranger in a list
+        of managers must not stop the rest.
+
+    Returns {"sent", "blocked", "failed"} so the caller can report honestly rather than
+    assuming everything went out.
+    """
+    if len(phones) > settings.WA_BROADCAST_MAX:
+        raise UnroutableMessage(
+            f"{len(phones)} recipients exceeds WA_BROADCAST_MAX="
+            f"{settings.WA_BROADCAST_MAX}; split it or raise the cap deliberately")
+
+    out = {"sent": 0, "blocked": 0, "failed": 0}
+    for i, p in enumerate(phones):
+        if i:
+            _pause()
+        try:
+            ok = deliver(compose(pharmacy_id, p, "text", body))
+            out["sent" if ok else "failed"] += 1
+        except GateBlocked as e:
+            out["blocked"] += 1
+            log.warning("broadcast skipped %s: %s", p, e)
+        except UnroutableMessage as e:
+            out["failed"] += 1
+            log.warning("broadcast could not route %s: %s", p, e)
+    log.info("broadcast done: %s", out)
+    return out
 
 
 def gowa_fetch_media(rel_path: str) -> bytes | None:
