@@ -562,6 +562,73 @@ print("  Verify: ./run.sh safety\n")
 PYEOF
   ;;
 
+platform)
+  # Designate a paired slot as the PLATFORM line -- the number strangers text REGISTER to.
+  #
+  # Until this exists, register.py answers onboarding from whichever tenant owns the
+  # inbound device. That works, but it puts the ban risk of cold onboarding traffic on a
+  # real pharmacy's number. One dedicated line moves it off them permanently.
+  SLOT="${2:?usage: ./run.sh platform <slot-name> [display-name]}"
+  SLOT="$SLOT" PNAME="${3:-Pharma OS}" "$PY" - <<'PYEOF'
+import os, sys
+sys.path.insert(0, "api")
+import httpx
+from config import settings
+from db import ex, q1
+
+slot, pname = os.environ["SLOT"], os.environ["PNAME"]
+base = settings.GOWA_URL.rstrip("/")
+auth = (settings.GOWA_USER or "pharmaos", settings.GOWA_PASS)
+
+r = httpx.get(f"{base}/devices", auth=auth, timeout=15)
+live = {s["id"]: s for s in ((r.json() or {}).get("results") or [])}
+jid = (live.get(slot) or {}).get("jid")
+if not jid:
+    print(f"slot {slot} is not linked to a WhatsApp account.")
+    print(f"Known slots: {', '.join(live) or '(none)'}")
+    print("Pair it first: ./run.sh pair <phone> " + slot)
+    sys.exit(1)
+
+# The JID is unique across pharmacies, so a slot already bound to a tenant has to be
+# released rather than duplicated -- otherwise the insert fails on the partial index and
+# the message tells you nothing about why.
+held = q1("select id, name, kind from pharmacies where wa_jid = %s", (jid,))
+if held and held["kind"] != "platform":
+    print(f"{jid} is currently bound to {held['name']} (a tenant).")
+    print("Converting it to the platform line would leave that pharmacy with no device.")
+    print("Pair a separate number for the platform, or unbind that pharmacy first.")
+    sys.exit(1)
+
+if held:
+    ex("update pharmacies set name=%s, gowa_device_id=%s, wa_number=%s, status='active' "
+       "where id=%s", (pname, slot, jid.split("@")[0], held["id"]))
+    print(f"\n  updated platform line: {pname}  <-  {slot}  ({jid})\n")
+else:
+    row = q1("""insert into pharmacies (name, kind, status, wa_jid, gowa_device_id,
+                                        wa_number, timezone)
+                values (%s,'platform','active',%s,%s,%s,'Africa/Nairobi') returning id""",
+             (pname, jid, slot, jid.split("@")[0]))
+    print(f"\n  platform line created: {pname}  <-  {slot}  ({jid})\n")
+
+print("  Strangers can now text REGISTER to this number.")
+print("  Verify: ./run.sh safety\n")
+PYEOF
+  ;;
+
+activate)
+  # Bind the JID of every pharmacy whose handset has finished linking.
+  #
+  # Pairing is asynchronous -- we hand over a code and someone walks to another room --
+  # so something has to notice when the handset actually links. Until it does, the
+  # pharmacy is registered and completely mute. Cron calls the same job.
+  "$PY" - <<'PYEOF'
+import sys, json
+sys.path.insert(0, "api")
+from register import activation_sweep
+print(json.dumps(activation_sweep(), indent=2))
+PYEOF
+  ;;
+
 safety)
   # A gate that is off looks exactly like a gate that is on until the number is banned.
   # Print the posture so it is checkable in one command rather than inferred from .env.

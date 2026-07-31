@@ -90,6 +90,72 @@ The command then waits and prints `PAIRED` when the session comes up.
 
 ---
 
+## 2c. Or let the pharmacy register itself — `REGISTER`
+
+Steps 2b and 3 are you, at a terminal, onboarding one pharmacy. This is the same thing
+driven entirely from WhatsApp, by the owner, with no terminal at all.
+
+**The owner texts `REGISTER`** to the platform number and answers five questions:
+
+```
+REGISTER
+> First — what is your name?
+Peter Otieno
+> What is the pharmacy's registered name?
+Testline Chemist
+> What is the PPB premises licence number for Testline Chemist?
+PPB/98765/2025
+> Which town or estate is Testline Chemist in?
+Kakamega
+> Which WhatsApp number will the pharmacy use for its bot?
+0733222111
+> [summary] Reply YES to create it, or EDIT to start again.
+YES
+```
+
+`YES` creates the pharmacy, makes the sender its owner, and replies with three things:
+
+* the **8-character link code** from WhatsApp — for the pharmacy's own handset
+* an **OWNER code** — managers text `OWNER <code>` to join
+* a **JOIN code** — attendants text `JOIN <code>` to join
+
+The link code comes from GOWA (`/app/login-with-code`), not from us. A locally generated
+code is the failure this flow was rebuilt to avoid: it looks right, reads out fine, and
+links nothing.
+
+### Then the handset has to link
+
+The owner types the code on the shop's phone. Nothing tells us when that finishes, so
+something has to look:
+
+```bash
+./run.sh activate      # binds the JID of anything that has linked, and tells the owner
+```
+
+Run it a couple of times while they type, or leave it on cron. Until it succeeds the
+pharmacy is `pending_activation`: it exists, has stock and staff, and cannot send or
+receive a thing. That state is deliberate and visible rather than looking like an outage.
+
+`activate` refuses to bind a slot that linked to a **different** number than the one
+registered — that means somebody else typed the code, and binding it would hand a stranger
+the pharmacy's conversations.
+
+### The platform line
+
+Onboarding means messaging people with no history, which is exactly the pattern WhatsApp
+bans numbers for. It belongs on a line of its own:
+
+```bash
+./run.sh pair 254700000000 platform    # a number reserved for this
+./run.sh platform platform             # designate it
+```
+
+Without one, `REGISTER` still works — it is answered by whichever pharmacy owns the number
+that was texted, and every occurrence is logged as a warning. That is fine for a pilot
+with one SIM and should not outlive it: the ban risk sits on a real pharmacy's number.
+
+---
+
 ## 3. Bind the paired slot to a pharmacy
 
 Pairing gives GOWA a session. Binding tells the app whose it is.
@@ -202,6 +268,12 @@ alert, so running it would only produce failures that look like bugs.
 Available: `expiry_sweep`, `forecast_refresh`, `variance_report`, `low_stock_check`,
 `daily_digest`, `weekly_report`, `refill_reminders`, `reconcile`.
 
+`activation_sweep` is the exception: it runs **once for the whole platform**, not once per
+tenant, and returns `{"scope": "platform", ...}`. It has to, because the per-tenant loop
+selects pharmacies that are already paired — precisely the ones it has nothing to do for.
+Put it on a short cron (every minute or two) if pharmacies register unattended; otherwise
+`./run.sh activate` by hand is enough.
+
 ---
 
 ## 9. Tests
@@ -248,6 +320,8 @@ and re-run `./run.sh bind <slot>`.
 | `./run.sh qr` | Pair by QR, self-refreshing |
 | `./run.sh pair <phone> [slot]` | Pair by 8-character code — for remote pharmacies |
 | `./run.sh bind <slot> [name]` | Attach a paired slot to a pharmacy |
+| `./run.sh platform <slot>` | Designate the line that answers `REGISTER` |
+| `./run.sh activate` | Bind handsets that have finished linking; tell their owners |
 | `./run.sh unpair` | Log a slot out |
 | `./run.sh brand` | Push display name + photo for `GOWA_DEVICE_ID` |
 | `./run.sh safety` | **Anti-ban posture and who is reachable** |

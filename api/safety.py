@@ -4,8 +4,9 @@ Four progressive gates, checked at compose time before any message is queued:
 
   1. ALLOWLIST   — dev/test only. When WA_ALLOWLIST is set, only those numbers
                    can receive messages. Empty in production → gate skipped.
-  2. RELATIONSHIP — recipient must exist in customers, staff, suppliers, or be
-                   the pharmacy itself. Blocks messages to total strangers.
+  2. RELATIONSHIP — recipient must exist in customers, staff, suppliers, be
+                   the pharmacy itself, or be part-way through registering with
+                   it. Blocks messages to total strangers.
   3. CHAT ESTABLISHED — recipient must have messaged this pharmacy at least once
                    (recorded in inbound_history). Blocks cold outreach.
   4. RATE LIMIT  — per-device caps on total messages and new-chat initiations
@@ -27,6 +28,11 @@ log = logging.getLogger(__name__)
 # WA_ALLOWLIST needed a process restart to take effect -- so widening the list before a
 # demo would look like it had worked while the old list was still enforced.
 _allowlist_cache: dict = {"raw": None, "set": set()}
+
+# How long a registration in progress keeps Gate 2 open for that phone. Long enough that
+# someone can walk to the shop's handset and come back; short enough that an abandoned
+# registration does not leave a stranger permanently messageable.
+ONBOARDING_WINDOW_HOURS = 24
 
 
 class GateBlocked(RuntimeError):
@@ -92,6 +98,22 @@ def has_relationship(phone: str, pharmacy_id: str) -> bool:
     # Check pharmacy's own number
     if q1("select id from pharmacies where wa_number = %s and id = %s",
           (normalized, str(pharmacy_id))):
+        return True
+
+    # Someone this line is currently onboarding (see register._make_contactable).
+    #
+    # This is the narrow, deliberate exception the gate needs: registration is the one
+    # flow where a phone with no prior relationship must receive a reply. It is scoped to
+    # the pharmacy that is answering and expires, so an abandoned registration does not
+    # leave a number permanently messageable. Gate 3 still applies on top -- the row is
+    # only ever written for a phone that has just messaged us.
+    # make_interval, not "interval '%s hours'": a placeholder inside a quoted literal is
+    # not a placeholder at all, it is the two characters %s inside a string, and Postgres
+    # rejects it at parse time.
+    if q1("""select 1 from onboarding_contacts
+              where phone = %s and pharmacy_id = %s
+                and created_at > now() - make_interval(hours => %s)""",
+          (normalized, str(pharmacy_id), ONBOARDING_WINDOW_HOURS)):
         return True
 
     return False

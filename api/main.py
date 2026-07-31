@@ -15,7 +15,7 @@ from fastapi.responses import HTMLResponse, JSONResponse
 
 from config import settings
 from db import ensure_buckets, q, q1, upload
-from jobs import JOBS, for_every_tenant
+from jobs import GLOBAL_JOBS, JOBS, for_every_tenant
 from router import handle_inbound
 from tenant import resolve_pharmacy_by_device, resolve_tenant
 from utils import from_pieces, kes, norm_phone
@@ -254,9 +254,17 @@ async def mpesa_callback(request: Request):
 def run_job(name: str, x_pharmaos_secret: str | None = Header(None),
             x_dishii_secret: str | None = Header(None)):
     _auth(x_pharmaos_secret or x_dishii_secret)
+
+    # Platform-wide jobs run once, with no tenant bound. activation_sweep is about
+    # pharmacies that are NOT yet paired, and the per-tenant loop below deliberately skips
+    # exactly those -- so routing it through the loop would silently never run it.
+    if name in GLOBAL_JOBS:
+        return {"job": name, "scope": "platform", "result": GLOBAL_JOBS[name]()}
+
     fn = JOBS.get(name)
     if not fn:
-        raise HTTPException(404, f"unknown job. available: {list(JOBS)}")
+        raise HTTPException(404, f"unknown job. available: "
+                                 f"{list(JOBS) + list(GLOBAL_JOBS)}")
     # Cron has no inbound message and therefore no tenant, so the job runs once per paired
     # tenant with that tenant bound. Calling fn() directly would raise NoTenant -- which is
     # the intended behaviour of pid(), and the reason this loop has to be here rather than

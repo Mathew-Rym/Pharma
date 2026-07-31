@@ -33,10 +33,13 @@ def person(monkeypatch):
 
     sent = []
     import wa
-    monkeypatch.setattr(wa, "send_text", lambda p, b: sent.append((p, b)))
-    import identity
-    # identity imports send_text lazily inside the function, so patch the source
-    monkeypatch.setattr("wa.send_text", lambda p, b: sent.append((p, b)))
+    # send_for, not send_text. identity.send_code() moved to send_for so a gate refusal
+    # surfaces as an exception instead of a log line; a fixture still patching the old
+    # name captures nothing, every assertion reads "no WhatsApp message was sent", and it
+    # looks like a product failure rather than a stale patch. Same class of mistake as
+    # the send_text -> reply_text drift in test_vision_count.
+    monkeypatch.setattr(wa, "send_for",
+                        lambda pid, p, t, b, *a, **k: sent.append((p, b)))
 
     yield {"id": sid, "phone": phone, "sent": sent, "q": q_, "ex": ex_}
 
@@ -162,6 +165,43 @@ def test_no_code_is_sent_to_an_unknown_number(person):
     from identity import send_code
     send_code("254799999999", person["q"], person["ex"])
     assert not person["sent"], "a code was sent to a number that is not staff"
+
+
+# ============================================================ the WhatsApp constraint
+@db
+def test_a_staff_member_who_never_texted_the_bot_gets_no_code(monkeypatch):
+    """The real limit on this feature, stated once so it stops looking like a bug.
+
+    WhatsApp will not let us message a number that has never messaged us — Gate 3 — and it
+    has no idea a web form was filled in. So someone added in the dashboard and nowhere
+    else cannot receive a sign-in code, however correct everything on our side is. The
+    cure is `JOIN <code>` on WhatsApp, which creates the staff row AND establishes the
+    chat in one step.
+
+    Unpatched on purpose: this test asserts the gate actually fires.
+    """
+    import secrets as _s
+
+    from db_helpers import ex_, q_
+    from identity import send_code
+
+    pid = os.environ["PHARMACY_ID"]
+    phone = "2547" + f"{_s.randbelow(10**8):08d}"
+    row = q_("""insert into staff (pharmacy_id, phone, name, role, is_active)
+                values (%s,%s,%s,'attendant',true) returning id""",
+             (pid, phone, f"PYTEST cold {phone[-4:]}"))
+    sid = str(row[0]["id"])
+    try:
+        ok, msg = send_code(phone, q_, ex_)
+        assert ok, "the caller must not learn that the send failed"
+        assert "HI" in msg, "the reply must say how to become reachable"
+        sent = q_("""select id from wa_messages
+                      where to_phone=%s and direction='out' and status='sent'""", (phone,))
+        assert not sent, "a cold sign-in code reached WhatsApp; Gate 3 did not fire"
+    finally:
+        ex_("delete from login_codes where staff_id=%s", (sid,))
+        ex_("delete from login_events where staff_id=%s", (sid,))
+        ex_("delete from staff where id=%s", (sid,))
 
 
 # ============================================================ identity linking

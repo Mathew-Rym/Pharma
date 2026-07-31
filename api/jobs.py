@@ -13,6 +13,7 @@ from reports import build_report_pdf, get_expiry_risk, get_reorder_suggestions
 from utils import from_pieces, kes
 from wa import send_document, send_text
 
+import register
 import tenancy
 from tenancy import pid          # tenant comes from the request, not from .env
 
@@ -354,6 +355,17 @@ def variance_report() -> dict:
         return {"variances": rows[0]["n"], "value": float(rows[0]["v"])}
     return _run("variance_report", _go)
 
+
+# Jobs that run ONCE, across the whole platform, rather than once per tenant.
+#
+# activation_sweep is the only one so far, and it has to be here rather than in JOBS
+# because for_every_tenant() selects pharmacies that are already paired -- precisely the
+# ones activation has nothing left to do for. Running it through that loop would mean a
+# pharmacy waiting to be linked is never looked at, which is the one state this job exists
+# to get out of.
+GLOBAL_JOBS = {
+    "activation_sweep": register.activation_sweep,
+}
 
 JOBS = {
     "expiry_sweep": expiry_sweep,

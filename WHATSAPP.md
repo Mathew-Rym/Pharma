@@ -47,7 +47,7 @@ Implemented in `api/safety.py`, called from `wa.compose()` before the row is wri
 | Gate | Rule | Where |
 |---|---|---|
 | 1 · Allowlist | when `WA_ALLOWLIST` is set, only those numbers can receive | dev, test, staging |
-| 2 · Relationship | recipient must be a customer, staff or supplier **of the sending tenant** | everywhere |
+| 2 · Relationship | recipient must be a customer, staff or supplier **of the sending tenant**, or be mid-registration with it | everywhere |
 | 3 · Chat established | an `inbound_history` row must exist for (recipient, tenant) | everywhere |
 | 4 · Rate cap | per device: `WA_RATE_LIMIT_HOUR`, plus `WA_NEW_CHAT_LIMIT_HOUR` new chats | everywhere |
 
@@ -73,19 +73,46 @@ related but **not** reachable because they never messaged in.
 
 ## Onboarding sequence
 
-1. Pharmacy handset (dedicated SIM) messages the platform bot: `REGISTER`.
-2. Bot collects name/address/owner conversationally. `wa_jid` is taken **from the sender**,
-   never typed.
-3. Backend calls GOWA `/app/login-with-code` for that number → WhatsApp returns an
-   8-character code.
-4. Bot replies **into that same chat** with the code plus: *WhatsApp → Linked Devices →
-   Link with phone number instead*.
-5. Human enters it on that handset. GOWA reports the session up.
-6. Backend matches the JID to the pending row, binds `gowa_device_id`, sets it active.
-7. Owner messages the **pharmacy number** with their owner code → `staff` row, phone taken
-   from the sender. This also establishes the chat, which is what makes later alerts legal.
-8. Staff are given a join code **out of band** (spoken, SMS) and message the pharmacy
-   number with `JOIN <code>`. The bot never messages staff first.
+Implemented in `api/register.py`, hooked into the router **before** tenant resolution —
+everything below comes from someone the resolver cannot place.
+
+1. The owner, from **any** phone, messages the platform line: `REGISTER`.
+2. Five questions, asked deterministically: their name, the pharmacy name, the PPB premises
+   licence, the town, and **which handset the shop will use**. Then a summary and `YES`.
+3. `YES` writes the pharmacy (`status='pending_activation'`, `kind='tenant'`) and the
+   owner's `staff` row. `wa_jid` is left **null**.
+4. Backend calls GOWA `/app/login-with-code?phone=<the shop handset>` → WhatsApp returns an
+   8-character code. The bot relays it with: *WhatsApp → Linked Devices → Link with phone
+   number instead*. `CODE` reissues it; they expire in minutes.
+5. Someone types it on the shop handset. GOWA reports the session up.
+6. `activation_sweep` (`./run.sh activate`, or cron) reads the JID back from GOWA, binds
+   it, sets the pharmacy `active`, and tells the owner. It **refuses** a slot that linked
+   to a different number than the one registered.
+7. Managers text `OWNER <code>`, attendants text `JOIN <code>`, to the pharmacy's number.
+   Each creates a `staff` row with the phone taken from the sender, and establishes the
+   chat — which is what makes later alerts legal. The bot never messages staff first.
+
+**Why the handset is asked for rather than inferred.** The tempting shortcut is to treat
+whoever sent `REGISTER` as the handset, which makes `wa_jid` free and correct by
+construction. It is only correct if the shop phone is the one texting — and when it is not,
+the owner's personal WhatsApp silently becomes the pharmacy bot: every customer message
+lands in their private chats, and a ban takes out their own messaging along with the shop's.
+So it is a question, validated as a Kenyan mobile, and the JID is still read back from GOWA
+at step 6 rather than trusted from step 2. A typo'd handset number is caught there, because
+the slot links to a number that does not match what was registered.
+
+**Why registration never calls the model.** The conversation is a pure function
+(`register._step`) with no LLM, no network and no database. Slot-filling with Gemini reads
+better in a demo and fails badly in production: a pharmacy that cannot sign up because a
+model is rate-limited is revenue that never arrives, and a model that helpfully infers a
+licence number puts fiction in a regulated field.
+
+**Replying to a stranger.** This is the one flow where a phone with no relationship gets an
+answer, so Gate 2 needs an exception. It is a row in `onboarding_contacts` — scoped to the
+one pharmacy that is answering, and expiring after 24 hours. Not a `customers` row: that
+table is read by `tenancy.resolve_by_sender()`, so the owner would stay pinned to the
+answering pharmacy forever and every later message of theirs would come back "you're
+registered at more than one pharmacy, which one?".
 
 The QR flow works too but the code flow is better here: a WhatsApp QR expires in under a
 minute and cannot survive being relayed to another phone as an image.

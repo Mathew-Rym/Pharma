@@ -123,15 +123,22 @@ def resolve_by_sender(phone: str) -> list[str]:
 
     Only ACTIVE staff count. Deactivating someone has to revoke access rather than merely
     hide them from a list.
+
+    Platform rows are excluded. Onboarding gives a registering owner a contact row on the
+    platform pharmacy so it is allowed to reply to them (see register._make_contactable),
+    and without this filter that row would come back here forever: every message they ever
+    send afterwards would resolve to two pharmacies and be answered with "which one?".
     """
     p = norm_phone(phone)
     if not p:
         return []
-    rows = q("""select distinct pharmacy_id from (
+    rows = q("""select distinct t.pharmacy_id from (
                     select pharmacy_id from staff     where phone = %s and is_active
                     union
                     select pharmacy_id from customers where phone = %s
                     union
                     select pharmacy_id from suppliers where phone = %s
-                ) t""", (p, p, p))
+                ) t
+                join pharmacies ph on ph.id = t.pharmacy_id
+               where ph.kind = 'tenant'""", (p, p, p))
     return [str(r["pharmacy_id"]) for r in rows]

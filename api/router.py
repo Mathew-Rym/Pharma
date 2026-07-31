@@ -8,6 +8,7 @@ import json
 import logging
 
 import tenancy
+import register
 from db import ex, q, q1
 from llm import chat
 from reports import TOOLS, run_tool
@@ -51,6 +52,13 @@ def handle_inbound(msg: dict) -> None:
     """msg: {wa_id, from, type, text, media_bucket, media_path, mime}"""
     phone = norm_phone(msg.get("from", ""))
     if not phone:
+        return
+
+    # Onboarding runs BEFORE resolution, because everything it handles comes from someone
+    # the resolver cannot place: a stranger sending REGISTER, or a new hire who is not
+    # staff until the moment their JOIN code is accepted. Resolving first would send both
+    # down the unknown-sender path and answer neither.
+    if register.intercept(phone, msg):
         return
 
     # Which pharmacy is this message for?
