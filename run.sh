@@ -730,7 +730,18 @@ def _ver(path):
     m = re.search(r"schema_v(\d+)\.sql$", path)
     return int(m.group(1)) if m else 0
 files = ["db/schema.sql"] + sorted(glob.glob("db/schema_v*.sql"), key=_ver)
-conn = psycopg.connect(os.environ["DATABASE_URL"])
+
+# DIRECT_URL when it is set, DATABASE_URL otherwise.
+#
+# DATABASE_URL points at Supabase's TRANSACTION pooler (6543), which is right for the API:
+# many short-lived queries, no session state to keep. Migrations are the opposite shape --
+# long multi-statement DDL scripts, and the sort of thing (CREATE INDEX CONCURRENTLY, role
+# changes) that wants a session of its own. DIRECT_URL is the SESSION pooler (5432).
+#
+# Falling back rather than requiring it keeps a single-URL .env working unchanged.
+dsn = os.getenv("DIRECT_URL") or os.environ["DATABASE_URL"]
+print(f"  connecting via {'DIRECT_URL (session pooler)' if os.getenv('DIRECT_URL') else 'DATABASE_URL'}")
+conn = psycopg.connect(dsn)
 for f in files:
     try:
         with conn.cursor() as cur:
