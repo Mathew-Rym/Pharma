@@ -542,14 +542,45 @@ def activation_sweep() -> dict:
         log.info("activated %s on %s", ph["name"], jid)
 
         if ph["owner_phone"]:
-            _say(ph["owner_phone"],
-                 f"*{ph['name']}* is live ✅\n\nThis number is now your pharmacy's "
-                 f"assistant. Text *HELP* to see what it can do.\n\n"
-                 f"Your team joins by texting this number:\n"
-                 f"👤 Managers: *OWNER {ph['owner_code']}*\n"
-                 f"🧑‍💼 Attendants: *JOIN {ph['join_code']}*",
-                 str(ph["id"]))
+            _confirm_activation(ph)
     return {"activated": activated, "still_waiting": waiting}
+
+
+def _confirm_activation(ph: dict) -> None:
+    """Tell the owner their pharmacy is live -- over the PLATFORM line.
+
+    The owner's conversation lives on the platform line: that is the number they texted
+    REGISTER to, so Gate 3 is open there and WhatsApp shows one continuous thread. The new
+    pharmacy line, by contrast, is a number they have never messaged. Sending from it would
+    be a cold contact, and the only ways to make it pass would both be worse than the
+    problem: fabricate an inbound_history row (the schema_v10 mistake), or teach Gate 2/3
+    that pharmacies.owner_phone is inherently reachable, which would make every registered
+    owner cold-messageable by a tenant they have never contacted.
+
+    So the message goes out over the platform line and ASKS them to text the new number.
+    Their reply is what opens Gate 3 on the tenant, honestly and by their own action.
+
+    When no platform row exists -- a single-SIM deployment -- the line the owner texted IS
+    this tenant's device, so sending from the tenant is factual there, not a bypass. That is
+    the only case in which it is used.
+    """
+    plat = platform_pid()
+    sender = plat or str(ph["id"])
+    body = (f"*{ph['name']}* is live ✅\n\n"
+            f"Your pharmacy's assistant is now running on +{ph['wa_number']}.\n\n"
+            f"*Text HELP to +{ph['wa_number']}* to start using it — that also lets it "
+            f"reply to you.\n\n"
+            f"Your team joins by texting that number:\n"
+            f"👤 Managers: *OWNER {ph['owner_code']}*\n"
+            f"🧑‍💼 Attendants: *JOIN {ph['join_code']}*")
+    if _say(ph["owner_phone"], body, sender):
+        return
+    # Not silent. A confirmation that cannot be delivered is the single most visible failure
+    # in the whole flow -- the owner types the code and nothing arrives -- so it has to be
+    # findable in the log rather than inferred from an absence.
+    log.error("activation confirmation for %s could not be delivered to %s (sent from %s): "
+              "the owner has no open conversation with that line",
+              ph["name"], ph["owner_phone"], "platform" if plat else "tenant")
 
 
 # ------------------------------------------------------------------ the router hook
