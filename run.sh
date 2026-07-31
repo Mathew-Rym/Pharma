@@ -657,11 +657,58 @@ activate)
   # Pairing is asynchronous -- we hand over a code and someone walks to another room --
   # so something has to notice when the handset actually links. Until it does, the
   # pharmacy is registered and completely mute. Cron calls the same job.
-  "$PY" - <<'PYEOF'
-import sys, json
+  # --watch polls instead of asking once. This is the demo affordance: the operator hands
+  # over a code, someone walks to the shop phone and types it, and the pharmacy has to go
+  # live in front of the audience. A single-shot sweep run at the wrong second reports
+  # "still_waiting" and looks like a failure, so nobody can tell a slow handset from a
+  # broken one.
+  WATCH=""; for a in "$@"; do [ "$a" = "--watch" ] && WATCH="1"; done
+  WATCH="$WATCH" "$PY" - <<'PYEOF'
+import json
+import os
+import sys
+import time
+
 sys.path.insert(0, "api")
 from register import activation_sweep
-print(json.dumps(activation_sweep(), indent=2))
+
+if not os.environ.get("WATCH"):
+    print(json.dumps(activation_sweep(), indent=2))
+    sys.exit(0)
+
+INTERVAL, DEADLINE = 5, 120
+print(f"Watching for handsets to link (every {INTERVAL}s for {DEADLINE}s). Ctrl-C to stop.\n")
+deadline = time.monotonic() + DEADLINE
+seen_waiting: set = set()
+while True:
+    res = activation_sweep()
+    for name in res.get("activated") or []:
+        print(f"\n  LIVE: {name}\n")
+    # A mismatched handset is not "still waiting" -- somebody else typed the code, and
+    # activation_sweep refuses to bind it. Surface that immediately rather than letting it
+    # scroll past as another dot: waiting resolves itself, this does not.
+    for name in res.get("still_waiting") or []:
+        if "wrong handset" in name and name not in seen_waiting:
+            print(f"\n  REFUSED: {name}")
+            print("           the slot linked to a different number than was registered;")
+            print("           it will not be bound. Re-run REGISTER with the right number.\n")
+            seen_waiting.add(name)
+    if res.get("activated"):
+        waiting = [w for w in (res.get("still_waiting") or [])]
+        print(f"  still waiting: {', '.join(waiting) if waiting else 'nothing'}")
+        sys.exit(0)
+    if res.get("status") == "gateway unreachable":
+        print("\n  GOWA is unreachable -- is the container up? ./run.sh whatsapp")
+        sys.exit(1)
+    if time.monotonic() >= deadline:
+        waiting = res.get("still_waiting") or []
+        print(f"\n\nNothing linked within {DEADLINE}s.")
+        print(f"  still pending: {', '.join(waiting) if waiting else 'no pharmacy is awaiting a handset'}")
+        print("  The pair code expires in minutes -- reply CODE to the bot for a fresh one,")
+        print("  then keep WhatsApp open on the shop phone until it finishes syncing.")
+        sys.exit(1)
+    print(".", end="", flush=True)
+    time.sleep(INTERVAL)
 PYEOF
   ;;
 
