@@ -37,6 +37,32 @@ jobs:
       # number messageable, so a CI run against the live database fabricates WhatsApp
       # reachability for numbers that never contacted anyone. That has already caused one
       # sending restriction.
+      #
+      # ---------------------------------------------------------------------------------
+      # TWO DIFFERENT FAILURES HAVE BEEN SEEN HERE. Do not conflate them: the first is
+      # fixed, the second is not, and only one of them is about a database.
+      #
+      #   1. FIXED. 80 failed + 2 errors, every one of them
+      #        supabase._sync.client.SupabaseException: Invalid URL
+      #      raised inside api/db.py's module body while it was still being imported. Not
+      #      82 broken tests -- one placeholder that was not URL-shaped, crashing at
+      #      collection time. Nothing to do with a database. Fixed by the values above.
+      #
+      #   2. OPEN. Exactly one test:
+      #        tests/test_gowa.py::test_correctly_signed_message_is_accepted
+      #        psycopg_pool.PoolTimeout: couldn't get a connection after 15.00 sec
+      #      This one IS a database dependency, and the exception name is how you tell it
+      #      apart from (1) -- PoolTimeout, never SupabaseException. api/main.py's GOWA
+      #      webhook calls resolve_pharmacy_by_device() to name the tenant from device_id,
+      #      which reads the pharmacies table. The test mocks handle_inbound but not that
+      #      call, so it reaches a real pool. The other signature tests pass because they
+      #      return 401 before that line.
+      #
+      # THE FIX FOR (2) IS A MOCK, NEVER A DATABASE:
+      #   monkeypatch.setattr(main, "resolve_pharmacy_by_device", lambda d: None)
+      # Giving CI a database to make it pass would trade one red test for fabricated
+      # WhatsApp reachability in the live project -- see the paragraph above.
+      # ---------------------------------------------------------------------------------
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5

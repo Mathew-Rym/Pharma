@@ -54,9 +54,12 @@ create index if not exists pharmacies_pending_activation
 -- them a `customers` row on the line that is answering. That is wrong in two ways, both
 -- found by driving the real flow:
 --
---   * tenancy.resolve_by_sender() reads customers, so the row is permanent. Every message
---     the owner ever sends afterwards resolves to two pharmacies and gets answered with
---     "which one?" instead of an answer.
+--   * (historical, v13) tenancy.resolve_by_sender() read customers, so the row acted as an
+--     identity signal: every message the owner sent afterwards resolved to two pharmacies
+--     and got "which one?" instead of an answer. The customers arm has since been removed
+--     from that resolver, so this particular mechanism is gone -- but the point below is
+--     not, and this table is NOT redundant. A customers row is permanent and unscoped;
+--     this grant expires.
 --   * When the answering line is a tenant rather than a dedicated platform number, that
 --     pharmacy's customer list silently fills with people who were registering a
 --     different pharmacy entirely.

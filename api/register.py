@@ -214,11 +214,20 @@ def _make_contactable(phone: str, pharmacy_id: str) -> None:
     it is narrow on purpose: it only ever runs for a phone that has *just sent us a
     message*, so nothing here lets us contact someone who did not start the conversation.
 
-    The row goes in onboarding_contacts, NOT customers. Using customers looked equivalent
-    and was not -- resolve_by_sender() reads that table, so the registering owner stayed
-    pinned to the answering pharmacy forever and every later message of theirs came back
-    "you're registered at more than one pharmacy, which one?". Driving the real flow is
-    what surfaced it.
+    The row goes in onboarding_contacts, NOT customers, and this table is NOT redundant
+    now that resolve_by_sender() has stopped reading customers. Two independent reasons,
+    and only the first has changed:
+
+      1. (historical) resolve_by_sender() used to read customers, so the row was an
+         identity signal and the registering owner stayed pinned to the answering pharmacy
+         forever. That specific mechanism is gone.
+      2. (still true) a customers row is PERMANENT and unscoped, while this grant is meant
+         to expire -- an abandoned registration must not leave a stranger messageable for
+         good. And when the answering line is a tenant rather than a dedicated platform
+         number, a customers row would file everyone registering some OTHER pharmacy into
+         that pharmacy's customer list.
+
+    So do not "simplify" this back to a customers row on the strength of reason 1 alone.
     """
     ex("""insert into onboarding_contacts (pharmacy_id, phone)
           values (%s,%s)

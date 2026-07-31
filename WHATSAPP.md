@@ -6,7 +6,7 @@ been proposed four separate times. Written down so it stops happening.
 ## The distinction everything rests on
 
 | Capability | Requires |
-|---|---|
+| --- | --- |
 | A number can **send** to the bot | Nothing. Any WhatsApp user can. |
 | The system can **receive and reply** on a number | A GOWA session for that number, created by a Linked Devices action **on that handset**. |
 
@@ -17,7 +17,7 @@ physical handset can pair itself. Chat can relay a link code; it cannot do the l
 ## Pairing vs linking
 
 | | What it is | Who |
-|---|---|---|
+| --- | --- | --- |
 | **Pairing** | Giving GOWA control of a WhatsApp account, via QR or an 8-character link code. | Bots only. One session per pharmacy shopfront. |
 | **Linking** | Storing a phone number in the database so the system knows which pharmacy it belongs to. | Every human. |
 
@@ -31,7 +31,7 @@ gradually.
 ## Who sends where
 
 | Person | Sends from | Sends to | Paired? |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | Customer | their own phone | pharmacy shopfront number | never |
 | Staff / pharmacist / manager | their own phone | pharmacy shopfront number | never |
 | Owner (reports, alerts) | their own phone | pharmacy shopfront number | never |
@@ -40,12 +40,50 @@ gradually.
 A WhatsApp account cannot message itself, which is why the owner's phone must be separate
 from the pharmacy number — otherwise the bot could never send them a report.
 
+## Who a number acts for, and who may be replied to
+
+Two different questions, two different answers, read off the same tables. Confusing them
+cost a real bug.
+
+| | `tenancy.resolve_by_sender()` | `safety.has_relationship()` (Gate 2) |
+| --- | --- | --- |
+| Asks | which pharmacy does this number **act for**? | may we **reply** to this number? |
+| Reads | staff (active), suppliers | customers, staff, suppliers, own number, onboarding_contacts |
+| Customers count? | **no** | **yes** |
+
+**Customers are deliberately not an identity signal.** Shopping at a pharmacy is not acting
+for it, and it is many-to-many by nature — someone who buys from three chemists is ordinary,
+not ambiguous. Reading `customers` in the resolver was a category error with a concrete
+cost: a stranger's *first* message auto-creates a customers row (before consent), so a
+pharmacy owner who registered through a host line and later sent that line any ordinary
+message resolved to **two** pharmacies and was answered *"you're registered at more than one
+pharmacy, which one?"* from then on. Filtering on `consent_given` does not fix it — the
+collision just moves from "texted once" to "consented at two", which is normal behaviour.
+
+Customer traffic does not need the resolver: the device the message arrived on names the
+tenant, and that is the stronger signal because the sender cannot spoof it.
+
+**The consequence, stated rather than discovered later:** a customer-only number whose
+`device_id` fails to resolve now falls to `_greet_unknown` and gets **no reply**. That is
+fail-closed and intended. Today it affects nobody — every inbound arrives on a bound tenant
+device.
+
+**This is armed, not dormant.** While every device resolves to a tenant, `resolve_by_sender`
+barely runs. The moment a dedicated platform SIM is paired and `./run.sh platform` applied,
+that device resolves to `kind='platform'` — not a tenant — so `pharmacy_id` is left unset and
+sender resolution becomes the **primary** path for every host-line message.
+
+**`suppliers` has the same many-to-many shape and is knowingly left in.** One distributor
+across twenty pharmacies is twenty rows, so a distributor texting an unbound line resolves to
+twenty candidates and the caller asks. Asking is the correct degraded behaviour; guessing is
+not. Not fixed — recorded so it is not rediscovered at scale.
+
 ## The four gates, on every send
 
 Implemented in `api/safety.py`, called from `wa.compose()` before the row is written.
 
 | Gate | Rule | Where |
-|---|---|---|
+| --- | --- | --- |
 | 1 · Allowlist | when `WA_ALLOWLIST` is set, only those numbers can receive | dev, test, staging |
 | 2 · Relationship | recipient must be a customer, staff or supplier **of the sending tenant**, or be mid-registration with it | everywhere |
 | 3 · Chat established | an `inbound_history` row must exist for (recipient, tenant) | everywhere |

@@ -113,7 +113,7 @@ def resolve(device_jid: str, sender_phone: str | None = None) -> Resolution:
 
 
 def resolve_by_sender(phone: str) -> list[str]:
-    """Every pharmacy this phone is known at, as staff, customer or supplier.
+    """Every pharmacy this phone ACTS FOR: staff (active) or supplier. Not customers.
 
     Returns a LIST on purpose. The spec makes a person at two pharmacies a deliberate
     product decision -- separate history, separate balances -- so first-match-wins would
@@ -124,10 +124,49 @@ def resolve_by_sender(phone: str) -> list[str]:
     Only ACTIVE staff count. Deactivating someone has to revoke access rather than merely
     hide them from a list.
 
-    Platform rows are excluded. Onboarding gives a registering owner a contact row on the
-    platform pharmacy so it is allowed to reply to them (see register._make_contactable),
-    and without this filter that row would come back here forever: every message they ever
-    send afterwards would resolve to two pharmacies and be answered with "which one?".
+    Platform rows are excluded: a platform pharmacy is not a tenant and has no inventory.
+
+    ---- why `customers` is deliberately NOT here ----
+
+    This resolver answers "which pharmacy does this number act FOR?". Shopping somewhere
+    is not acting for it, and it is many-to-many by nature: a person who buys from three
+    chemists is ordinary, not ambiguous. Including customers was a category error, and it
+    had a concrete cost, found by driving the real flow rather than by reading the code:
+
+      A stranger's FIRST message auto-creates a customers row -- router._handle_customer
+      calls rx.get_or_create_customer() before the consent gate. So a pharmacy owner who
+      registered through a host line and later sent that same line any ordinary message
+      resolved to TWO pharmacies, and every message of theirs from then on was answered
+      "you're registered at more than one pharmacy, which one?" instead of an answer.
+
+    Filtering on `consent_given` does not fix it: the collision merely moves from "texted
+    once" to "consented at two", and consenting at two pharmacies is normal behaviour.
+
+    Customer traffic does not need this function. The device the message arrived on names
+    the tenant (see resolve() and main.webhook_gowa, which sets pharmacy_id before the
+    router ever consults the sender), so customers are routed by OUR number, not by their
+    own identity -- which is the stronger signal anyway, because they cannot spoof it.
+
+    CONSEQUENCE, stated rather than discovered later: a customer-only number whose
+    device_id fails to resolve now falls through to router._greet_unknown and receives no
+    reply. That is fail-closed and intended. Today it affects nobody, because every
+    inbound arrives on a bound tenant device.
+
+    THIS IS ARMED, NOT DORMANT. While every device resolves to a tenant, this function
+    rarely runs at all. The moment a dedicated platform SIM is paired and
+    `./run.sh platform` is applied, that device resolves to kind='platform' -- not a
+    tenant -- so pharmacy_id is left unset and sender resolution becomes the PRIMARY path
+    for every host-line message. The fix belongs before that SIM, not after.
+
+    `suppliers` keeps the same many-to-many shape and is knowingly left in: one
+    distributor across twenty pharmacies is twenty rows, so a distributor texting an
+    unbound line resolves to twenty candidates and the caller asks. Asking is the correct
+    degraded behaviour; guessing is not. Not fixed here, recorded so it is not
+    rediscovered at scale.
+
+    Gate 2 (safety.has_relationship) still reads customers, and must. It answers a
+    different question -- "may we reply to this number?" -- and a customer we hold a row
+    for is exactly who we may reply to. Only the resolver changed.
     """
     p = norm_phone(phone)
     if not p:
@@ -135,10 +174,8 @@ def resolve_by_sender(phone: str) -> list[str]:
     rows = q("""select distinct t.pharmacy_id from (
                     select pharmacy_id from staff     where phone = %s and is_active
                     union
-                    select pharmacy_id from customers where phone = %s
-                    union
                     select pharmacy_id from suppliers where phone = %s
                 ) t
                 join pharmacies ph on ph.id = t.pharmacy_id
-               where ph.kind = 'tenant'""", (p, p, p))
+               where ph.kind = 'tenant'""", (p, p))
     return [str(r["pharmacy_id"]) for r in rows]
