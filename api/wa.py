@@ -19,6 +19,7 @@ import logging
 
 import httpx
 
+import tenancy
 from config import settings
 from db import ex, q1
 from tenancy import pid
@@ -54,13 +55,16 @@ def compose(pharmacy_id, phone: str, msg_type: str, body: str,
     if not phone:
         raise UnroutableMessage("no destination phone")
 
+    # One shared definition of "live" -- see tenancy.LIVE_SQL. Checking only
+    # gowa_device_id here is what let six messages in a row be composed and then refused at
+    # delivery: the slot existed, the JID did not, and deliver() compares the JID. Fail
+    # here, where the caller still has context, rather than in a background sender.
+    why = tenancy.why_not_live(pharmacy_id)
+    if why:
+        raise UnroutableMessage(why)
+
     ph = q1("""select wa_jid, gowa_device_id from pharmacies where id = %s""",
             (str(pharmacy_id),))
-    if not ph:
-        raise UnroutableMessage(f"unknown pharmacy {pharmacy_id}")
-    if not ph["gowa_device_id"]:
-        raise UnroutableMessage(
-            f"pharmacy {pharmacy_id} has no paired device; refusing to guess one")
 
     # ---- safety gates ----
     check_gates(phone, str(pharmacy_id), ph["gowa_device_id"])

@@ -71,6 +71,46 @@ def pharmacy_scope(pharmacy_id: str):
         _current.reset(token)
 
 
+# ------------------------------------------------------------------ "is it live?"
+#
+# ONE definition, because three callers used to disagree and the disagreement cost six
+# messages in a row on the night of the first real registration:
+#
+#   wa.compose()          required gowa_device_id       -> passed, wa_jid was NULL
+#   wa.deliver()          compares live jid == expected -> refused, expected was NULL
+#   jobs.for_every_tenant required gowa_device_id       -> selected a pharmacy that could
+#                                                          never receive anything
+#
+# So compose accepted messages that were doomed at delivery, and the scheduler kept
+# generating them. All three now read the definition below.
+#
+# All three conditions matter: gowa_device_id names the slot to send through, wa_jid is what
+# deliver() checks that slot against, and status='active' is what activation_sweep sets once
+# the handset has genuinely linked. Any one of them missing means "not reachable".
+LIVE_SQL = "wa_jid is not null and gowa_device_id is not null and status = 'active'"
+
+
+def why_not_live(pharmacy_id: str) -> str | None:
+    """None when the pharmacy can send and receive; otherwise the human-readable reason.
+
+    Returns a reason rather than a bool so the caller can say WHICH part is missing --
+    "registered but the handset has not linked" and "no such pharmacy" are different
+    operational problems and were previously indistinguishable.
+    """
+    row = q1("""select name, kind, status, wa_jid, gowa_device_id
+                  from pharmacies where id = %s""", (str(pharmacy_id),))
+    if not row:
+        return f"unknown pharmacy {pharmacy_id}"
+    if not row["gowa_device_id"]:
+        return f"{row['name']} has no device slot; refusing to guess one"
+    if not row["wa_jid"]:
+        return (f"{row['name']} has a device slot but no linked handset yet "
+                f"(status={row['status']}); run ./run.sh activate once it links")
+    if row["status"] != "active":
+        return f"{row['name']} is status={row['status']}, not active"
+    return None
+
+
 @dataclass(frozen=True)
 class Resolution:
     """Three outcomes, never two.

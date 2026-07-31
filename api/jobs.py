@@ -25,17 +25,21 @@ def for_every_tenant(job_fn) -> list[dict]:
 
     Three specifics that matter:
 
-    * Only tenants with a paired device. An unpaired pharmacy cannot receive the alert, so
-      running the job for it produces sends that must fail wa.compose()'s device check --
-      noise that looks like a bug. Skip at selection instead.
+    * Only tenants that are actually LIVE, via tenancy.LIVE_SQL -- the same definition
+      wa.compose() uses. This used to test gowa_device_id alone, which is weaker: a
+      pharmacy that has been issued a slot but whose handset never linked has a device and
+      no wa_jid, so it was selected, every send was composed, and every send was then
+      refused by deliver()'s JID guard. One registration produced six such messages. The
+      alert cannot arrive either way; skipping at selection is the difference between
+      silence and a log full of refusals that look like a bug.
     * Platform rows are excluded: no inventory, nobody to alert.
     * Each tenant is caught separately. One bad row must not abort the loop, or a single
       pharmacy with dirty data silences alerts for every other pharmacy -- and cron
       failures are invisible by nature, which is the whole reason job_runs exists.
     """
-    tenants = q("""select id, name from pharmacies
-                    where kind = 'tenant' and gowa_device_id is not null
-                    order by name""")
+    tenants = q(f"""select id, name from pharmacies
+                     where kind = 'tenant' and {tenancy.LIVE_SQL}
+                     order by name""")
     if not tenants:
         log.warning("no paired tenants; %s did not run", getattr(job_fn, "__name__", job_fn))
         return []
