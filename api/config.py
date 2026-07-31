@@ -6,13 +6,44 @@ from dotenv import load_dotenv
 load_dotenv()
 
 
+# Placeholders for PHARMAOS_TESTING=1, for the settings whose FORM is parsed rather than
+# merely read. `test-supabase_url` is a string, not a URL: supabase-py validates against
+# ^(https?)://.+ and raises SupabaseException("Invalid URL") while api/db.py is still being
+# imported -- so every test that imports any api module died at collection, which read as 80
+# broken tests rather than one bad string. psycopg was quieter about the same problem and
+# only warned ('missing "=" after "test-database_url" in connection info string'), 261 times
+# in one run, which buries whatever the run was actually trying to tell you.
+#
+# These must never reach anything real. They are shaped to parse and to fail to connect:
+# test.supabase.co does not resolve and nothing listens on localhost:5432 in CI.
+#
+# SUPABASE_SERVICE_KEY is here for the same reason and is easy to miss: supabase-py
+# validates the key against a JWT shape too (^seg.seg.seg$), so `test-key` fails exactly
+# like `test-supabase_url` did, one line further down the same constructor. Three dotted
+# segments is the whole requirement -- it is not decoded and not sent anywhere -- so the
+# value is deliberately the least credential-looking thing that satisfies the regex.
+_TEST_PLACEHOLDERS = {
+    "SUPABASE_URL": "https://test.supabase.co",
+    "DATABASE_URL": "postgresql://test:test@localhost:5432/test",
+    "SUPABASE_SERVICE_KEY": "test.test.test",
+}
+
+
 def _req(key: str) -> str:
+    """A real environment variable ALWAYS wins; the placeholder is only a last resort.
+
+    os.getenv is consulted first and returned unconditionally when set, so production
+    behaviour is unchanged and PHARMAOS_TESTING cannot override a value someone has
+    deliberately supplied -- including in CI, where the workflow sets these explicitly as
+    well. The placeholder exists so that importing an api module does not require a
+    database to exist.
+    """
     v = os.getenv(key)
-    if not v:
-        if os.getenv("PHARMAOS_TESTING") == "1":
-            return f"test-{key.lower()}"
-        raise RuntimeError(f"Missing required env var: {key}")
-    return v
+    if v:
+        return v
+    if os.getenv("PHARMAOS_TESTING") == "1":
+        return _TEST_PLACEHOLDERS.get(key, f"test-{key.lower()}")
+    raise RuntimeError(f"Missing required env var: {key}")
 
 
 class Settings:

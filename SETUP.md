@@ -97,7 +97,7 @@ driven entirely from WhatsApp, by the owner, with no terminal at all.
 
 **The owner texts `REGISTER`** to the platform number and answers five questions:
 
-```
+```text
 REGISTER
 > First — what is your name?
 Peter Otieno
@@ -194,7 +194,7 @@ or they all appear identically to customers.
 Idempotent — re-run it to reset to a known state before each rehearsal. It prints the
 isolation moment so you can see it worked:
 
-```
+```text
 nebivolol     A: Nebilong 5mg KES 780   B: Nebilet 5mg KES 890
 atorvastatin  A: Atorvachol KES 950     B: not stocked
 ```
@@ -235,7 +235,7 @@ This is the step that decides whether the demo works. It prints:
 ### Which gate grants access, and who grants it
 
 | | Gate 1 · allowlist | Gate 3 · chat established |
-|---|---|---|
+| --- | --- | --- |
 | Granted by | you, editing `WA_ALLOWLIST` | them, texting the bot |
 | Automatic | never — the code only reads it | yes, on their first message |
 | When to use | while developing | always on |
@@ -314,7 +314,7 @@ and re-run `./run.sh bind <slot>`.
 ## Command reference
 
 | Command | Does |
-|---|---|
+| --- | --- |
 | `./run.sh migrate` | Apply schema, in numeric order |
 | `./run.sh whatsapp` | Start the GOWA container |
 | `./run.sh qr` | Pair by QR, self-refreshing |

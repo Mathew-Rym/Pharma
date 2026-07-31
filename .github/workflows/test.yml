@@ -6,11 +6,44 @@ jobs:
     env:
       PHARMAOS_TESTING: "1"
       GEMINI_API_KEY: test-only
+      # Belt and braces for the two settings whose FORM is validated at import time.
+      # api/config.py already supplies these under PHARMAOS_TESTING, but stating them here
+      # means CI does not silently depend on that fallback staying correct: supabase-py
+      # rejects a URL that is not ^(https?)://.+ and a key that is not shaped like a JWT,
+      # and it raises while api/db.py is still being imported. That is a collection-time
+      # crash in every test that imports an api module, which reads as ~80 broken tests
+      # rather than one bad string.
+      #
+      # Neither value can reach anything: test.supabase.co does not resolve, and the key is
+      # three dotted words rather than a token.
+      SUPABASE_URL: https://test.supabase.co
+      SUPABASE_SERVICE_KEY: test.test.test
+      #
+      # DATABASE_URL is DELIBERATELY NOT SET, and neither is PHARMACY_ID.
+      #
+      # Not an omission -- setting it makes this workflow worse. tests/test_tenancy.py,
+      # tests/test_safety_gates.py and tests/test_outbound_device.py gate their skips on
+      # DATABASE_URL alone, so a placeholder value un-skips 18 tests which then spend 15
+      # seconds each timing out against a Postgres that is not there: 68 skipped becomes 50
+      # skipped plus 17 errors, and the run goes from 18s to over four minutes.
+      #
+      # api/config.py supplies a parseable DATABASE_URL placeholder under
+      # PHARMAOS_TESTING, which is all that import-time construction needs. The env var
+      # must stay absent because it is what the suite reads to decide whether a real
+      # database exists.
+      #
+      # It must also never point at production. These tests insert staff and pharmacies and
+      # write inbound_history -- and an inbound_history row is exactly what makes a phone
+      # number messageable, so a CI run against the live database fabricates WhatsApp
+      # reachability for numbers that never contacted anyone. That has already caused one
+      # sending restriction.
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
       - run: pip install -r api/requirements.txt -r dashboard/requirements.txt
-      # DB tests self-skip when DATABASE_URL is absent, so this runs the pure ones
+      # PHARMACY_ID is what keeps the database tests skipping -- most of them gate on
+      # DATABASE_URL *and* PHARMACY_ID, and the rest on DATABASE_URL, neither of which is
+      # set above. This step therefore runs the tests that need no database.
       - run: pytest tests/ -v
