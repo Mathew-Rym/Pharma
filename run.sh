@@ -568,13 +568,19 @@ platform)
   # Until this exists, register.py answers onboarding from whichever tenant owns the
   # inbound device. That works, but it puts the ban risk of cold onboarding traffic on a
   # real pharmacy's number. One dedicated line moves it off them permanently.
-  SLOT="${2:?usage: ./run.sh platform <slot-name> [display-name]}"
-  SLOT="$SLOT" PNAME="${3:-Pharma OS}" "$PY" - <<'PYEOF'
+  # --release-tenant is required, and deliberately not the default, when the slot is
+  # already bound to a tenant: that tenant loses its only inbound path and every scheduled
+  # job stops selecting it, which is a decision rather than a detail.
+  SLOT="${2:?usage: ./run.sh platform <slot-name> [display-name] [--release-tenant]}"
+  RELEASE=""
+  for a in "$@"; do [ "$a" = "--release-tenant" ] && RELEASE="1"; done
+  PN="${3:-Pharma OS}"; [ "$PN" = "--release-tenant" ] && PN="Pharma OS"
+  SLOT="$SLOT" PNAME="$PN" RELEASE="$RELEASE" "$PY" - <<'PYEOF'
 import os, sys
 sys.path.insert(0, "api")
 import httpx
 from config import settings
-from db import ex, q1
+from db import ex, q1, pool
 
 slot, pname = os.environ["SLOT"], os.environ["PNAME"]
 base = settings.GOWA_URL.rstrip("/")
@@ -593,13 +599,43 @@ if not jid:
 # released rather than duplicated -- otherwise the insert fails on the partial index and
 # the message tells you nothing about why.
 held = q1("select id, name, kind from pharmacies where wa_jid = %s", (jid,))
-if held and held["kind"] != "platform":
+if held and held["kind"] != "platform" and not os.environ.get("RELEASE"):
     print(f"{jid} is currently bound to {held['name']} (a tenant).")
-    print("Converting it to the platform line would leave that pharmacy with no device.")
-    print("Pair a separate number for the platform, or unbind that pharmacy first.")
+    print("Converting it would leave that pharmacy with NO inbound path, and")
+    print("jobs.for_every_tenant would stop selecting it (it requires a device).")
+    print("\nIf that is what you want, say so explicitly:")
+    print(f"  ./run.sh platform {slot} \"{pname}\" --release-tenant")
+    print("\nOtherwise pair a separate number for the platform line.")
     sys.exit(1)
 
-if held:
+if held and held["kind"] != "platform":
+    # ONE transaction. The partial unique indexes on wa_jid and gowa_device_id mean the
+    # values must be freed before they can be re-claimed; doing that as two autocommitted
+    # statements leaves a window where the device belongs to nobody, and an inbound landing
+    # in it resolves to no tenant. Keep the release and the claim atomic.
+    #
+    # The tenant keeps EVERYTHING else -- products, batches, staff, ledger. It becomes a
+    # tenant awaiting a handset, which is an honest state and exactly what
+    # status='pending_activation' is for.
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""update pharmacies
+                              set wa_jid = null, gowa_device_id = null,
+                                  status = 'pending_activation'
+                            where id = %s""", (held["id"],))
+            cur.execute("""insert into pharmacies (name, kind, status, wa_jid,
+                                                   gowa_device_id, wa_number, timezone)
+                           values (%s,'platform','active',%s,%s,%s,'Africa/Nairobi')
+                           returning id""",
+                        (pname, jid, slot, jid.split("@")[0]))
+            new_id = cur.fetchone()["id"]
+        conn.commit()
+    print(f"\n  released  {held['name']}  ->  no device, status=pending_activation")
+    print(f"            (all its products, staff and ledger are untouched)")
+    print(f"  platform  {pname}  <-  {slot}  ({jid})   id={new_id}\n")
+    print("  NOTE: that tenant now has no inbound path and drops out of every")
+    print("        scheduled job until a handset is paired and bound to it.\n")
+elif held:
     ex("update pharmacies set name=%s, gowa_device_id=%s, wa_number=%s, status='active' "
        "where id=%s", (pname, slot, jid.split("@")[0], held["id"]))
     print(f"\n  updated platform line: {pname}  <-  {slot}  ({jid})\n")
