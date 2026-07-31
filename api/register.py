@@ -308,15 +308,23 @@ def _provision(phone: str, ctx: dict, platform: str) -> None:
              tuple(cols[k] for k in keys))
     pid = str(row["id"])
 
-    ex("""insert into staff (pharmacy_id, name, phone, role, is_active)
-          values (%s,%s,%s,'owner',true)
-          on conflict (pharmacy_id, phone) do update set role = 'owner', is_active = true""",
-       (pid, ctx["owner_name"], phone))
+    # Through _grant_role so the owner's role lands in the audit trail like every other
+    # role change. 'owner' is the top rank, so effective_role() can only ever grant it.
+    _grant_role(pid, phone, "owner", mechanism="register", name=ctx["owner_name"])
 
-    # The owner must be reachable on their OWN pharmacy's line the moment it comes up --
-    # that is how they learn it came up. They started this conversation, so recording it
-    # is a statement of fact, not a bypass.
-    record_inbound(phone, pid)
+    # DELIBERATELY no record_inbound() against the new pharmacy.
+    #
+    # An earlier version did exactly that, reasoning that the owner "must be reachable on
+    # their own pharmacy's line the moment it comes up". That reasoning was wrong, and the
+    # comment made it sound principled. The owner messaged the PLATFORM line; they have
+    # never messaged the pharmacy that was just created. Writing inbound_history for them
+    # against the tenant invents a conversation, which is the same class of error as the
+    # schema_v10 backfill that made 254746294224 reachable and cost this project a WhatsApp
+    # sending restriction.
+    #
+    # Activation confirmations therefore go out over the platform line, where the owner's
+    # conversation genuinely lives -- see activation_sweep(). The confirmation itself tells
+    # them to text HELP to the new number, and THAT inbound opens Gate 3 honestly.
     clear_state(phone)
     log.info("registered pharmacy %s (%s) for owner %s", cols["name"], pid, phone)
 
@@ -374,6 +382,72 @@ def _resend_code(phone: str, platform: str) -> None:
     _say(phone, _activation_message(dict(ph), code), platform)
 
 
+# ------------------------------------------------------------------ roles
+# Order matters and matches the staff.role CHECK constraint exactly
+# (owner|manager|pharmacist|attendant). A rank missing a role would leave its precedence
+# undefined, so tests assert this covers the constraint.
+#
+# pharmacist sits below manager because manager is an ADMINISTRATIVE authority -- approving
+# purchase orders, seeing the money -- while pharmacist is a CLINICAL one. They are not
+# really comparable, and collapsing them onto one axis is a simplification: a pharmacist
+# redeeming a manager code gains admin rights, which is intended, but the reverse (a manager
+# redeeming a pharmacist code) does NOT grant clinical authority, and must not, because
+# dispensing authority has to come from a verified PPB registration rather than a code
+# somebody forwarded. That asymmetry is not expressible in a single rank and is the known
+# limit of this model -- see the owner-initiated ADD design.
+ROLE_RANK = {"attendant": 1, "pharmacist": 2, "manager": 3, "owner": 4}
+
+
+def effective_role(existing: str | None, granted: str) -> str:
+    """The role someone ends up with. Never lower than the one they already hold.
+
+    Last-code-wins was the previous rule and it silently demoted a manager to attendant
+    three minutes after promoting them. Privilege loss with no notification is the worst
+    shape of this bug: it surfaces days later as "the system won't let me approve this".
+    """
+    if not existing:
+        return granted
+    return existing if ROLE_RANK.get(existing, 0) >= ROLE_RANK.get(granted, 0) else granted
+
+
+def _grant_role(pharmacy_id: str, phone: str, granted: str, mechanism: str,
+                actor: str | None = None, name: str | None = None) -> str:
+    """Add or promote someone, append to the audit trail, and return the role they hold.
+
+    Every role change lands in staff_role_changes. staff.role decides who may approve a
+    prescription-only medicine, and that approval is logged against a PPB number -- so role
+    is part of the regulatory record, and a mutable column with no history answers "who
+    authorised this, and were they entitled to?" with only the latest value.
+
+    A no-op writes no audit row: an unchanged role is not a change, and padding the trail
+    with them makes the real ones harder to find.
+    """
+    row = q1("select role from staff where pharmacy_id = %s and phone = %s",
+             (str(pharmacy_id), phone))
+    existing = row["role"] if row else None
+    final = effective_role(existing, granted)
+
+    if existing is None:
+        ex("""insert into staff (pharmacy_id, name, phone, role, is_active)
+              values (%s,%s,%s,%s,true)""",
+           (str(pharmacy_id), name or f"Staff {phone[-4:]}", phone, final))
+    else:
+        # role is set explicitly to the COMPUTED value, never to excluded.role. That single
+        # clause -- `do update set role = excluded.role` -- was the whole bug.
+        ex("""update staff set role = %s, is_active = true
+               where pharmacy_id = %s and phone = %s""",
+           (final, str(pharmacy_id), phone))
+
+    if final != existing:
+        ex("""insert into staff_role_changes
+                (pharmacy_id, phone, old_role, new_role, mechanism, actor)
+              values (%s,%s,%s,%s,%s,%s)""",
+           (str(pharmacy_id), phone, existing, final, mechanism, actor or phone))
+        log.info("role %s -> %s for %s at %s via %s", existing, final, phone,
+                 pharmacy_id, mechanism)
+    return final
+
+
 # ------------------------------------------------------------------ joining a pharmacy
 def _redeem(phone: str, kind: str, code: str, platform: str | None) -> None:
     column, role = ("owner_code", "manager") if kind == "owner" else ("join_code", "attendant")
@@ -390,18 +464,27 @@ def _redeem(phone: str, kind: str, code: str, platform: str | None) -> None:
         return
 
     pid = str(ph["id"])
-    existing = q1("select role from staff where pharmacy_id = %s and phone = %s",
-                  (pid, phone))
-    ex("""insert into staff (pharmacy_id, name, phone, role, is_active)
-          values (%s,%s,%s,%s,true)
-          on conflict (pharmacy_id, phone)
-            do update set is_active = true, role = excluded.role""",
-       (pid, f"Staff {phone[-4:]}", phone, role))
+    before = q1("select role from staff where pharmacy_id = %s and phone = %s",
+                (pid, phone))
+    before = before["role"] if before else None
+    after = _grant_role(pid, phone, role,
+                        mechanism="owner_code" if kind == "owner" else "join_code")
     record_inbound(phone, pid)
 
-    was = f" (was {existing['role']})" if existing and existing["role"] != role else ""
-    body = (f"You're in ✅\n\nYou're now a *{role}* at *{ph['name']}*{was}.\n\n"
-            "Text *HELP* any time to see what you can do.")
+    if before == after:
+        body = (f"You're already a *{after}* at *{ph['name']}*.\n\n"
+                "Text *HELP* any time to see what you can do.")
+    elif before and after != role:
+        # They redeemed a lower-ranked code than the role they hold. Say so, rather than
+        # confirming a role they were not given or silently doing nothing: a code that
+        # appears to have been ignored is indistinguishable from a broken one.
+        body = (f"You're already a *{after}* at *{ph['name']}*, which is higher than that "
+                f"code grants — so nothing changed.\n\n"
+                "Text *HELP* any time to see what you can do.")
+    else:
+        was = f" (was {before})" if before else ""
+        body = (f"You're in ✅\n\nYou're now a *{after}* at *{ph['name']}*{was}.\n\n"
+                "Text *HELP* any time to see what you can do.")
     # Reply from the pharmacy they just joined when it is live; that is the number they
     # will be talking to from now on, and answering from a different one is confusing.
     # Before it is live, the platform line is the only device that exists.
