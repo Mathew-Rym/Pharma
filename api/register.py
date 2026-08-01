@@ -500,7 +500,22 @@ def _redeem(phone: str, kind: str, code: str, platform: str | None) -> None:
     before = before["role"] if before else None
     after = _grant_role(pid, phone, role,
                         mechanism="owner_code" if kind == "owner" else "join_code")
-    record_inbound(phone, pid)
+
+    # Record the message against the line that ACTUALLY received it, not the pharmacy
+    # whose code was redeemed. Those are the same thing when staff text the pharmacy's own
+    # number, as the instructions tell them to -- and different when they text the platform
+    # line, which is exactly what happened on the first live registration.
+    #
+    # `record_inbound(phone, pid)` was the same fabrication removed from _provision in
+    # 681cfa4, one function further down: it asserts a conversation with a pharmacy this
+    # phone may never have messaged, and an inbound_history row is precisely what opens
+    # Gate 3. Being handed a code is not a conversation.
+    #
+    # Consequence, deliberate: staff who redeem over the platform line do NOT thereby
+    # become reachable on the pharmacy's line. They become reachable by texting it -- which
+    # the confirmation asks them to do.
+    if platform:
+        record_inbound(phone, platform)
 
     if before == after:
         body = (f"You're already a *{after}* at *{ph['name']}*.\n\n"
