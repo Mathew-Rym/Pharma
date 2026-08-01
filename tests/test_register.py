@@ -123,8 +123,13 @@ def test_edit_restarts_rather_than_guessing_which_field_was_wrong():
     flow, ctx, _ = _walk(GOOD)
     nxt, ctx2, reply = register._step(flow, "EDIT", ctx)
     assert nxt == register.START
-    assert ctx2 == {}
+    assert ctx2 == {}, "every ANSWER is cleared"
     assert reply
+
+    # ...but who is asking survives, or the own-number check silently stops firing for
+    # the one path most likely to be used by someone correcting that exact mistake.
+    _, ctx3, _ = register._step("reg_confirm", "EDIT", {**ctx, "sender": "254700000001"})
+    assert ctx3 == {"sender": "254700000001"}
 
 
 def test_an_unclear_answer_at_confirmation_does_not_create_anything():
@@ -153,6 +158,58 @@ def test_a_bad_answer_re_asks_the_same_question(flow, bad):
     assert nxt == flow, f"{flow} advanced on {bad!r}"
     assert ctx == {}
     assert reply
+
+
+# ============================================================ owner phone != bot line
+def test_the_owner_cannot_nominate_their_own_number_as_the_bot_line():
+    """THE failure of the first real registration.
+
+    The owner answered with their own number. WhatsApp then linked the pharmacy bot to the
+    same account the owner uses, and their own messages to it arrive marked is_from_me --
+    which the webhook drops before anything else runs. The owner can never use their own
+    pharmacy's bot, and every message any personal contact sends them is processed as
+    pharmacy traffic.
+
+    The flow used to only WARN, in the very question being answered. A warning that is
+    ignored costs a re-registration and, in that instance, a real person's contacts being
+    filed as pharmacy customers.
+    """
+    import register
+    nxt, ctx, reply = register._step("reg_wa", "0720521291",
+                                     {"sender": "254720521291"})
+    assert nxt == "reg_wa", "advanced despite the owner giving their own number"
+    assert ctx == {"sender": "254720521291"}, "nothing may be recorded from a refused answer"
+    assert "own" in reply.lower() or "different" in reply.lower()
+
+
+@pytest.mark.parametrize("typed", ["0720521291", "254720521291", "+254 720 521 291"])
+def test_the_rejection_survives_every_way_of_writing_the_same_number(typed):
+    """Comparison is on the NORMALISED form. Comparing raw text would let the identical
+    number through simply because it was typed with a leading zero."""
+    import register
+    nxt, _, _ = register._step("reg_wa", typed, {"sender": "254720521291"})
+    assert nxt == "reg_wa", f"{typed!r} slipped past the check"
+
+
+def test_a_different_number_is_still_accepted():
+    """The check must reject one number, not the question. Reaching reg_confirm renders the
+    summary, so the earlier answers have to be present -- exactly as they are in a real
+    conversation."""
+    import register
+    ctx = {"sender": "254720521291", "owner_name": "Jane", "name": "Greenline",
+           "licence": "PPB/1/2", "town": "Kisumu"}
+    nxt, out, _ = register._step("reg_wa", "0733222111", ctx)
+    assert nxt == "reg_confirm"
+    assert out["wa"] == "254733222111"
+
+
+def test_the_flow_records_who_is_asking_so_the_check_has_something_to_compare():
+    """The comparison is only possible if the sender is in the context. If intercept ever
+    stops seeding it, this check silently passes everything -- so assert the seeding."""
+    import register
+    src = open(SRC).read()
+    assert '"sender": phone' in src or "'sender': phone" in src, (
+        "intercept must seed ctx['sender'], or the own-number check cannot fire")
 
 
 def test_the_pharmacy_name_is_not_silently_truncated_into_something_wrong():

@@ -100,7 +100,7 @@ _FIELD = {"reg_owner_name": "owner_name", "reg_name": "name", "reg_licence": "li
           "reg_town": "town", "reg_wa": "wa"}
 
 
-def _validate(flow: str, text: str) -> tuple[str | None, str | None]:
+def _validate(flow: str, text: str, ctx: dict) -> tuple[str | None, str | None]:
     """(clean value, complaint). Exactly one is None.
 
     Rejecting is cheap; advancing on a bad answer is not. A mistyped handset number sends
@@ -112,6 +112,23 @@ def _validate(flow: str, text: str) -> tuple[str | None, str | None]:
         if not is_valid_ke_mobile(p):
             return None, ("That doesn't look like a Kenyan mobile number. Send it as "
                           "*0712 345 678* or *254712345678*.")
+        # REFUSED, not warned. The first real registration answered this question with the
+        # owner's own number, and the warning printed directly above it was not enough.
+        #
+        # When the bot line and the owner's line are one account, WhatsApp marks the
+        # owner's messages is_from_me and main.webhook_gowa drops them before anything
+        # runs -- so the owner can never use their own pharmacy's bot. Worse, every
+        # personal contact who messages them is processed as pharmacy traffic: two real
+        # people were auto-created as customers within minutes.
+        #
+        # Compared on the NORMALISED form, so 0720…, 254720… and +254 720 … are all the
+        # same number. Comparing raw text would let it through on a leading zero.
+        if ctx.get("sender") and p == norm_phone(ctx["sender"]):
+            return None, ("That's the number you're texting me from, so it can't also be "
+                          "the shop's bot.\n\nIf it were, WhatsApp would treat your own "
+                          "messages as the bot's and you'd never be able to use it — and "
+                          "everyone who messages you personally would reach the pharmacy.\n\n"
+                          "Send a *different* number for the shop's line.")
         return p, None
 
     if flow == "reg_licence":
@@ -133,6 +150,15 @@ def _validate(flow: str, text: str) -> tuple[str | None, str | None]:
     return t, None
 
 
+def _restart_ctx(ctx: dict) -> dict:
+    """A fresh context that still remembers who is asking.
+
+    `sender` is not an answer, it is the identity of the person answering, so it survives
+    a restart. Every other key is an answer and must not.
+    """
+    return {"sender": ctx["sender"]} if ctx.get("sender") else {}
+
+
 def _summary(ctx: dict) -> str:
     return ("Please check this:\n\n"
             f"🏥 *{ctx['name']}*\n"
@@ -151,15 +177,20 @@ def _step(flow: str, text: str, ctx: dict) -> tuple[str, dict, str]:
         if t.upper() in ("YES", "Y", "CONFIRM", "OK", "SAWA", "NDIO"):
             return PROVISION, ctx, ""
         if t.upper() in ("EDIT", "NO", "N", "CHANGE", "RESTART"):
-            return START, {}, "No problem, let's start again.\n\n" + _QUESTIONS[START]
+            # Everything is cleared EXCEPT who is asking. Wiping the sender too would
+            # silently disable the own-number check for the rest of the conversation, so
+            # the one path most likely to be taken by someone correcting that exact
+            # mistake would be the one path that no longer catches it.
+            return START, _restart_ctx(ctx), ("No problem, let's start again.\n\n"
+                                              + _QUESTIONS[START])
         # Anything else re-asks. Falling through to creation on an ambiguous answer would
         # create a real pharmacy from a message that was never a confirmation.
         return "reg_confirm", ctx, _summary(ctx)
 
     if flow not in _FIELD:
-        return START, {}, _QUESTIONS[START]
+        return START, _restart_ctx(ctx), _QUESTIONS[START]
 
-    value, complaint = _validate(flow, t)
+    value, complaint = _validate(flow, t, ctx)
     if complaint:
         return flow, ctx, complaint
 
@@ -649,7 +680,10 @@ def intercept(phone: str, msg: dict) -> bool:
     # word someone types when they think they have lost the thread is filed as an answer,
     # and the flow they were trying to restart carries on with it.
     if restart or not mid_flow:
-        set_state(phone, START, {}, ttl_min=_TTL_MIN, pharmacy_id=platform)
+        # ctx carries the sender from the first turn so _validate can refuse the
+        # owner's own number as the bot line. Without it that check cannot fire at all.
+        set_state(phone, START, {"sender": phone}, ttl_min=_TTL_MIN,
+                  pharmacy_id=platform)
         _say(phone, _QUESTIONS[START], platform)
         return True
 
