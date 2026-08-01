@@ -11,7 +11,7 @@ import tenancy
 import register
 from db import ex, q, q1
 from llm import chat
-from reports import TOOLS, run_tool
+from reports import ROLE_TOOLS, TOOLS, denial_message, may_use, run_tool
 from safety import record_inbound
 from state import clear_state, get_state
 from utils import norm_phone
@@ -204,22 +204,31 @@ def _handle_staff(phone: str, staff: dict, msg: dict, text: str) -> None:
         return
 
     # --- deterministic shortcuts before any model call
+    #
+    # Guarded by the SAME policy as the agent path. These bypass the model entirely, so
+    # scoping only the tool list handed to the LLM would have left the cheapest route to
+    # the day's takings -- one word, `TODAY` -- completely open.
     if up in ("EXPIRY", "EXPIRING"):
-        reply_text(phone, run_tool("get_expiry_risk", {"days": 90}, phone))
+        _guard(phone, staff, "get_expiry_risk", {"days": 90})
         return
     if up in ("LOW", "LOWSTOCK", "LOW STOCK"):
-        reply_text(phone, run_tool("get_stock", {"low_stock_only": True}, phone))
+        _guard(phone, staff, "get_stock", {"low_stock_only": True})
         return
     if up in ("TODAY", "SALES"):
-        reply_text(phone, run_tool("get_sales_summary", {"period": "today"}, phone))
+        _guard(phone, staff, "get_sales_summary", {"period": "today"})
         return
     if up in ("REPORT", "REPORT MONTH"):
-        run_tool("generate_report_pdf", {"period": "month"}, phone)
+        _guard(phone, staff, "generate_report_pdf", {"period": "month"}, reply=False)
         return
     if up == "REPORT WEEK":
-        run_tool("generate_report_pdf", {"period": "week"}, phone)
+        _guard(phone, staff, "generate_report_pdf", {"period": "week"}, reply=False)
         return
     if up in ("ORDER", "REORDER"):
+        # Not run_tool, but the same data -- what to buy and how much. Gated on the tool
+        # that answers that question, or ORDER becomes the way round the guard.
+        if not may_use(staff["role"], "get_reorder_suggestions"):
+            _deny(phone, staff, "get_reorder_suggestions")
+            return
         from forecast import reorder_message
         reply_text(phone, reorder_message())
         return
@@ -279,7 +288,10 @@ def _handle_staff(phone: str, staff: dict, msg: dict, text: str) -> None:
         return
 
     # --- everything else: let the model pick a tool
-    _agent_reply(phone, text, STAFF_SYSTEM, TOOLS)
+    # Role-scoped. The model cannot call what it was never shown, and _guard
+    # re-checks at execution in case the list and the policy ever drift.
+    allowed = [t for t in TOOLS if may_use(staff["role"], t["name"])]
+    _agent_reply(phone, text, STAFF_SYSTEM, allowed)
 
 
 def _staff_help(role: str) -> str:
@@ -301,6 +313,26 @@ def _staff_help(role: str) -> str:
         "Or just ask me in your own words."
     )
     return base
+
+
+def _deny(phone: str, staff: dict, tool: str) -> None:
+    log.info("tool %s denied to %s (role=%s)", tool, phone, staff.get("role"))
+    reply_text(phone, denial_message(staff.get("role"), tool))
+
+
+def _guard(phone: str, staff: dict, tool: str, args: dict, reply: bool = True) -> None:
+    """Run a tool for a staff member, or say which role is needed.
+
+    One place, used by both the keyword shortcuts and (via the filtered list) the agent, so
+    the two cannot drift apart. They already had: CUSTOMER_TOOLS was filtered while the
+    staff path was not, and nothing failed to make that visible.
+    """
+    if not may_use(staff.get("role"), tool):
+        _deny(phone, staff, tool)
+        return
+    out = run_tool(tool, args, phone)
+    if reply and out:
+        reply_text(phone, out)
 
 
 # ------------------------------------------------------------ customer branch

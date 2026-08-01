@@ -629,6 +629,59 @@ TOOL_IMPLS = {
 }
 
 
+# ------------------------------------------------------------------ who may run what
+#
+# The customer/staff boundary was enforced (CUSTOMER_TOOLS is filtered to get_stock).
+# Within staff it was not: router handed the whole TOOLS list to every role, so an
+# attendant could ask "how did we do today" and be told the day's takings. The
+# deterministic shortcuts were a wider hole still, because no model was involved at all --
+# `TODAY` called get_sales_summary directly.
+#
+# Cumulative by rank, asserted by a test: attendant ⊆ pharmacist ⊆ manager ⊆ owner. A gap
+# would mean a promotion could REMOVE a tool someone relied on, which is the same silent
+# privilege loss as the JOIN-demotes-a-manager bug.
+#
+# Two judgement calls worth naming rather than burying:
+#   * find_supplier sits at manager. An attendant receiving a delivery might reasonably
+#     want the rep's number, but supplier relationships are procurement, and procurement is
+#     where money decisions live. Easy to move down if the shop floor asks for it.
+#   * get_expiry_risk sits at pharmacist, not attendant. Expiry is a dispensing-safety
+#     question before it is a stock question.
+_ATTENDANT = {"get_stock"}
+_PHARMACIST = _ATTENDANT | {"get_expiry_risk"}
+_MANAGER = _PHARMACIST | {"get_sales_summary", "get_top_products", "find_supplier",
+                          "get_reorder_suggestions", "generate_report_pdf"}
+
+ROLE_TOOLS: dict[str, set[str]] = {
+    "attendant": _ATTENDANT,
+    "pharmacist": _PHARMACIST,
+    "manager": _MANAGER,
+    "owner": {t["name"] for t in TOOLS},
+}
+
+
+def may_use(role: str | None, tool: str) -> bool:
+    """Fail closed. An unknown or missing role gets nothing.
+
+    The previous default was "every tool", so a role that is not in this table -- a typo, or
+    one added to the CHECK constraint and forgotten here -- must not inherit it.
+    """
+    return tool in ROLE_TOOLS.get(role or "", frozenset())
+
+
+def denial_message(role: str | None, tool: str) -> str:
+    """Say which role is needed, rather than pretending the tool does not exist.
+
+    Hiding it teaches staff the system is broken and they stop trusting it. Naming the role
+    tells them who to ask, which is the actual answer to their question.
+    """
+    needed = [r for r in ("attendant", "pharmacist", "manager", "owner")
+              if tool in ROLE_TOOLS.get(r, frozenset())]
+    who = needed[0] if needed else "the owner"
+    return (f"That needs *{who}* access — you're signed in as *{role or 'unknown'}*.\n\n"
+            f"Ask the pharmacy owner if you should have it.")
+
+
 def run_tool(name: str, args: dict, phone: str, pharmacy_id: str | None = None) -> str:
     """Execute a tool. generate_report_pdf has a side effect (sends a document)."""
     pid = pharmacy_id
