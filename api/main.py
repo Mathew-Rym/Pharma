@@ -3,6 +3,7 @@
 The webhook returns 200 immediately and does the real work in a background task.
 Baileys will time out and re-deliver if you make it wait for a 30-second vision call.
 """
+import asyncio
 import hashlib
 import hmac
 import json
@@ -38,13 +39,67 @@ def _auth(secret: str | None) -> None:
         raise HTTPException(status_code=401, detail="bad secret")
 
 
+# How often to look for handsets that have finished linking. Pairing is asynchronous --
+# someone walks to another room and types a code -- and only GOWA knows when it completed.
+ACTIVATION_POLL_SECS = 60
+
+
+async def _activation_loop() -> None:
+    """Bind newly linked handsets, forever, inside this process.
+
+    IN-PROCESS on purpose, not cron and not a systemd timer: activation_sweep talks to GOWA
+    on localhost:3001, so it has to run somewhere that can reach it. This is that place.
+
+    It exists because the owner has no terminal. Until now every activation waited on a
+    human running ./run.sh activate, which is fine for us and impossible for a pharmacist
+    in Kakamega -- they type the code, nothing happens, and the product looks broken at the
+    one moment it most needs not to.
+
+    MULTI-WORKER HAZARD, and the choice made: with more than one uvicorn worker this loop
+    runs once per worker, so two workers would both try to bind the same handset. The
+    obvious guard is a Postgres advisory lock, but those are SESSION-scoped and DATABASE_URL
+    points at Supabase's TRANSACTION pooler (6543), where a session-scoped lock is not
+    reliably held on the same backend -- exactly the finding that made tenancy.LIVE_SQL
+    necessary. Using DIRECT_URL for one long-lived lock connection would work and is the
+    upgrade path if this ever runs multi-worker.
+
+    Single worker is therefore a REQUIREMENT, and it is documented, not enforced -- nothing
+    here detects the worker count, and claiming otherwise would be worse than the gap. Both
+    launchers run one worker today (run.sh and api/Dockerfile pass no --workers).
+
+    If it is ever run multi-worker the failure is bounded rather than corrupting: the UPDATE
+    writes the same JID either way, so the worst case is _confirm_activation sending the
+    owner the same "you're live" message twice.
+    """
+    import register
+    while True:
+        try:
+            res = register.activation_sweep()
+            if res.get("activated"):
+                log.info("activation loop: activated %s", res["activated"])
+        except Exception:
+            # Never let one bad sweep kill the loop; a pharmacy waiting to go live would
+            # then wait forever, with nothing in the log to say why.
+            log.exception("activation sweep failed; will retry")
+        await asyncio.sleep(ACTIVATION_POLL_SECS)
+
+
 @app.on_event("startup")
-def _startup() -> None:
+async def _startup() -> None:
     try:
         ensure_buckets()
     except Exception:
         log.warning("bucket check skipped", exc_info=True)
-    log.info("pharmaos api up · model=%s", settings.MODEL_VISION)
+    app.state.activation_task = asyncio.create_task(_activation_loop())
+    log.info("pharmaos api up · model=%s · activation sweep every %ss",
+             settings.MODEL_VISION, ACTIVATION_POLL_SECS)
+
+
+@app.on_event("shutdown")
+async def _shutdown() -> None:
+    task = getattr(app.state, "activation_task", None)
+    if task:
+        task.cancel()
 
 
 @app.get("/health")
