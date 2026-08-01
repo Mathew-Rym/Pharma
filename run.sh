@@ -555,9 +555,20 @@ else:
     pick = input("\nNumber: ").strip()
     row = rows[int(pick) - 1]
 
-ex("update pharmacies set wa_jid=%s, gowa_device_id=%s, wa_number=%s where id=%s",
+# status='active' as well, and it is not cosmetic. tenancy.LIVE_SQL requires wa_jid AND
+# gowa_device_id AND status='active', and wa.compose() refuses anything that fails it. A
+# bind that set only the first two left the pharmacy holding a verified handset while every
+# outbound message raised UnroutableMessage -- a line that looks correct in ./run.sh safety
+# and answers nobody. Binding a linked handset IS the activation; say so in the row.
+ex("""update pharmacies
+         set wa_jid=%s, gowa_device_id=%s, wa_number=%s, status='active'
+       where id=%s""",
    (jid, slot, jid.split("@")[0], row["id"]))
-print(f"\n  {row['name']}  <-  {slot}  ({jid})\n")
+print(f"\n  {row['name']}  <-  {slot}  ({jid})   status=active\n")
+
+import tenancy
+why = tenancy.why_not_live(str(row["id"]))
+print(f"  live check: {'LIVE — this line can send and receive' if why is None else 'NOT LIVE: ' + why}\n")
 print("  Verify: ./run.sh safety\n")
 PYEOF
   ;;
