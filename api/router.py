@@ -11,7 +11,7 @@ import tenancy
 import register
 from db import ex, q, q1
 from llm import chat
-from reports import ROLE_TOOLS, TOOLS, denial_message, may_use, run_tool
+from reports import TOOLS, denial_message, may_use, run_tool, tools_for
 from safety import record_inbound
 from state import clear_state, get_state
 from utils import norm_phone
@@ -242,6 +242,9 @@ def _handle_staff(phone: str, staff: dict, msg: dict, text: str) -> None:
 
     # --- draft purchase orders from the forecast
     if up == "PO" or up.startswith("PO "):
+        # Money action: drafts purchase orders and routes them for approval.
+        if not may_use(staff["role"], "draft_po"):
+            _deny(phone, staff, "draft_po"); return
         from approvals import send_po_for_approval
         from forecast import create_draft_pos
         filt = text[3:].strip() or None
@@ -255,6 +258,8 @@ def _handle_staff(phone: str, staff: dict, msg: dict, text: str) -> None:
 
     # --- talk to the agent on the pharmacy PC
     if up in ("SYNC", "RESYNC", "SYNC NOW"):
+        if not may_use(staff["role"], "pc_sync"):
+            _deny(phone, staff, "pc_sync"); return
         from agent_api import queue_command
         if queue_command("resync", reply_to=phone, requested_by=str(staff["id"])):
             reply_text(phone, "Asking the pharmacy PC to sync now. This takes up to a "
@@ -265,11 +270,15 @@ def _handle_staff(phone: str, staff: dict, msg: dict, text: str) -> None:
         return
 
     if up in ("PC", "AGENT", "PC STATUS"):
+        if not may_use(staff["role"], "pc_status"):
+            _deny(phone, staff, "pc_status"); return
         from agent_api import agent_status
         reply_text(phone, agent_status())
         return
 
     if up == "PROBE":
+        if not may_use(staff["role"], "pc_probe"):
+            _deny(phone, staff, "pc_probe"); return
         from agent_api import queue_command
         if queue_command("probe", reply_to=phone, requested_by=str(staff["id"])):
             reply_text(phone, "Scanning the pharmacy PC for the phAMACore database...")
@@ -278,11 +287,17 @@ def _handle_staff(phone: str, staff: dict, msg: dict, text: str) -> None:
         return
 
     if up in ("VARIANCE", "RECON", "SHRINKAGE"):
+        # Till-vs-stock figures. An attendant denied TODAY must not read them here.
+        if not may_use(staff["role"], "variance"):
+            _deny(phone, staff, "variance"); return
         from agent_api import reconciliation_summary
         reply_text(phone, reconciliation_summary())
         return
 
     if up.startswith("WHY "):
+        # Explains a reorder suggestion, so it exposes the same sales-derived data.
+        if not may_use(staff["role"], "forecast_why"):
+            _deny(phone, staff, "forecast_why"); return
         from forecast import forecast_explain
         reply_text(phone, forecast_explain(text[4:].strip()))
         return
@@ -290,29 +305,42 @@ def _handle_staff(phone: str, staff: dict, msg: dict, text: str) -> None:
     # --- everything else: let the model pick a tool
     # Role-scoped. The model cannot call what it was never shown, and _guard
     # re-checks at execution in case the list and the policy ever drift.
-    allowed = [t for t in TOOLS if may_use(staff["role"], t["name"])]
-    _agent_reply(phone, text, STAFF_SYSTEM, allowed)
+    _agent_reply(phone, text, STAFF_SYSTEM, tools_for(staff["role"]))
+
+
+# Every advertised command, with the capability it needs. A test asserts this covers
+# STAFF_COMMANDS exactly, so a command added to one and not the other fails the build --
+# which is the check that would have caught PO sitting ungated behind a help entry.
+_HELP_LINES: list[tuple[str, str]] = [
+    ("get_stock",               "• *LOW* — what is below reorder level"),
+    ("get_stock",               "• *do we have amoxil* — stock check"),
+    ("find_supplier",           "• *who supplies prenor* — supplier contact"),
+    ("pc_sync",                 "• *SYNC* — pull fresh data from the pharmacy PC"),
+    ("pc_status",               "• *PC* — is the pharmacy PC online"),
+    ("get_expiry_risk",         "• *EXPIRY* — what is expiring in 90 days"),
+    ("get_sales_summary",       "• *TODAY* — today's sales"),
+    ("get_reorder_suggestions", "• *ORDER* — what to reorder"),
+    ("generate_report_pdf",     "• *REPORT* — full PDF report"),
+    ("draft_po",                "• *PO* — draft purchase orders from the forecast"),
+    ("forecast_why",            "• *WHY prenor* — why the system suggests ordering it"),
+    ("variance",                "• *VARIANCE* — where the till and our stock disagree"),
+    ("pc_probe",                "• *PROBE* — scan the pharmacy PC for its database"),
+]
 
 
 def _staff_help(role: str) -> str:
-    base = (
-        "*Pharma OS commands*\n"
-        "📸 Send a photo of a supplier invoice → I receive the stock (batch + expiry)\n"
-        "• *EXPIRY* — what is expiring in 90 days\n"
-        "• *LOW* — what is below reorder level\n"
-        "• *TODAY* — today's sales\n"
-        "• *ORDER* — what to reorder\n"
-        "• *REPORT* — full PDF report\n"
-        "• *who supplies prenor* — supplier contact\n"
-        "• *do we have amoxil* — stock check\n"
-        "• *PO* — draft purchase orders from the forecast\n"
-        "• *WHY prenor* — why the system suggests ordering it\n"
-        "• *VARIANCE* — where the till and our stock disagree\n"
-        "• *SYNC* — pull fresh data from the pharmacy PC\n"
-        "• *PC* — is the pharmacy PC online\n"
-        "Or just ask me in your own words."
-    )
-    return base
+    """Only what this role can actually do.
+
+    The parameter was previously accepted and ignored -- every role got the same list,
+    including commands they would be refused. That is how the gap hid: the bot advertised
+    PO to an attendant, ran it for them, and nothing anywhere disagreed. Listing exactly
+    what will work makes help and enforcement the same statement.
+    """
+    lines = [text for cap, text in _HELP_LINES if may_use(role, cap)]
+    return ("*Pharma OS commands*\n"
+            "📸 Send a photo of a supplier invoice → I receive the stock (batch + expiry)\n"
+            + "\n".join(lines)
+            + "\nOr just ask me in your own words.")
 
 
 def _deny(phone: str, staff: dict, tool: str) -> None:

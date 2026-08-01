@@ -28,35 +28,35 @@ def test_every_database_role_has_a_tool_policy():
     default used to be "all tools", an unmapped role is an open door."""
     import re
 
-    from reports import ROLE_TOOLS
+    from reports import ROLE_CAPS
     schema = open(os.path.join(os.path.dirname(__file__), "..", "db", "schema.sql")).read()
     m = re.search(r"role\s+text not null check \(role in \(([^)]+)\)\)", schema)
     allowed = {v.strip().strip("'") for v in m.group(1).split(",")}
-    assert set(ROLE_TOOLS) == allowed
+    assert set(ROLE_CAPS) == allowed
 
 
 def test_every_named_tool_actually_exists():
     """A typo in the policy silently grants nothing, or silently grants everything if the
     lookup is inverted. Either way it fails quietly."""
-    from reports import ROLE_TOOLS, TOOLS
-    real = {t["name"] for t in TOOLS}
-    for role, names in ROLE_TOOLS.items():
-        assert names <= real, f"{role} names tools that do not exist: {names - real}"
+    from reports import _EXTRA_CAPS, ROLE_CAPS, TOOLS
+    real = {t["name"] for t in TOOLS} | _EXTRA_CAPS
+    for role, names in ROLE_CAPS.items():
+        assert names <= real, f"{role} names capabilities that do not exist: {names - real}"
 
 
 def test_access_only_widens_as_rank_increases():
     """attendant ⊆ pharmacist ⊆ manager ⊆ owner. A gap would mean a promotion could take
     away a tool someone relied on -- the same silent privilege loss as the JOIN/OWNER
     demotion bug."""
-    from reports import ROLE_TOOLS
+    from reports import ROLE_CAPS
     for lower, higher in (("attendant", "pharmacist"), ("pharmacist", "manager"),
                           ("manager", "owner")):
-        assert ROLE_TOOLS[lower] <= ROLE_TOOLS[higher], f"{lower} has tools {higher} lacks"
+        assert ROLE_CAPS[lower] <= ROLE_CAPS[higher], f"{lower} has tools {higher} lacks"
 
 
 def test_the_owner_can_use_everything():
-    from reports import ROLE_TOOLS, TOOLS
-    assert ROLE_TOOLS["owner"] == {t["name"] for t in TOOLS}
+    from reports import _EXTRA_CAPS, ROLE_CAPS, TOOLS
+    assert ROLE_CAPS["owner"] == {t["name"] for t in TOOLS} | _EXTRA_CAPS
 
 
 @pytest.mark.parametrize("role,tool,allowed", [
@@ -90,19 +90,64 @@ def test_denial_names_the_role_needed():
     assert "attendant" in msg.lower()
 
 
-# ============================================================ the shortcuts
-def test_the_deterministic_shortcuts_are_gated_by_the_same_policy():
-    """`TODAY` called get_sales_summary with no role check and no model involved, so tool
-    scoping applied to the LLM path alone would have left the cheapest bypass wide open.
+# ============================================================ the keyword commands
+def test_every_advertised_command_has_a_policy():
+    """Counting run_tool call sites was NOT enough, and gave false confidence.
 
-    Structural, because the alternative is driving every shortcut through a live database.
+    The first version of this test compared run_tool calls against guarded calls inside the
+    shortcut block. It passed while PO, VARIANCE, WHY, SYNC, PC and PROBE sat completely
+    ungated, because none of them go through run_tool -- they call create_draft_pos(),
+    reconciliation_summary(), queue_command() and so on directly. PO drafts purchase orders
+    and routes them for approval; an attendant could run it.
+
+    So the assertion is now on the enumerated COMMANDS, not on how they happen to be
+    implemented. Adding a command to the help without deciding who may run it fails here.
     """
+    from reports import ROLE_CAPS, STAFF_COMMANDS
+    for cmd, cap in STAFF_COMMANDS.items():
+        holders = [r for r, caps in ROLE_CAPS.items() if cap in caps]
+        assert holders, f"{cmd} maps to capability {cap!r} that no role has"
+
+
+def test_the_help_text_and_the_command_policy_describe_the_same_system():
+    """_staff_help used to take `role` and ignore it, so every role was shown commands it
+    would be refused. That disagreement is how PO stayed ungated behind a help entry
+    nobody cross-checked."""
+    from reports import ROLE_CAPS, STAFF_COMMANDS
+    from router import _HELP_LINES
+
+    helped = {cap for cap, _ in _HELP_LINES}
+    known = set().union(*ROLE_CAPS.values())
+    # Not an equality: the help also shows natural-language examples ("who supplies
+    # prenor") that reach a tool through the model rather than through a keyword branch.
+    # Both must name a REAL capability, and every keyword command must be advertised --
+    # an unadvertised command is one nobody cross-checks, which is how PO stayed open.
+    assert helped <= known, f"help advertises capabilities that do not exist: {helped - known}"
+    policed = set(STAFF_COMMANDS.values())
+    assert policed <= helped, f"keyword commands missing from the help: {policed - helped}"
+
+
+def test_every_keyword_branch_in_the_staff_handler_is_gated():
+    """Structural backstop over the source, so a new `if up == "X"` that calls a function
+    directly -- the exact shape that slipped through -- cannot land unguarded."""
     src = open(os.path.join(os.path.dirname(__file__), "..", "api", "router.py")).read()
-    body = src[src.index("deterministic shortcuts"):src.index("approvals with a PIN")]
-    calls = body.count("run_tool(")
-    guarded = body.count("_guard(")
-    assert guarded >= calls, (
-        f"{calls} run_tool call(s) in the shortcut block but only {guarded} guarded")
+    body = src[src.index("deterministic shortcuts"):src.index("everything else: let the model")]
+    import re
+    # Each branch that reacts to a keyword must mention may_use or _guard before the next.
+    branches = re.split(r"(?m)^    if up[ .]", body)[1:]
+    ungated = [b.splitlines()[0].strip()[:48] for b in branches
+               if "_guard(" not in b and "may_use(" not in b]
+    assert not ungated, f"keyword branches with no role check: {ungated}"
+
+
+def test_the_help_shown_to_an_attendant_omits_what_they_cannot_run():
+    from router import _staff_help
+    att, mgr = _staff_help("attendant"), _staff_help("manager")
+    assert "*PO*" not in att and "*PO*" in mgr
+    assert "*TODAY*" not in att and "*TODAY*" in mgr
+    assert "*VARIANCE*" not in att and "*VARIANCE*" in mgr
+    assert "*LOW*" in att, "an attendant must still be told what they CAN do"
+    assert "who supplies" in att, "supplier contact is attendant-level on purpose"
 
 
 def test_the_staff_agent_gets_a_filtered_tool_list():

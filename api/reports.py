@@ -647,17 +647,61 @@ TOOL_IMPLS = {
 #     where money decisions live. Easy to move down if the shop floor asks for it.
 #   * get_expiry_risk sits at pharmacist, not attendant. Expiry is a dispensing-safety
 #     question before it is a stock question.
-_ATTENDANT = {"get_stock"}
-_PHARMACIST = _ATTENDANT | {"get_expiry_risk"}
-_MANAGER = _PHARMACIST | {"get_sales_summary", "get_top_products", "find_supplier",
-                          "get_reorder_suggestions", "generate_report_pdf"}
+# CAPABILITIES, not just tools. The first version of this policy covered reports.TOOLS and
+# nothing else, which left a hole its own test could not see: the keyword commands PO,
+# VARIANCE, WHY, SYNC, PC and PROBE are handled directly in router._handle_staff without
+# ever calling run_tool. A structural test counting run_tool call sites therefore passed
+# while PO -- which drafts purchase orders and sends them for approval, a money action --
+# stayed open to every role. Anything a role can DO gets a name here.
+_EXTRA_CAPS = {
+    "draft_po",      # PO      — creates draft purchase orders and routes them for approval
+    "variance",      # VARIANCE— till-vs-stock discrepancies, i.e. sales-adjacent figures
+    "forecast_why",  # WHY x   — explains a reorder suggestion, so it exposes the same data
+    "pc_sync",       # SYNC    — ask the shop PC to refresh; no sensitive output
+    "pc_status",     # PC      — is the shop PC online; status only
+    "pc_probe",      # PROBE   — scans the shop PC for its database; infrastructure
+}
 
-ROLE_TOOLS: dict[str, set[str]] = {
+# find_supplier is at ATTENDANT deliberately, and was moved down from manager. The problem
+# this product set out to solve at New Lemuma was supplier contacts living on one person's
+# personal phone -- so the attendant standing at the door with a short delivery has to go
+# find someone. Gating a phone number behind manager recreates exactly that. Procurement
+# DECISIONS are manager-level (draft_po, get_reorder_suggestions); a phone number is not a
+# decision.
+_ATTENDANT = {"get_stock", "find_supplier", "pc_sync", "pc_status"}
+_PHARMACIST = _ATTENDANT | {"get_expiry_risk"}
+_MANAGER = _PHARMACIST | {"get_sales_summary", "get_top_products",
+                          "get_reorder_suggestions", "generate_report_pdf",
+                          "draft_po", "variance", "forecast_why", "pc_probe"}
+
+ROLE_CAPS: dict[str, set[str]] = {
     "attendant": _ATTENDANT,
     "pharmacist": _PHARMACIST,
     "manager": _MANAGER,
-    "owner": {t["name"] for t in TOOLS},
+    "owner": {t["name"] for t in TOOLS} | _EXTRA_CAPS,
 }
+
+# Every keyword _staff_help advertises, mapped to the capability it needs. A test asserts
+# this covers the help text, so adding a command to the help without deciding who may run
+# it fails the build -- which is the check that would have caught PO.
+STAFF_COMMANDS: dict[str, str] = {
+    "EXPIRY": "get_expiry_risk",
+    "LOW": "get_stock",
+    "TODAY": "get_sales_summary",
+    "ORDER": "get_reorder_suggestions",
+    "REPORT": "generate_report_pdf",
+    "PO": "draft_po",
+    "WHY": "forecast_why",
+    "VARIANCE": "variance",
+    "SYNC": "pc_sync",
+    "PC": "pc_status",
+    "PROBE": "pc_probe",
+}
+
+
+def tools_for(role: str | None) -> list[dict]:
+    """The reports.TOOLS entries this role may use, for handing to the model."""
+    return [t for t in TOOLS if may_use(role, t["name"])]
 
 
 def may_use(role: str | None, tool: str) -> bool:
@@ -666,7 +710,7 @@ def may_use(role: str | None, tool: str) -> bool:
     The previous default was "every tool", so a role that is not in this table -- a typo, or
     one added to the CHECK constraint and forgotten here -- must not inherit it.
     """
-    return tool in ROLE_TOOLS.get(role or "", frozenset())
+    return tool in ROLE_CAPS.get(role or "", frozenset())
 
 
 def denial_message(role: str | None, tool: str) -> str:
@@ -676,7 +720,7 @@ def denial_message(role: str | None, tool: str) -> str:
     tells them who to ask, which is the actual answer to their question.
     """
     needed = [r for r in ("attendant", "pharmacist", "manager", "owner")
-              if tool in ROLE_TOOLS.get(r, frozenset())]
+              if tool in ROLE_CAPS.get(r, frozenset())]
     who = needed[0] if needed else "the owner"
     return (f"That needs *{who}* access — you're signed in as *{role or 'unknown'}*.\n\n"
             f"Ask the pharmacy owner if you should have it.")
