@@ -284,12 +284,101 @@ PYEOF
   ;;
 
 unpair)
+  # Undo a pairing: log the handset out AND clear the row that pointed at it.
+  #
+  # The previous version was wrong twice, and both are the same class of bug that produced
+  # the bind regression -- one writer changing half of "paired".
+  #
+  #   D="${GOWA_DEVICE_ID:-pharmacy-1}" ignored $2 entirely, so `./run.sh unpair
+  #   some-slot` logged out whatever GOWA_DEVICE_ID named. That is currently pharmacy-1,
+  #   the PLATFORM line and the only working line in the system.
+  #
+  #   It contained no database write, so wa_jid, gowa_device_id and status='active'
+  #   survived the logout: LIVE_SQL passed, compose() accepted, deliver() refused every
+  #   message, and for_every_tenant kept selecting a dead line.
   : "${GOWA_PASS:?set GOWA_PASS in .env}"
-  D="${GOWA_DEVICE_ID:-pharmacy-1}"
-  curl -s -u "${GOWA_USER:-pharmaos}:${GOWA_PASS}" -H "X-Device-Id: $D" \
-       "http://127.0.0.1:3001/app/logout" | head -c 300
-  echo
-  echo "Logged out. Run ./run.sh qr to pair a different number."
+  SLOT="${2:?usage: ./run.sh unpair <slot-name> [--release-platform]   (see ./run.sh reconcile)}"
+  RELEASE_PLATFORM=""
+  for a in "$@"; do [ "$a" = "--release-platform" ] && RELEASE_PLATFORM="1"; done
+  SLOT="$SLOT" RELEASE_PLATFORM="$RELEASE_PLATFORM" "$PY" - <<'PYEOF'
+import os, sys
+sys.path.insert(0, "api")
+import httpx
+import tenancy
+from config import settings
+from db import ex, q1
+
+slot = os.environ["SLOT"]
+base = settings.GOWA_URL.rstrip("/")
+auth = (settings.GOWA_USER or "pharmaos", settings.GOWA_PASS)
+
+try:
+    r = httpx.get(f"{base}/devices", auth=auth, timeout=15)
+    live = {s["id"]: (s.get("jid") or "") for s in ((r.json() or {}).get("results") or [])}
+except Exception as e:
+    print(f"Cannot reach the WhatsApp gateway: {e}")
+    print("Refusing to clear the database while the gateway state is unknown.")
+    sys.exit(1)
+
+# Refuse an unknown slot BY NAME. A typo previously fell through to the default and logged
+# out a different, working line.
+if slot not in live:
+    print(f"No slot named {slot!r}.")
+    print(f"Known slots: {', '.join(live) or '(none)'}")
+    sys.exit(1)
+
+row = q1("select id, name, kind, wa_jid, status from pharmacies where gowa_device_id = %s",
+         (slot,))
+if row and row["kind"] == "platform" and not os.environ.get("RELEASE_PLATFORM"):
+    print(f"{slot} is the PLATFORM line ({row['name']}).")
+    print("Unpairing it stops REGISTER working for EVERYONE -- no pharmacy could sign up,")
+    print("and onboarding replies would have no line to send from.")
+    print(f"\nIf that is really what you want:\n  ./run.sh unpair {slot} --release-platform")
+    sys.exit(1)
+
+# ORDER: database first, then the logout. Neither ordering is atomic -- an HTTP call and a
+# Postgres transaction cannot be -- so the question is only which half-state is safer if
+# the process dies between them.
+#
+#   DB first  -> a live session that resolves to no pharmacy. Inbound finds no row for that
+#                JID, so it is ignored and nothing is answered. Silent, and fail-closed.
+#   logout first -> exactly today's bug: dead session, database still says live, every job
+#                selects it and every send is refused.
+#
+# Silence beats a phantom-live pharmacy, so the DB goes first. The command is idempotent
+# either way: re-running it re-clears an already-clear row and re-logs-out an already-dead
+# slot without complaint, and prints both sides so a half-finished run is visible.
+if row:
+    ex("""update pharmacies
+             set wa_jid = null, gowa_device_id = null, status = 'pending_activation'
+           where id = %s""", (str(row["id"]),))
+    print(f"  database : {row['name']} released (was {row['status']}, jid {row['wa_jid']})")
+else:
+    print(f"  database : no pharmacy row pointed at {slot} -- nothing to clear")
+
+try:
+    resp = httpx.get(f"{base}/app/logout", auth=auth, headers={"X-Device-Id": slot},
+                     timeout=30)
+    print(f"  gateway  : logout returned {resp.status_code}")
+except Exception as e:
+    print(f"  gateway  : LOGOUT FAILED ({e})")
+    print("             The database is already cleared, so that number now resolves to")
+    print("             no pharmacy and its messages are ignored. Re-run this command.")
+    sys.exit(1)
+
+# GOWA keeps the slot after a logout ("slot kept" in its own logs). That is why
+# gowa_device_id is cleared and not merely blanked in passing: a later pair on the same
+# slot name could bind a DIFFERENT number while the row still held the old JID, which is
+# precisely the mismatch deliver()'s guard exists to catch.
+after = {s["id"]: (s.get("jid") or "")
+         for s in ((httpx.get(f"{base}/devices", auth=auth, timeout=15).json() or {})
+                   .get("results") or [])}
+print(f"  slot now : {slot} jid={after.get(slot) or '(none)'}")
+if row:
+    print(f"  live check: {tenancy.why_not_live(str(row['id'])) or 'LIVE (unexpected)'}")
+print("\n  Pair a replacement with:  ./run.sh pair <number> " + slot)
+print("  Check both sides with:    ./run.sh reconcile")
+PYEOF
   ;;
 
 all)
@@ -720,6 +809,90 @@ while True:
         sys.exit(1)
     print(".", end="", flush=True)
     time.sleep(INTERVAL)
+PYEOF
+  ;;
+
+reconcile)
+  # Compare what GOWA actually has against what the database believes.
+  #
+  # These two have now diverged three separate times, each time silently and each time
+  # discovered by accident:
+  #   * bind wrote wa_jid and gowa_device_id but not status, so a linked handset was not
+  #     live (58bd0ec)
+  #   * unpair logged a handset out and wrote nothing, so a dead session still read as live
+  #   * a handset was remote-logged-out from the phone, which nothing on this side noticed
+  #
+  # One command that would have surfaced all three in a line. Read-only: it reports and
+  # suggests, and changes nothing, because the right repair differs per case.
+  "$PY" - <<'PYEOF'
+import sys
+sys.path.insert(0, "api")
+import httpx
+import tenancy
+from config import settings
+from db import q
+
+base = settings.GOWA_URL.rstrip("/")
+auth = (settings.GOWA_USER or "pharmaos", settings.GOWA_PASS)
+try:
+    res = httpx.get(f"{base}/devices", auth=auth, timeout=15).json() or {}
+    slots = {s["id"]: {"jid": s.get("jid") or "", "state": s.get("state") or "?"}
+             for s in (res.get("results") or [])}
+except Exception as e:
+    print(f"WhatsApp gateway unreachable: {e}")
+    sys.exit(1)
+
+rows = q("""select id, name, kind, status, wa_jid, gowa_device_id
+              from pharmacies order by kind, name""")
+by_slot = {r["gowa_device_id"]: r for r in rows if r["gowa_device_id"]}
+
+print("\nGOWA slots")
+for sid, s in slots.items():
+    r = by_slot.get(sid)
+    who = f"{r['name']} ({r['kind']})" if r else "-- no pharmacy row --"
+    print(f"  {sid:22} {s['state']:14} {s['jid'] or '(no jid)':32} {who}")
+
+print("\nPharmacies")
+for r in rows:
+    why = tenancy.why_not_live(str(r["id"]))
+    print(f"  {r['name']:22} {r['kind']:9} {r['status']:19} "
+          f"{'LIVE' if why is None else 'not live'}")
+
+problems = []
+for sid, s in slots.items():
+    r = by_slot.get(sid)
+    if not r:
+        if s["jid"]:
+            problems.append(f"slot {sid} is logged in as {s['jid']} but no pharmacy claims "
+                            f"it — inbound to that number resolves to nothing")
+        continue
+    if s["jid"] and r["wa_jid"] and s["jid"] != r["wa_jid"]:
+        problems.append(f"{r['name']}: slot {sid} holds {s['jid']} but the row says "
+                        f"{r['wa_jid']} — deliver() will refuse every message")
+    if not s["jid"] and r["wa_jid"]:
+        problems.append(f"{r['name']}: row claims {r['wa_jid']} but slot {sid} is "
+                        f"{s['state']} with no session — the handset was logged out. "
+                        f"Fix: ./run.sh unpair {sid}")
+    if s["jid"] and not r["wa_jid"]:
+        problems.append(f"{r['name']}: slot {sid} IS linked ({s['jid']}) but the row has no "
+                        f"wa_jid — it cannot send. Fix: ./run.sh activate, or "
+                        f"./run.sh bind {sid} \"{r['name']}\"")
+    if s["jid"] and r["wa_jid"] == s["jid"] and r["status"] != "active":
+        problems.append(f"{r['name']}: handset linked and JID matches, but status is "
+                        f"{r['status']} — LIVE_SQL fails, so nothing sends. "
+                        f"Fix: ./run.sh bind {sid} \"{r['name']}\"")
+
+for r in rows:
+    if r["gowa_device_id"] and r["gowa_device_id"] not in slots:
+        problems.append(f"{r['name']}: row points at slot {r['gowa_device_id']}, which "
+                        f"does not exist in GOWA")
+
+print("\nDrift")
+if problems:
+    for p in problems:
+        print(f"  ! {p}")
+    sys.exit(1)
+print("  none — every slot and row agree")
 PYEOF
   ;;
 
