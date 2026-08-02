@@ -78,6 +78,30 @@ across twenty pharmacies is twenty rows, so a distributor texting an unbound lin
 twenty candidates and the caller asks. Asking is the correct degraded behaviour; guessing is
 not. Not fixed — recorded so it is not rediscovered at scale.
 
+## Why the bot presents as online
+
+`WHATSAPP_PRESENCE_ON_CONNECT=available`, and it is a deliberate reversal of GOWA's
+anti-ban default.
+
+With `unavailable`, WhatsApp returns **no delivery receipt**, so everyone who messages the
+pharmacy sees a single tick — permanently. The message still arrives over the multi-device
+protocol and the bot still replies within seconds, but the sender's phone says *not
+delivered*. For a shopfront that reads as being ignored. It cost an hour of debugging a
+system that was working correctly, and an owner watching a demo would draw the same wrong
+conclusion.
+
+The cost of `available` is that the account looks online continuously, which is a bot
+signature. What makes it acceptable is Gates 2 and 3: this account can only ever **reply**,
+never open a conversation. Online-and-only-ever-replying is what a busy shop looks like.
+Online-and-initiating is what a broadcaster looks like, and that is the pattern WhatsApp
+restricts.
+
+Related, and observed live: WhatsApp error **463, "reach-out timelock"** — its own
+server-side restriction on starting new chats, which hits *"newly-linked or low-activity
+numbers"* hardest. Its own advice is *"ask the recipient to message you first."* That is
+Gate 3, arrived at independently by WhatsApp. A newly paired line will be refused when it
+tries to open a conversation and will work fine when it replies.
+
 ## The four gates, on every send
 
 Implemented in `api/safety.py`, called from `wa.compose()` before the row is written.

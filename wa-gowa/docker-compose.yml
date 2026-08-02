@@ -64,7 +64,18 @@ services:
       WHATSAPP_AUTO_DOWNLOAD_MEDIA: "true"
       # Leave 'unavailable' so the pharmacy's phone keeps notifying its owner. Setting
       # 'available' marks the account online and silences their handset.
-      WHATSAPP_PRESENCE_ON_CONNECT: unavailable
+      # available, not unavailable. An "unavailable" account does not return a delivery
+      # receipt, so everyone who messages the pharmacy sees ONE TICK forever -- the message
+      # still arrives over the multi-device protocol and the bot still replies, but the
+      # sender's phone says "not delivered". For a shopfront that reads as being ignored,
+      # and it cost an hour of debugging a system that was working correctly.
+      #
+      # The cost is that the account presents as online continuously, which is a bot
+      # signature. What makes that acceptable here is Gates 2 and 3: this account can only
+      # ever REPLY, never open a conversation. Online-and-only-ever-replying is what a busy
+      # shop looks like; online-and-initiating is what a broadcaster looks like, and that is
+      # the pattern WhatsApp restricts.
+      WHATSAPP_PRESENCE_ON_CONNECT: available
       WHATSAPP_AUTO_MARK_READ: "true"
       WHATSAPP_AUTO_REJECT_CALL: "true"
       WHATSAPP_ACCOUNT_VALIDATION: "true"

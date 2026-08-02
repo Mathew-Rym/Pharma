@@ -72,7 +72,7 @@ whatsapp|wa)
       -e WHATSAPP_WEBHOOK_EVENTS=message \
       -e WHATSAPP_WEBHOOK_IGNORE_JIDS=@g.us \
       -e WHATSAPP_AUTO_DOWNLOAD_MEDIA=true \
-      -e WHATSAPP_PRESENCE_ON_CONNECT=unavailable \
+      -e WHATSAPP_PRESENCE_ON_CONNECT=available \
       -e WHATSAPP_AUTO_MARK_READ=true \
       -e WHATSAPP_AUTO_REJECT_CALL=true \
       -e WHATSAPP_ACCOUNT_VALIDATION=true \
