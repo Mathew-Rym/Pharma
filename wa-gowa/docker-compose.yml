@@ -24,6 +24,15 @@ services:
       # 3001 on purpose: wa-gateway/ already uses 3000, so both can coexist while
       # you compare them.
       - "3001:3000"
+    # Explicit resolvers, for the same reason run.sh passes --dns. A host running
+    # systemd-resolved keeps its stub on 127.0.0.53, which Docker cannot give a container,
+    # so it substitutes the upstream it can see -- on a phone hotspot that is the gateway,
+    # which does not answer DNS from Docker's network. The container then cannot resolve
+    # web.whatsapp.com, and the only visible symptom is "couldn't link device" on the
+    # handset while every endpoint here looks healthy.
+    dns:
+      - 1.1.1.1
+      - 8.8.8.8
     environment:
       APP_PORT: 3000
       APP_DEBUG: "false"

@@ -34,6 +34,20 @@ whatsapp|wa)
   # than a missing dependency, and localhost:3001 just never comes up. So: use compose
   # when it exists, otherwise run the same container directly. Same result either way,
   # no extra install.
+  #
+  # --dns is not optional. This host runs systemd-resolved, whose stub lives on 127.0.0.53,
+  # and Docker cannot hand a loopback address to a container -- loopback inside a container
+  # is the container. So Docker substitutes the upstream it can see, which on a phone
+  # hotspot is the gateway (192.168.137.1) and does not answer DNS from Docker's network.
+  # The container then cannot resolve web.whatsapp.com at all.
+  #
+  # The symptom is nothing like the cause: GOWA still starts, /devices still lists slots,
+  # a previously linked slot still reports state=logged_in from stored session data, and
+  # ./run.sh qr returns AUTHENTICATION_ERROR "reconnect error" -- while the phone, having
+  # been shown a QR that could never complete a handshake, just says "couldn't link
+  # device". Hours can go into the QR before anyone looks at DNS.
+  #
+  # Override with GOWA_DNS in .env on a network that blocks public resolvers.
   : "${GOWA_PASS:?set GOWA_PASS in .env}"
   : "${GOWA_WEBHOOK_SECRET:?set GOWA_WEBHOOK_SECRET in .env}"
 
@@ -47,6 +61,7 @@ whatsapp|wa)
     docker run -d --name pharmaos-gowa --restart unless-stopped \
       -p 3001:3000 \
       --add-host host.docker.internal:host-gateway \
+      --dns "${GOWA_DNS:-1.1.1.1}" --dns 8.8.8.8 \
       -v gowa-storage:/app/storages \
       -e APP_PORT=3000 \
       -e APP_DEBUG=false \
