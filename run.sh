@@ -86,6 +86,9 @@ whatsapp|wa)
 qr)
   # Pair a WhatsApp number, entirely from the terminal.
   #
+  # Takes an explicit slot: ./run.sh qr [slot-name]. Defaults to GOWA_DEVICE_ID only when
+  # omitted, and never touches a slot other than the one named.
+  #
   # GOWA v9 no longer bundles its web dashboard -- it downloads it from GitHub at
   # startup, and that download fails with 403 behind many networks, which is why
   # http://localhost:3001 can look dead while the API is perfectly healthy. So we do
@@ -94,7 +97,7 @@ qr)
   # From v8 it is multi-device: you must CREATE a device slot first, then request the
   # QR scoped to it. `GET /app/login` with no device returns DEVICE_ID_REQUIRED.
   : "${GOWA_PASS:?set GOWA_PASS in .env}"
-  "$PY" - <<'PYEOF'
+  QR_SLOT="${2:-}" "$PY" - <<'PYEOF'
 import sys, time
 from pathlib import Path
 sys.path.insert(0, "api")
@@ -151,16 +154,38 @@ except Exception as e:
     print(f"GOWA not reachable at {base}: {e}\nStart it with: ./run.sh whatsapp")
     sys.exit(1)
 
-connected = [d for d in devs if paired(d)]
-if connected:
-    print("Already paired:")
-    for d in connected:
-        print(f"   {d.get('device_id') or d.get('jid')}  {d.get('push_name') or ''}")
-    print("\nSet GOWA_DEVICE_ID in .env to that id if it is not already.")
-    print("To pair a different number: ./run.sh unpair, then ./run.sh qr")
+# WHICH SLOT. Previously this was GOWA_DEVICE_ID or the first slot found, with no way to
+# say. Two consequences, both bad once a second pharmacy exists:
+#
+#   * GOWA_DEVICE_ID is pharmacy-1, the PLATFORM line. A QR requested against it and then
+#     scanned on a different handset REPLACES the only working session in the system.
+#   * the already-paired check below looked at EVERY slot, so with the platform line linked
+#     it printed "Already paired" and exited -- making it impossible to pair a second
+#     handset at all, and advising `./run.sh unpair` first, which would have logged out
+#     that same platform line.
+#
+# So the slot is now an explicit argument, and everything below is scoped to it.
+import os
+dev_id = os.environ.get("QR_SLOT") or settings.GOWA_DEVICE_ID or (
+    devs[0].get("device_id") if devs else None)
+
+mine = [d for d in devs if (d.get("device_id") == dev_id) and paired(d)]
+if mine:
+    print(f"Slot {dev_id} is already paired:")
+    for d in mine:
+        print(f"   {d.get('jid') or d.get('device_id')}  {d.get('push_name') or ''}")
+    print(f"\nTo pair a DIFFERENT handset, use a different slot:")
+    print(f"   ./run.sh qr <new-slot-name>")
+    print(f"To replace the handset on THIS slot, unpair it first:")
+    print(f"   ./run.sh unpair {dev_id}")
     sys.exit(0)
 
-dev_id = settings.GOWA_DEVICE_ID or (devs[0].get("device_id") if devs else None)
+others = [d for d in devs if paired(d) and d.get("device_id") != dev_id]
+if others:
+    print("Already linked elsewhere (left alone):")
+    for d in others:
+        print(f"   {d.get('device_id')}  {d.get('jid') or ''}")
+    print()
 if dev_id and not any(d.get("device_id") == dev_id for d in devs):
     # GOWA_DEVICE_ID names a slot that no longer exists (a `docker rm` without the
     # volume, or an unpair that dropped it). Requesting a QR against it just returns
