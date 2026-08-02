@@ -78,29 +78,72 @@ across twenty pharmacies is twenty rows, so a distributor texting an unbound lin
 twenty candidates and the caller asks. Asking is the correct degraded behaviour; guessing is
 not. Not fixed — recorded so it is not rediscovered at scale.
 
-## Why the bot presents as online
+## The single grey tick — SUSPECTED cause, not established
 
-`WHATSAPP_PRESENCE_ON_CONNECT=available`, and it is a deliberate reversal of GOWA's
-anti-ban default.
+Senders see one grey tick and it never advances. The message does arrive: the bot receives
+it over the multi-device protocol and replies within seconds, with the reply recorded
+`status='sent'`.
 
-With `unavailable`, WhatsApp returns **no delivery receipt**, so everyone who messages the
-pharmacy sees a single tick — permanently. The message still arrives over the multi-device
-protocol and the bot still replies within seconds, but the sender's phone says *not
-delivered*. For a shopfront that reads as being ignored. It cost an hour of debugging a
-system that was working correctly, and an owner watching a demo would draw the same wrong
-conclusion.
+**Hypothesis, untested:** `WHATSAPP_PRESENCE_ON_CONNECT=unavailable` (what the container
+actually runs today) means the account presents as offline, and an offline account returns
+no delivery receipt.
 
-The cost of `available` is that the account looks online continuously, which is a bot
-signature. What makes it acceptable is Gates 2 and 3: this account can only ever **reply**,
-never open a conversation. Online-and-only-ever-replying is what a busy shop looks like.
-Online-and-initiating is what a broadcaster looks like, and that is the pattern WhatsApp
-restricts.
+**The evidence is one correlation**, and it is thin:
 
-Related, and observed live: WhatsApp error **463, "reach-out timelock"** — its own
-server-side restriction on starting new chats, which hits *"newly-linked or low-activity
-numbers"* hardest. Its own advice is *"ask the recipient to message you first."* That is
-Gate 3, arrived at independently by WhatsApp. A newly paired line will be refused when it
-tries to open a conversation and will work fine when it replies.
+```text
+11:06:49  [PRESENCE_PULSE] marked pharmacy-1 as unavailable
+11:07:13  a real inbound arrives, 24 seconds later — one tick
+```
+
+**What does not fit:** `WHATSAPP_AUTO_MARK_READ=true` is also set. If receipts were flowing
+at all we would expect *blue* ticks, not double. A single grey tick means no receipt of any
+kind is being sent — consistent with the presence theory, and equally consistent with
+something else being wrong. Nobody has isolated it.
+
+`run.sh` and `docker-compose.yml` have been changed to `available`, but **that change is not
+in effect** — it needs the container recreated, and recreating it is currently the last
+thing worth doing (see below). Do not read this section as describing running behaviour.
+
+Cheapest next test, if GOWA exposes presence at runtime rather than only at connect:
+
+```bash
+curl -s -u "$GOWA_USER:$GOWA_PASS" -H "X-Device-Id: pharmacy-1" \
+  -X POST http://localhost:3001/send/presence -d '{"type":"available"}'
+```
+
+Ten seconds, no restart, no re-pairing. If that endpoint does not exist, the question waits
+until the container is restarted for some other reason.
+
+## Re-pairing is not free
+
+WhatsApp error **463, "reach-out timelock"** — its own server-side restriction on starting
+new chats — says in its own text that *"newly-linked or low-activity numbers are affected
+most"*, and advises *"ask the recipient to message you first."* That is Gate 3, arrived at
+independently by WhatsApp.
+
+On 2 August 254777602338 was paired, remote-logged-out, and re-paired within one hour. Then
+an agent test-send to a **fabricated** number triggered 463, and the device was logged out
+one second later:
+
+```text
+11:07:54  WhatsApp rejected this send with error 463 (reach-out timelock)
+11:07:55  [REMOTE_LOGOUT] Received LoggedOut event for device pharmacy-1
+```
+
+The account was then blocked for five hours.
+
+Two rules follow, and they are not stylistic:
+
+* **Never send to a number that has not messaged first.** Not a real one, and especially not
+  an invented one — messaging numbers that do not exist is the clearest spam signal there
+  is. The gates enforce this; do not hand-craft webhooks that route around them.
+* **Treat every link event as expensive.** Each pair/unpair cycle raises the profile of a
+  number that WhatsApp already considers new. Do not recreate the container to change a
+  setting unless the setting is worth the pairing.
+
+`WA_ALLOWLIST` is the mechanical backstop for the first rule: with it set, Gate 1 refuses
+every recipient not named, before anything reaches GOWA. Keep it set during development and
+clear it only when serving real customers.
 
 ## The four gates, on every send
 
