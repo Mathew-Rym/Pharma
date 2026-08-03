@@ -139,6 +139,11 @@ def _dispatch(phone: str, msg: dict, resolved_pid: str) -> None:
         "select * from staff where phone=%s and pharmacy_id=%s and is_active",
         (phone, resolved_pid),
     )
+    supplier = q1(
+        "select * from suppliers where phone=%s and pharmacy_id=%s",
+        (phone, resolved_pid),
+    ) if not staff else None
+
     try:
         # Unsupported media stops here, before either branch. _handle_staff sends any image
         # to grn.add_page and _handle_customer sends any image to the prescription
@@ -148,6 +153,8 @@ def _dispatch(phone: str, msg: dict, resolved_pid: str) -> None:
             _refuse_unsupported_media(phone, msg["unsupported_media"])
         elif staff:
             _handle_staff(phone, staff, msg, text)
+        elif supplier:
+            _handle_supplier(phone, supplier, msg, text)
         else:
             _handle_customer(phone, msg, text)
     except Exception as e:
@@ -166,7 +173,6 @@ _MEDIA_REFUSALS = {
     "ptt":   "I can't listen to voice notes yet",
     "video": "I can't watch videos",
     "sticker": "I can't read stickers",
-    "document": "I can't open documents yet",
 }
 
 
@@ -187,9 +193,21 @@ def _refuse_unsupported_media(phone: str, kind: str) -> None:
 # ------------------------------------------------------------------ staff branch
 def _handle_staff(phone: str, staff: dict, msg: dict, text: str) -> None:
     import grn
+    import distributor
 
     st = get_state(phone)
     up = text.upper()
+
+    # --- CSV / Excel stock sheets from a distributor or admin staff
+    if msg.get("type") == "document" and msg.get("media_path"):
+        distributor.process_stock_sheet(
+            phone,
+            str(staff["pharmacy_id"]),
+            msg["media_path"],
+            msg.get("media_bucket", ""),
+            msg.get("doc_ext", "csv"),
+        )
+        return
 
     # --- RECEIVE declares intent, so a photo is never a guess.
     #
@@ -420,6 +438,23 @@ def _guard(phone: str, staff: dict, tool: str, args: dict, reply: bool = True) -
         reply_text(phone, out)
 
 
+# ------------------------------------------------------------ supplier branch
+def _handle_supplier(phone: str, supplier: dict, msg: dict, text: str) -> None:
+    import distributor
+
+    if msg.get("type") == "document" and msg.get("media_path"):
+        distributor.process_stock_sheet(
+            phone,
+            str(supplier["pharmacy_id"]),
+            msg["media_path"],
+            msg.get("media_bucket", ""),
+            msg.get("doc_ext", "csv"),
+        )
+        return
+        
+    reply_text(phone, "Please send stock update files as CSV or Excel documents.")
+
+
 # ------------------------------------------------------------ customer branch
 def _handle_customer(phone: str, msg: dict, text: str) -> None:
     import rx
@@ -427,6 +462,12 @@ def _handle_customer(phone: str, msg: dict, text: str) -> None:
     st = get_state(phone)
     up = text.upper()
     cust = rx.get_or_create_customer(phone)
+
+    # Documents from customers: tell them to text instead
+    if msg.get("type") == "document":
+        reply_text(phone, "Please send your request as a text message. "
+                         "For a prescription, send a photo.")
+        return
 
     if up == "DELETE":
         rx.delete_my_data(phone)

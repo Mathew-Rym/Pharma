@@ -181,9 +181,10 @@ async def webhook_media(background: BackgroundTasks,
 # detection, narrow action.
 _MEDIA_KINDS = ("image", "document", "video", "audio", "voice", "ptt", "sticker")
 
-# What the pharmacy can actually process. A photo of an invoice or a prescription is the
-# entire media story; nothing else has a handler.
-_ACTIONABLE_MEDIA = ("image",)
+# What the pharmacy can actually process. Photos and documents (CSV/Excel stock files).
+_ACTIONABLE_MEDIA = ("image", "document")
+
+_CSV_EXTS = ("csv", "xls", "xlsx")
 
 
 def _gowa_media_path(payload: dict) -> tuple[str, str] | None:
@@ -292,17 +293,38 @@ async def webhook_gowa(request: Request, background: BackgroundTasks,
                 return {"ok": True, "ignored": "unknown device"}
             staff = q1("""select id from staff where phone=%s and pharmacy_id=%s
                            and is_active""", (phone, media_tenant))
-            bucket = settings.BUCKET_INVOICES if staff else settings.BUCKET_RX
             ext = str(rel).rsplit(".", 1)[-1].lower().split("?")[0]
-            if ext not in ("jpg", "jpeg", "png", "webp", "pdf"):
-                ext = "jpg"
-            path = f"{datetime.utcnow():%Y/%m}/{phone}/{uuid.uuid4().hex[:10]}.{ext}"
-            upload(bucket, path, data,
-                   "application/pdf" if ext == "pdf" else "image/jpeg")
-            log.info("gowa media stored bucket=%s path=%s bytes=%s",
-                     bucket, path, len(data))
-            inbound.update({"type": "image", "media_bucket": bucket,
-                            "media_path": path})
+            is_doc = kind == "document" or ext in _CSV_EXTS
+            if is_doc:
+                # Documents always go to the invoices bucket regardless of staff/customer.
+                # A distributor sending a stock CSV is never staff but the file belongs
+                # in the same store as GRN invoices.
+                bucket = settings.BUCKET_INVOICES
+                if ext not in _CSV_EXTS and ext not in ("pdf",):
+                    ext = "csv"  # safe fallback: we'll parse it as text anyway
+                mime = {
+                    "csv": "text/csv",
+                    "xls": "application/vnd.ms-excel",
+                    "xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    "pdf": "application/pdf",
+                }.get(ext, "application/octet-stream")
+                path = f"{datetime.utcnow():%Y/%m}/{phone}/{uuid.uuid4().hex[:10]}.{ext}"
+                upload(bucket, path, data, mime)
+                log.info("gowa document stored bucket=%s path=%s bytes=%s ext=%s",
+                         bucket, path, len(data), ext)
+                inbound.update({"type": "document", "media_bucket": bucket,
+                                "media_path": path, "doc_ext": ext})
+            else:
+                bucket = settings.BUCKET_INVOICES if staff else settings.BUCKET_RX
+                if ext not in ("jpg", "jpeg", "png", "webp", "pdf"):
+                    ext = "jpg"
+                path = f"{datetime.utcnow():%Y/%m}/{phone}/{uuid.uuid4().hex[:10]}.{ext}"
+                upload(bucket, path, data,
+                       "application/pdf" if ext == "pdf" else "image/jpeg")
+                log.info("gowa media stored bucket=%s path=%s bytes=%s",
+                         bucket, path, len(data))
+                inbound.update({"type": "image", "media_bucket": bucket,
+                                "media_path": path})
         else:
             log.warning("gowa media %s could not be retrieved; treating as text", rel)
 
