@@ -114,6 +114,42 @@ curl -s -u "$GOWA_USER:$GOWA_PASS" -H "X-Device-Id: pharmacy-1" \
 Ten seconds, no restart, no re-pairing. If that endpoint does not exist, the question waits
 until the container is restarted for some other reason.
 
+## One slot per pharmacy, created at runtime
+
+`register` derives a slot name from the handset number — `ph-<digits>` — and creates it on
+demand. The platform slot is never reused. Fifty pharmacies means fifty slots on one
+container, which is the whole reason one platform line can onboard all of them.
+
+**Confirmed working.** An earlier commit message called it a KNOWN LIMITATION, saying a
+runtime-created slot could not be paired because `/app/login` returned
+`AUTHENTICATION_ERROR: reconnect error`. That was a misreading: the slot was fine, the
+container could not resolve `web.whatsapp.com`. After the DNS fix the same slot returned
+`SUCCESS` with a real `qr_link`.
+
+**`reconnect error` means no route to WhatsApp, not a bad slot.** First check:
+
+```bash
+docker logs pharmaos-gowa | grep "i/o timeout"
+```
+
+## Sessions are not lost by restarting
+
+They live in the `gowa-storage` volume at `/app/storages/whatsapp.db` (with `-wal`/`-shm`).
+`docker stop` / `docker start` cannot lose a pairing, and neither can a full recreate — GOWA
+logged `auto-connected device pharmacy-1` immediately after a `docker rm` + `docker run`.
+
+What looks identical from outside, and is not:
+
+```text
+10:55:52.033  auto-connected device pharmacy-1     ← restored from disk
+10:55:52.655  [REMOTE_LOGOUT] 254777602338:2       ← invalidated server-side, 622ms later
+```
+
+Both losses on 2 August were WhatsApp invalidating the session, not disk loss. Only deleting
+the volume loses a pairing locally. That distinction decides whether the model scales: disk
+loss would cap it at one or two pharmacies, server-side invalidation is an operational
+problem — stable DNS, no unnecessary link events, never a cold send.
+
 ## Re-pairing is not free
 
 WhatsApp error **463, "reach-out timelock"** — its own server-side restriction on starting

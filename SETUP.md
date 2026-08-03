@@ -140,6 +140,46 @@ receive a thing. That state is deliberate and visible rather than looking like a
 registered — that means somebody else typed the code, and binding it would hand a stranger
 the pharmacy's conversations.
 
+### Runtime slot creation works — and this is what makes it scale
+
+Each registering pharmacy gets its **own** GOWA slot, created on the fly, named
+`ph-<digits>` from the handset number. `pharmacy-1` is never reused. That is the whole basis
+for onboarding fifty pharmacies from one platform line, so it is worth being clear that it
+is confirmed working: after the DNS fix, `POST /app/login` against a slot created minutes
+earlier returned `SUCCESS` with a real `qr_link`, and a subsequent scan put a JID on it.
+
+An earlier commit message recorded this as a KNOWN LIMITATION — *"pairing a runtime-created
+slot fails with `AUTHENTICATION_ERROR: reconnect error`"*. **That was wrong**, and it read as
+"the model does not scale". The slot was fine; the container could not resolve
+`web.whatsapp.com` at all. `reconnect error` means **no route to WhatsApp**, not a bad slot.
+
+So when pairing fails with that message, check connectivity first — it is a one-liner:
+
+```bash
+docker logs pharmaos-gowa | grep "i/o timeout"
+```
+
+Any hits mean DNS. See the `--dns` flags in `run.sh` and `wa-gowa/docker-compose.yml`.
+
+### Sessions survive a restart
+
+Sessions live in the `gowa-storage` volume at `/app/storages/whatsapp.db`. **`docker stop`
+then `docker start` cannot lose a pairing** — the files never move. Neither does a full
+`docker rm` + `docker run`: on 2 August GOWA logged `auto-connected device pharmacy-1` after
+exactly that, which is the session loading from disk.
+
+An earlier note claimed a recreate *had* lost the session. It had not. The millisecond log
+shows why the two look identical from outside:
+
+```text
+10:55:52.033  auto-connected device pharmacy-1        ← loaded from disk
+10:55:52.655  [REMOTE_LOGOUT] 254777602338:2          ← WhatsApp invalidated it, 622ms later
+```
+
+The session was restored and then killed server-side. Only deleting the volume loses a
+pairing locally; everything else is WhatsApp's decision. See RUNBOOK.md for the backup
+procedure and its caveats.
+
 ### The platform line
 
 Onboarding means messaging people with no history, which is exactly the pattern WhatsApp
