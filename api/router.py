@@ -13,7 +13,7 @@ from db import ex, q, q1
 from llm import chat
 from reports import TOOLS, denial_message, may_use, run_tool, tools_for
 from safety import record_inbound
-from state import clear_state, get_state
+from state import clear_state, get_state, set_state
 from utils import norm_phone
 from wa import reply_text
 
@@ -191,16 +191,42 @@ def _handle_staff(phone: str, staff: dict, msg: dict, text: str) -> None:
     st = get_state(phone)
     up = text.upper()
 
-    # --- images always mean "receiving a delivery" for staff.
-    # Which KIND of photo depends on where we are: mid-receiving, after the invoice has
-    # been read, a photo is the goods being counted rather than another invoice page.
-    # Getting this order wrong would file a photo of the delivery as invoice page 3 and
-    # send it to the extractor.
+    # --- RECEIVE declares intent, so a photo is never a guess.
+    #
+    # Every staff image used to become an invoice page unconditionally. That gave a
+    # pharmacist photographing a walk-in's prescription no way to say so: it was extracted
+    # as a supplier invoice, and if the extractor found line-shaped text it would move
+    # stock. There is no undo for that, and nothing in the reply would look wrong.
+    #
+    # Deterministic keyword, no model. Intent in a privilege-adjacent path must not depend
+    # on a classifier being right, for the same reason register.py is a pure function.
+    if up in ("RECEIVE", "RECEIVING"):
+        clear_state(phone)
+        set_state(phone, "grn_collect", {"pages": []})
+        reply_text(phone, "Receiving a delivery. Send photos of the supplier invoice — "
+                          "all pages — then reply *DONE*.\n\n"
+                          "Reply *CANCEL* to stop.")
+        return
+
     if msg.get("type") == "image" and msg.get("media_path"):
+        # Which KIND of photo depends on where we are: after the invoice has been read, a
+        # photo is the goods being counted rather than another invoice page. Getting this
+        # order wrong would file a photo of the delivery as invoice page 3.
         if st["flow"] == "grn_goods":
             grn.add_goods_photo(phone, msg["media_path"])
-        else:
+            return
+        if st["flow"] == "grn_collect":
             grn.add_page(phone, msg["media_path"])
+            return
+        # No active flow: ASK. The two things a staff photo can be are a supplier invoice
+        # and a customer's prescription, and they move in opposite directions -- one adds
+        # stock, the other dispenses it. Assuming was the bug.
+        reply_text(phone, "What is this photo?\n\n"
+                          "• Reply *RECEIVE* if it's a supplier invoice — I'll take the "
+                          "pages and add the stock\n"
+                          "• For a customer's prescription, have the customer send it to "
+                          "this number themselves so it's linked to them\n\n"
+                          "I haven't filed it anywhere yet.")
         return
 
     if up == "HELP":
@@ -342,6 +368,7 @@ def _handle_staff(phone: str, staff: dict, msg: dict, text: str) -> None:
 # STAFF_COMMANDS exactly, so a command added to one and not the other fails the build --
 # which is the check that would have caught PO sitting ungated behind a help entry.
 _HELP_LINES: list[tuple[str, str]] = [
+    ("receive_goods",           "• *RECEIVE* — then send invoice photos, then *DONE*"),
     ("get_stock",               "• *LOW* — what is below reorder level"),
     ("get_stock",               "• *do we have amoxil* — stock check"),
     ("find_supplier",           "• *who supplies prenor* — supplier contact"),

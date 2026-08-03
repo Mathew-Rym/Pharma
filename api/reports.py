@@ -660,6 +660,7 @@ _EXTRA_CAPS = {
     "pc_sync",       # SYNC    — ask the shop PC to refresh; no sensitive output
     "pc_status",     # PC      — is the shop PC online; status only
     "pc_probe",      # PROBE   — scans the shop PC for its database; infrastructure
+    "receive_goods", # RECEIVE — start an invoice intake; an attendant's core job
 }
 
 # find_supplier is at ATTENDANT deliberately, and was moved down from manager. The problem
@@ -668,7 +669,7 @@ _EXTRA_CAPS = {
 # find someone. Gating a phone number behind manager recreates exactly that. Procurement
 # DECISIONS are manager-level (draft_po, get_reorder_suggestions); a phone number is not a
 # decision.
-_ATTENDANT = {"get_stock", "find_supplier", "pc_sync", "pc_status"}
+_ATTENDANT = {"get_stock", "find_supplier", "pc_sync", "pc_status", "receive_goods"}
 _PHARMACIST = _ATTENDANT | {"get_expiry_risk"}
 _MANAGER = _PHARMACIST | {"get_sales_summary", "get_top_products",
                           "get_reorder_suggestions", "generate_report_pdf",
@@ -696,6 +697,7 @@ STAFF_COMMANDS: dict[str, str] = {
     "SYNC": "pc_sync",
     "PC": "pc_status",
     "PROBE": "pc_probe",
+    "RECEIVE": "receive_goods",
 }
 
 
