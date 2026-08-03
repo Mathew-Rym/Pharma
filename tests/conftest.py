@@ -92,10 +92,40 @@ def _create_throwaway() -> str | None:
         return None
 
 
+def _sweep_abandoned() -> None:
+    """Remove PYTEST pharmacies left by a run that was killed.
+
+    A session-scoped finalizer cannot run if pytest is SIGKILLed or times out, so an
+    interrupted run leaks its pharmacy -- two were found after two interrupted runs against
+    the live database. Left alone they accumulate, and a stray tenant row is not inert: it
+    is selected by for_every_tenant and counted by /health.
+
+    Only rows older than an hour, so a concurrently running suite is never deleted out from
+    under itself.
+    """
+    dsn = os.getenv("DATABASE_URL")
+    if not dsn:
+        return
+    try:
+        import psycopg
+        with psycopg.connect(dsn, connect_timeout=20, prepare_threshold=None) as conn:
+            with conn.cursor() as cur:
+                cur.execute("""select id from pharmacies
+                                where name like 'PYTEST-%'
+                                  and created_at < now() - interval '1 hour'""")
+                stale = [str(r[0]) for r in cur.fetchall()]
+        for pid in stale:
+            print(f"conftest: sweeping abandoned test pharmacy {pid}", file=sys.stderr)
+            _teardown(pid)
+    except Exception as e:
+        print(f"conftest: sweep skipped ({e})", file=sys.stderr)
+
+
 if not os.getenv("PHARMACY_ID"):
     _OWNED_PHARMACY = _create_throwaway()
     if _OWNED_PHARMACY:
         os.environ["PHARMACY_ID"] = _OWNED_PHARMACY
+        _sweep_abandoned()
 
 
 # ---------------------------------------------------------------- external dependencies
