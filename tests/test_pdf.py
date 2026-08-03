@@ -10,6 +10,8 @@ import sys
 
 import pytest
 
+from conftest import needs_supabase
+
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "api"))
 
 
@@ -65,6 +67,7 @@ db = pytest.mark.skipif(not DB, reason="DATABASE_URL/PHARMACY_ID not set")
 
 
 @db
+@needs_supabase
 def test_report_pdf_builds():
     """REGRESSION: this raised before the sanitiser existed."""
     from reports import build_report_pdf
@@ -74,6 +77,7 @@ def test_report_pdf_builds():
 
 
 @db
+@needs_supabase
 def test_po_pdf_carries_letterhead_and_withholds_internal_rationale():
     """A wholesaler needs a reference, a licence and a callback number. It must NOT
     receive po_lines.rationale -- that is the pharmacy's demand data and negotiating
@@ -137,6 +141,7 @@ def test_po_pdf_carries_letterhead_and_withholds_internal_rationale():
 
 
 @db
+@needs_supabase
 def test_unapproved_po_is_stamped_draft():
     """A PDF that looks authorised but is not would let an unapproved order be
     forwarded to a supplier."""

@@ -10,6 +10,8 @@ import sys
 
 import pytest
 
+from conftest import needs_supabase
+
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "api"))
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "dashboard"))
 
@@ -206,6 +208,7 @@ def test_a_staff_member_who_never_texted_the_bot_gets_no_code(monkeypatch):
 
 # ============================================================ identity linking
 @db
+@needs_supabase
 def test_signing_in_links_a_permanent_identity(person):
     """auth.users is what survives a phone change. Without the link, a new SIM means a
     new person as far as the system is concerned."""
