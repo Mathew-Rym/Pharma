@@ -140,7 +140,13 @@ def _dispatch(phone: str, msg: dict, resolved_pid: str) -> None:
         (phone, resolved_pid),
     )
     try:
-        if staff:
+        # Unsupported media stops here, before either branch. _handle_staff sends any image
+        # to grn.add_page and _handle_customer sends any image to the prescription
+        # extractor, so a voice note reaching either is the failure this guard exists for.
+        # The row above already recorded its TRUE msg_type and media_path.
+        if msg.get("unsupported_media"):
+            _refuse_unsupported_media(phone, msg["unsupported_media"])
+        elif staff:
             _handle_staff(phone, staff, msg, text)
         else:
             _handle_customer(phone, msg, text)
@@ -152,6 +158,30 @@ def _dispatch(phone: str, msg: dict, resolved_pid: str) -> None:
            (f"{type(e).__name__}: {e}"[:500], msg.get("wa_id")))
     finally:
         ex("update wa_messages set handled=true where wa_id=%s", (msg.get("wa_id"),))
+
+
+_MEDIA_REFUSALS = {
+    "audio": "I can't listen to voice notes yet",
+    "voice": "I can't listen to voice notes yet",
+    "ptt":   "I can't listen to voice notes yet",
+    "video": "I can't watch videos",
+    "sticker": "I can't read stickers",
+    "document": "I can't open documents yet",
+}
+
+
+def _refuse_unsupported_media(phone: str, kind: str) -> None:
+    """Say so once, and say what WILL work.
+
+    Silence would be worse than the old behaviour in one respect: the sender would keep
+    resending. Naming the alternative -- text, or a photo -- is what turns a refusal into an
+    instruction. One message per inbound, and inbound is deduplicated by wa_id, so a
+    re-delivered message cannot produce a second refusal.
+    """
+    what = _MEDIA_REFUSALS.get(kind, f"I can't handle {kind} messages")
+    log.info("refused unsupported media (%s) from %s", kind, phone)
+    reply_text(phone, f"{what}. Please send it as *text*, or as a *photo* if it's a "
+                      f"prescription or an invoice.")
 
 
 # ------------------------------------------------------------------ staff branch

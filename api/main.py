@@ -169,6 +169,23 @@ async def webhook_media(background: BackgroundTasks,
 
 
 # ============================================================ GOWA webhook
+#
+# Kinds we look for on an inbound payload. Only IMAGE is something this system can act on;
+# everything else is detected so it can be REFUSED deliberately rather than misread.
+#
+# 'voice' and 'ptt' are here without confirmation. The GOWA binary contains the bare strings
+# `voice`/`Voice`/`VOICE` and json tags `json:"audio"` / `json:"ptt"` -- but those tags are
+# on its SEND request structs, not on the inbound webhook payload, so the key a real voice
+# note arrives under is still unverified. Detecting a key that never appears costs nothing;
+# failing to detect one means a voice note falls through as an empty text message. Broad
+# detection, narrow action.
+_MEDIA_KINDS = ("image", "document", "video", "audio", "voice", "ptt", "sticker")
+
+# What the pharmacy can actually process. A photo of an invoice or a prescription is the
+# entire media story; nothing else has a handler.
+_ACTIONABLE_MEDIA = ("image",)
+
+
 def _gowa_media_path(payload: dict) -> tuple[str, str] | None:
     """Return (kind, relative_path) for the first media field GOWA sent, else None.
 
@@ -177,7 +194,7 @@ def _gowa_media_path(payload: dict) -> tuple[str, str] | None:
     {"path": ..., "caption": ...}; with auto-download off it is {"url": ...}. Handle
     all three rather than assuming one.
     """
-    for kind in ("image", "document", "video", "audio", "sticker"):
+    for kind in _MEDIA_KINDS:
         v = payload.get(kind)
         if not v:
             continue
@@ -235,6 +252,23 @@ async def webhook_gowa(request: Request, background: BackgroundTasks,
     }
 
     media = _gowa_media_path(payload)
+
+    # Refuse non-image media BEFORE fetching or storing a byte of it.
+    #
+    # The previous code computed `kind` correctly and then threw it away: the extension was
+    # forced to .jpg for anything outside jpg/jpeg/png/webp/pdf, the upload was tagged
+    # image/jpeg, and inbound["type"] was hardcoded "image". So a voice note was downloaded,
+    # written into the PRESCRIPTIONS bucket as a fake JPEG, and handed to _handle_customer
+    # -- which sends any image to the prescription vision extractor. For staff it became a
+    # GRN invoice page. A spoken message parsed as a prescription is the worst failure this
+    # system can produce, and it was three lines of hardcoding away.
+    if media and media[0] not in _ACTIONABLE_MEDIA:
+        kind, rel = media
+        log.info("refusing %s from %s: not an actionable media type", kind, phone)
+        inbound.update({"type": kind, "media_path": str(rel), "unsupported_media": kind})
+        background.add_task(handle_inbound, inbound)
+        return {"ok": True, "unsupported": kind}
+
     if media:
         kind, rel = media
         from wa import gowa_fetch_media
