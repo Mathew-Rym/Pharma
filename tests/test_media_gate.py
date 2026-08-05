@@ -50,23 +50,42 @@ def test_all_three_gowa_shapes_are_understood_for_audio(shape):
     assert kind == "audio" and path
 
 
-def test_only_image_is_actionable():
-    """The allow-list is what the pharmacy can genuinely process. Everything else is
-    refused rather than guessed at."""
+def test_no_audio_kind_is_ever_actionable():
+    """The property that matters, stated so it survives the allow-list growing.
+
+    This originally asserted _ACTIONABLE_MEDIA == ("image",). d7cacae then added
+    "document" on purpose, so distributors can send stock CSVs -- a real capability with a
+    real handler behind it. Pinning the exact tuple made a legitimate product change look
+    like a regression.
+
+    What must never change is that nothing audio-shaped is actionable. An actionable kind
+    is fetched, stored and routed to rx or grn; a voice note down that path becomes a
+    prescription or an invoice page.
+    """
     import main
-    assert main._ACTIONABLE_MEDIA == ("image",)
-    assert "audio" not in main._ACTIONABLE_MEDIA
-    assert "document" not in main._ACTIONABLE_MEDIA
+    for kind in ("audio", "voice", "ptt", "video", "sticker"):
+        assert kind not in main._ACTIONABLE_MEDIA, (
+            f"{kind} became actionable -- it would reach rx or grn")
+
+
+def test_actionable_kinds_all_have_a_handler():
+    """Anything on the allow-list is fetched and routed, so each entry needs somewhere to
+    go. image -> grn.add_page / rx.receive_prescription; document -> the CSV path added in
+    d7cacae. An entry with no handler is silently dropped media."""
+    import main
+    assert set(main._ACTIONABLE_MEDIA) <= {"image", "document"}
+    assert "image" in main._ACTIONABLE_MEDIA
 
 
 def test_document_is_returned_by_the_detector_and_not_silently_dropped():
-    """test_gowa asserts _gowa_media_path returns ('document', path). Verify the CALLER
-    honours it rather than discarding it -- previously the caller ignored `kind` entirely,
-    so a document was stored as a .jpg and sent to the vision extractor."""
+    """test_gowa asserts _gowa_media_path returns ('document', path). The caller previously
+    ignored `kind` entirely, so a document was stored as a .jpg and sent to the vision
+    extractor. It is now handled deliberately -- d7cacae routes CSV/Excel stock files from
+    distributors to the invoices bucket -- rather than mangled."""
     import main
     assert main._gowa_media_path({"document": "invoice.pdf"}) == ("document", "invoice.pdf")
-    assert "document" not in main._ACTIONABLE_MEDIA, (
-        "a document reaching the image path becomes a fake JPEG in the prescriptions bucket")
+    assert "document" in main._ACTIONABLE_MEDIA, (
+        "documents must be handled explicitly, not fall through to the refusal path")
 
 
 # ============================================================ routing

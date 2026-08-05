@@ -492,6 +492,30 @@ def handle_review(phone: str, staff: dict, text: str) -> None:
                                  "More corrections, or reply *OK*.")
                 return
 
+    # Checked before the per-line parser, since "ALL NEW" does not start with a digit and
+    # would otherwise fall through to the "I did not understand that" branch.
+    if _is_all_new(t):
+        created = _link_all_unmatched(grn_id)
+        still = q("""select line_no from grn_lines where grn_id=%s and product_id is null
+                      order by line_no""", (grn_id,))
+        if not created and not still:
+            reply_text(phone, "Every line is already linked to a product. Reply *OK* to "
+                             "receive into stock.")
+            return
+        msg = (f"Added {len(created)} product(s) to your list and linked them:\n"
+               + "\n".join(f"• {n}" for n in created[:12]))
+        if len(created) > 12:
+            msg += f"\n…and {len(created) - 12} more"
+        if still:
+            nums = ", ".join(str(r["line_no"]) for r in still[:8])
+            msg += (f"\n\n⚠️ Line(s) {nums} had no readable description, so I did not "
+                    f"invent a product for them. Fix with *{still[0]['line_no']} NEW* "
+                    f"after checking the invoice.")
+        else:
+            msg += "\n\nReply *OK* to receive into stock."
+        reply_text(phone, msg)
+        return
+
     # "<line> EXP 06/2028" | "<line> BATCH X" | "<line> NEW"
     parts = t.split(None, 2)
     if parts and parts[0].isdigit():
@@ -531,6 +555,7 @@ def handle_review(phone: str, staff: dict, text: str) -> None:
               "• *7 EXP 06/2028* — fix an expiry\n"
               "• *7 BATCH ST26-0439* — fix a batch number\n"
               "• *7 NEW* — add as a new product\n"
+              "• *ALL NEW* — add every unlinked line as a new product\n"
               "• *CANCEL* — discard")
 
 
@@ -563,6 +588,58 @@ def _update_line(grn_id: str, line_no: int, col: str, value, drop_flag: str) -> 
              where grn_id = %s and line_no = %s returning id""",
         (value, drop_flag, grn_id, line_no),
     )
+
+
+def _is_all_new(text: str) -> bool:
+    """True for `ALL NEW` in any casing or spacing, and nothing else.
+
+    Deliberately not a prefix or substring match. `7 NEW` must keep working -- on an
+    established pharmacy, a few unfamiliar items among fifty known ones deserve a decision
+    each, and a greedy match here would take that away.
+    """
+    return (text or "").strip().upper().replace(" ", "") == "ALLNEW"
+
+
+def _link_all_unmatched(grn_id: str) -> list[str]:
+    """Create a product for every unmatched line on this GRN. Returns the names created.
+
+    This exists because the per-line remedy is a dead end on a NEW pharmacy. approve()
+    refuses while anything is unmatched and says to reply `<n> NEW` for each -- which is
+    right when three lines out of fifty are new, and impossible when all fifty are, because
+    there are no products to match against yet.
+
+    A real pharmacy demonstrated it: 232 extracted invoice lines, and products, batches and
+    stock_movements all zero. Gemini had read the invoices correctly. Finishing would have
+    meant ~58 separate WhatsApp messages, so nobody did, and a customer asking for a
+    medicine got "No product matching".
+
+    Scope is deliberately narrow: this LINKS lines to catalogue entries. It does not
+    approve, does not write batches or stock_movements, and does not touch the physical
+    count or the POM gate. Creating a catalogue entry and moving stock are different
+    decisions and stay that way -- the user still replies OK afterwards, and still counts
+    the goods.
+
+    Idempotent: a second call finds nothing unmatched and returns []. Someone will send it
+    twice.
+    """
+    rows = q("""select line_no, raw_description from grn_lines
+                 where grn_id = %s and product_id is null
+                 order by line_no""", (grn_id,))
+    created, skipped = [], []
+    for r in rows:
+        # A line with no description would become a product called "Unknown item" that a
+        # pharmacist could later dispense from. Skip it and name it, so a human decides.
+        if not (r["raw_description"] or "").strip():
+            skipped.append(r["line_no"])
+            continue
+        name = _create_product_from_line(grn_id, r["line_no"])
+        if name:
+            created.append(name)
+        else:
+            skipped.append(r["line_no"])
+    if skipped:
+        log.info("grn %s: lines %s left unmatched (no usable description)", grn_id, skipped)
+    return created
 
 
 def _create_product_from_line(grn_id: str, line_no: int) -> str | None:
@@ -612,8 +689,16 @@ def approve(grn_id: str, staff: dict, phone: str) -> None:
     unmatched = [l for l in lines if not l["product_id"]]
     if unmatched:
         nums = ", ".join(str(l["line_no"]) for l in unmatched[:8])
-        reply_text(phone, f"Cannot receive yet — line(s) {nums} are not linked to a product. "
-                         f"Reply *{unmatched[0]['line_no']} NEW* to add, for each.")
+        # Offer the bulk form FIRST when most of the invoice is unmatched. On a new
+        # pharmacy that is every line, and naming only the per-line command is what left
+        # 232 extracted lines stranded: correct advice nobody could act on 58 times.
+        bulk = len(unmatched) >= 3 or len(unmatched) == len(lines)
+        how = (f"Reply *ALL NEW* to add all {len(unmatched)} as new products, "
+               f"or *{unmatched[0]['line_no']} NEW* one at a time."
+               if bulk else
+               f"Reply *{unmatched[0]['line_no']} NEW* to add, for each.")
+        reply_text(phone, f"Cannot receive yet — line(s) {nums} are not linked to a "
+                         f"product. {how}")
         return
 
     g = q1("select * from grns where id=%s", (grn_id,))

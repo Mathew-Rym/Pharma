@@ -144,8 +144,14 @@ def get_stock(product_query: str | None = None, low_stock_only: bool = False,
         out = []
         for r in rows:
             exp = f", earliest expiry {r['earliest_expiry']:%b %Y}" if r["earliest_expiry"] else ""
+            # Never quote a zero price. A product created from an invoice line carries the
+            # COST but no sell price yet, and "@ KES 0.00" reads to a customer as free --
+            # a claim the pharmacy would have to honour or argue about at the counter.
+            # Saying the price is not set is the truth and prompts someone to set it.
+            price = (kes(r["sell_price"]) if r["sell_price"] and float(r["sell_price"]) > 0
+                     else "price not set")
             out.append(f"• {r['name']} — {from_pieces(r['qty_pieces'], r['pack_size'])} "
-                       f"({r['qty_pieces']} pcs) @ {kes(r['sell_price'])}{exp}")
+                       f"({r['qty_pieces']} pcs) @ {price}{exp}")
         return "\n".join(out)
 
     rows = q(
