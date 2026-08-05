@@ -39,6 +39,7 @@ if settings.GEMINI_API_KEY:
 
 if settings.ANTHROPIC_API_KEY:
     try:
+        # pyrefly: ignore [missing-import]
         from anthropic import Anthropic
         anthropic_client = Anthropic(api_key=settings.ANTHROPIC_API_KEY)
     except Exception as e:
@@ -294,7 +295,7 @@ def chat(system: str, messages: list[dict], tools: list[dict] | None = None,
     if provider == "gemini" and gemini_client:
         from google.genai import types
 
-        # Build Gemini tools if provided
+        # Build Gemini tool declarations
         g_tools = None
         if tools:
             func_decls = []
@@ -307,6 +308,8 @@ def chat(system: str, messages: list[dict], tools: list[dict] | None = None,
                         t_type = "BOOLEAN"
                     elif p_info.get("type") == "integer":
                         t_type = "INTEGER"
+                    elif p_info.get("type") == "number":
+                        t_type = "NUMBER"
                     schema_props[p_name] = types.Schema(
                         type=t_type,
                         description=p_info.get("description", "")
@@ -318,40 +321,60 @@ def chat(system: str, messages: list[dict], tools: list[dict] | None = None,
                 ))
             g_tools = [types.Tool(function_declarations=func_decls)]
 
-        # Check if messages contains tool execution results from prior turn
-        prompt_text = ""
-        tool_results_text = ""
+        # Convert Anthropic-style message history to Gemini Content objects.
+        # Roles: "user" -> "user", "assistant" -> "model".
+        contents = []
         for m in messages:
-            role = m.get("role")
-            content = m.get("content")
-            if role == "user":
-                if isinstance(content, str):
-                    prompt_text = content
-                elif isinstance(content, list):
-                    for item in content:
-                        if isinstance(item, dict) and item.get("type") == "tool_result":
-                            tool_results_text += f"\nTool output: {item.get('content', '')}"
+            role = "model" if m.get("role") == "assistant" else "user"
+            content = m.get("content", "")
 
-        if tool_results_text:
-            combined_prompt = f"Tool Execution Output:\n{tool_results_text}\n\nOriginal Question: {prompt_text}\nProvide the final answer based on the tool output."
-            res = gemini_client.models.generate_content(
-                model=settings.MODEL_CHAT,
-                contents=combined_prompt,
-                config=types.GenerateContentConfig(
-                    system_instruction=system,
-                    temperature=0.0,
-                )
+            if isinstance(content, str):
+                if content.strip():
+                    contents.append(types.Content(
+                        role=role,
+                        parts=[types.Part.from_text(text=content)]
+                    ))
+
+            elif isinstance(content, list):
+                parts = []
+                for item in content:
+                    if not isinstance(item, dict):
+                        # ContentBlock dataclass from a previous assistant turn
+                        if getattr(item, "type", None) == "tool_use":
+                            parts.append(types.Part.from_function_call(
+                                name=item.name,
+                                args=item.input or {}
+                            ))
+                        elif getattr(item, "type", None) == "text" and item.text:
+                            parts.append(types.Part.from_text(text=item.text))
+                        continue
+
+                    itype = item.get("type")
+                    if itype == "tool_use":
+                        parts.append(types.Part.from_function_call(
+                            name=item["name"],
+                            args=item.get("input") or {}
+                        ))
+                    elif itype == "tool_result":
+                        parts.append(types.Part.from_function_response(
+                            name=item.get("tool_use_id", "tool"),
+                            response={"output": item.get("content", "")}
+                        ))
+                    elif itype == "text" and item.get("text"):
+                        parts.append(types.Part.from_text(text=item["text"]))
+
+                if parts:
+                    contents.append(types.Content(role=role, parts=parts))
+
+        res = gemini_client.models.generate_content(
+            model=settings.MODEL_CHAT,
+            contents=contents,
+            config=types.GenerateContentConfig(
+                tools=g_tools,
+                system_instruction=system,
+                temperature=0.0,
             )
-        else:
-            res = gemini_client.models.generate_content(
-                model=settings.MODEL_CHAT,
-                contents=prompt_text,
-                config=types.GenerateContentConfig(
-                    tools=g_tools,
-                    system_instruction=system,
-                    temperature=0.0,
-                )
-            )
+        )
 
         blocks = []
         if getattr(res, "function_calls", None):

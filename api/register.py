@@ -649,6 +649,16 @@ def intercept(phone: str, msg: dict) -> bool:
     if not (redemption or mid_flow or is_code_retry or restart):
         return False
 
+    # If this message arrived on a LIVE TENANT's device, do not intercept it for
+    # onboarding. A customer texting a pharmacy number must reach the pharmacy, not
+    # the registration flow. The only exception is JOIN/OWNER code redemptions, which
+    # can validly arrive on any line (a new staff member who texted the wrong number).
+    inbound_pid = msg.get("pharmacy_id")
+    if inbound_pid and not redemption:
+        tenant = q1("select kind from pharmacies where id = %s", (inbound_pid,))
+        if tenant and tenant["kind"] == "tenant":
+            return False
+
     # A staff member who is already deep in a delivery must not have REGISTER hijack their
     # conversation. Redemptions are exempt: a code is unambiguous.
     if not redemption and not mid_flow:
