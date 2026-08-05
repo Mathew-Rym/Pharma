@@ -152,12 +152,62 @@ def apply_movement(cur, batch_id: str, delta: int, reason: str,
 
     Writes the ledger row and moves the batch quantity in one statement pair,
     inside the caller's transaction. Never UPDATE batches.qty_pieces anywhere else.
+
+    The pharmacy is DERIVED FROM THE BATCH, and cross-tenant access is refused.
+
+    It used to be settings.PHARMACY_ID -- whichever pharmacy .env named -- so every
+    pharmacy's movements were filed against that one: the batch under tenant A, the ledger
+    row under the .env pharmacy. Invisible while a single pharmacy existed, and the last of
+    the nine module-level `PID = settings.PHARMACY_ID` constants tenancy.py exists to
+    remove. It survived the sweep in test_tenancy.py because it is an argument inside a
+    function rather than a constant at module scope. It became a hard failure only when the
+    .env pharmacy was deleted:
+
+        ForeignKeyViolation: Key (pharmacy_id)=(cee0072c-…) is not present in table
+        "pharmacies"
+
+    -- receiving broken for every pharmacy, at the last step before the ledger.
+
+    The obvious repair is pid(), and it is not enough. A low-level ledger writer should not
+    trust ambient context it cannot check: if a caller binds the wrong tenant, or a batch id
+    arrives from somewhere unexpected, pid() supplies a plausible answer and the ledger row
+    silently disagrees with the stock it moved. Verified by test: with pid(), moving tenant
+    B's batch while bound to A writes A's ledger row AND decrements B's stock, leaving no
+    trace under B.
+
+    The batch is the one source that cannot disagree with the row being written, so the
+    pharmacy comes from there -- and if it differs from the bound tenant that is a bug in the
+    caller, raised rather than absorbed. Both queries use the caller's cursor, so the check
+    and the write are in the same transaction.
+
+    tenancy is imported lazily because tenancy imports db.
     """
+    from tenancy import NoTenant, pid
+
+    cur.execute("select pharmacy_id from batches where id = %s", (batch_id,))
+    row = cur.fetchone()
+    if not row:
+        raise ValueError(f"no such batch {batch_id}; refusing to write a stock movement")
+    owner = str(row["pharmacy_id"])
+
+    try:
+        bound = pid()
+    except NoTenant:
+        # No tenant bound at all. The batch still names its owner, so the write is
+        # unambiguous -- but nothing legitimate reaches here unscoped, so say so.
+        bound = None
+        log.warning("apply_movement called with no tenant bound; filing batch %s under its "
+                    "owner %s", batch_id, owner)
+    if bound and bound != owner:
+        raise ValueError(
+            f"batch {batch_id} belongs to pharmacy {owner}, not the bound tenant {bound}; "
+            f"refusing to move another tenant's stock")
+
     cur.execute(
         """insert into stock_movements
              (pharmacy_id, batch_id, delta_pieces, reason, actor_staff, ref_table, ref_id, note)
            values (%s,%s,%s,%s,%s,%s,%s,%s)""",
-        (settings.PHARMACY_ID, batch_id, delta, reason, actor_staff, ref_table, ref_id, note),
+        (owner, batch_id, delta, reason, actor_staff, ref_table, ref_id, note),
     )
     cur.execute(
         "update batches set qty_pieces = qty_pieces + %s where id = %s",
