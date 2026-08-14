@@ -100,7 +100,16 @@ def _dispatch_audio(monkeypatch, phone="254700555001", staff_row=None):
     monkeypatch.setattr(router, "reply_text", lambda p, b: replies.append(b))
     monkeypatch.setattr(router, "record_inbound", lambda p, pid: None)
     monkeypatch.setattr(router, "ex", lambda *a, **k: None)
-    monkeypatch.setattr(router, "q1", lambda *a, **k: staff_row)
+
+    # q1 now serves two different queries in _dispatch: the idempotency CLAIM (an
+    # `insert ... on conflict do nothing returning id`, which must return a row for a
+    # first delivery) and the staff lookup. A mock returning one value for both makes
+    # every message look like a duplicate and the handler never runs.
+    def _q1(sql, *a, **k):
+        if "insert into wa_messages" in sql:
+            return {"id": 1}                      # claimed: this is a first delivery
+        return staff_row
+    monkeypatch.setattr(router, "q1", _q1)
     msg = {"wa_id": "t-audio-1", "from": phone, "type": "audio",
            "media_path": "2026/08/note.ogg", "unsupported_media": "audio", "text": ""}
     router._dispatch(phone, msg, "11111111-1111-1111-1111-111111111111")
@@ -138,7 +147,7 @@ def test_the_stored_row_says_audio_not_image():
 
     import main
     src = inspect.getsource(main.webhook_gowa)
-    refuse = src[src.index("Refuse non-image media"):src.index("if media:\n        kind, rel")]
+    refuse = src[src.index("Refuse non-image media"):src.index("if media:")]
     assert '"type": kind' in refuse, "the refusal branch must persist the real kind"
     assert "media_path" in refuse, "the media path must survive for later inspection"
 

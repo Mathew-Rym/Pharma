@@ -115,25 +115,38 @@ def _greet_unknown(phone: str) -> None:
 
 def _dispatch(phone: str, msg: dict, resolved_pid: str) -> None:
     """Everything below runs with the tenant bound, so pid() is correct throughout."""
-    # Record inbound — this opens Gate 3 for future replies to this phone
-    record_inbound(phone, resolved_pid)
-
-    # idempotency — Baileys re-delivers on reconnect
-    if msg.get("wa_id"):
-        dup = q1("select 1 from wa_messages where wa_id = %s", (msg["wa_id"],))
-        if dup:
-            log.info("duplicate message %s ignored", msg["wa_id"])
-            return
-
+    # IDEMPOTENCY. The insert IS the lock -- not a SELECT followed by an insert.
+    #
+    # It used to be `select 1 ... where wa_id` and then, several lines later, an insert with
+    # `on conflict do nothing`. Both GOWA (on reconnect) and Meta (on any slow 200) redeliver,
+    # and two concurrent redeliveries both passed the SELECT before either reached the
+    # INSERT. The unique constraint protected the ROW; nothing protected the side effects.
+    # Both copies went on to the handler: two GRNs from one invoice, two POM approvals
+    # against one prescription, two stock movements from one delivery.
+    #
+    # `on conflict (wa_id) do nothing returning id` makes Postgres the arbiter: exactly one
+    # caller gets a row back, every other gets nothing and stops here. The window closes
+    # because the check and the claim are the same statement.
     text = (msg.get("text") or "").strip()
-    ex(
+    claimed = q1(
         """insert into wa_messages (pharmacy_id, wa_id, direction, from_phone, msg_type,
                                     body, media_path, handled)
            values (%s,%s,'in',%s,%s,%s,%s,false)
-           on conflict (wa_id) do nothing""",
+           on conflict (wa_id) do nothing
+           returning id""",
         (resolved_pid, msg.get("wa_id"), phone, msg.get("type", "text"),
          text[:4000], msg.get("media_path")),
     )
+    if msg.get("wa_id") and not claimed:
+        log.info("duplicate message %s ignored -- already claimed", msg["wa_id"])
+        return
+
+    # AFTER the lock, deliberately. This opens Gate 3 for future replies to this phone, and
+    # it used to run before the dedup check -- so every redelivery inflated
+    # inbound_history.message_count, which is the number ./run.sh safety prints as evidence
+    # of a real conversation. A retry storm made a quiet number look like an engaged
+    # customer.
+    record_inbound(phone, resolved_pid)
 
     staff = q1(
         "select * from staff where phone=%s and pharmacy_id=%s and is_active",
