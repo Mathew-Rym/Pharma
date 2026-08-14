@@ -15,7 +15,7 @@ from fastapi import BackgroundTasks, FastAPI, Header, HTTPException, Request, Up
 from fastapi.responses import HTMLResponse, JSONResponse
 
 from config import settings
-from db import ensure_buckets, q, q1, upload
+from db import ensure_buckets, ex, q, q1, upload
 from jobs import GLOBAL_JOBS, JOBS, for_every_tenant
 from router import handle_inbound
 from tenant import resolve_pharmacy_by_device, resolve_tenant
@@ -271,62 +271,20 @@ async def webhook_gowa(request: Request, background: BackgroundTasks,
         return {"ok": True, "unsupported": kind}
 
     if media:
-        kind, rel = media
-        from wa import gowa_fetch_media
-        data = (gowa_fetch_media(rel) if not str(rel).startswith("http")
-                else None)
-        if data is None and str(rel).startswith("http"):
-            try:
-                import httpx
-                data = httpx.get(rel, timeout=120).content
-            except Exception:
-                log.exception("could not fetch remote media %s", rel)
-        if data:
-            # Resolve which pharmacy received this media
-            media_tenant = resolve_pharmacy_by_device(body.get("device_id") or "")
-            if not media_tenant:
-                # Unknown device: we do not know whose prescription this is, and filing it
-                # under a configured default would put a patient's Rx in another
-                # pharmacy's bucket.
-                log.warning("media from unknown device %s; not stored",
-                            body.get("device_id"))
-                return {"ok": True, "ignored": "unknown device"}
-            staff = q1("""select id from staff where phone=%s and pharmacy_id=%s
-                           and is_active""", (phone, media_tenant))
-            ext = str(rel).rsplit(".", 1)[-1].lower().split("?")[0]
-            is_doc = kind == "document" or ext in _CSV_EXTS
-            if is_doc:
-                # Documents always go to the invoices bucket regardless of staff/customer.
-                # A distributor sending a stock CSV is never staff but the file belongs
-                # in the same store as GRN invoices.
-                bucket = settings.BUCKET_INVOICES
-                if ext not in _CSV_EXTS and ext not in ("pdf",):
-                    ext = "csv"  # safe fallback: we'll parse it as text anyway
-                mime = {
-                    "csv": "text/csv",
-                    "xls": "application/vnd.ms-excel",
-                    "xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    "pdf": "application/pdf",
-                }.get(ext, "application/octet-stream")
-                path = f"{datetime.utcnow():%Y/%m}/{phone}/{uuid.uuid4().hex[:10]}.{ext}"
-                upload(bucket, path, data, mime)
-                log.info("gowa document stored bucket=%s path=%s bytes=%s ext=%s",
-                         bucket, path, len(data), ext)
-                inbound.update({"type": "document", "media_bucket": bucket,
-                                "media_path": path, "doc_ext": ext})
-            else:
-                bucket = settings.BUCKET_INVOICES if staff else settings.BUCKET_RX
-                if ext not in ("jpg", "jpeg", "png", "webp", "pdf"):
-                    ext = "jpg"
-                path = f"{datetime.utcnow():%Y/%m}/{phone}/{uuid.uuid4().hex[:10]}.{ext}"
-                upload(bucket, path, data,
-                       "application/pdf" if ext == "pdf" else "image/jpeg")
-                log.info("gowa media stored bucket=%s path=%s bytes=%s",
-                         bucket, path, len(data))
-                inbound.update({"type": "image", "media_bucket": bucket,
-                                "media_path": path})
-        else:
-            log.warning("gowa media %s could not be retrieved; treating as text", rel)
+        # Fetch and store in the BACKGROUND, then dispatch. Not inline.
+        #
+        # This block used to run before the 200: gowa_fetch_media, then a fallback
+        # httpx.get(rel, timeout=120), then an upload to Supabase. On a slow link the
+        # webhook could block for two minutes. GOWA redelivers, and Meta will too after the
+        # Cloud API migration -- so a pharmacy on a bad connection received the same
+        # prescription twice, which is precisely the duplicate the dedup lock in
+        # router._dispatch now has to catch. Better not to provoke it.
+        #
+        # The media URL expires in minutes, so the background task fetches immediately; it
+        # does not queue for later.
+        background.add_task(_store_media_then_dispatch, media,
+                            body.get("device_id") or "", phone, inbound)
+        return {"ok": True, "media": media[0]}
 
     # Resolve pharmacy from GOWA device and inject into the message
     # The device that RECEIVED this message names the tenant. When it does not resolve,
@@ -342,6 +300,95 @@ async def webhook_gowa(request: Request, background: BackgroundTasks,
              phone, inbound["type"], body.get("device_id"), device_pharmacy)
     background.add_task(handle_inbound, inbound)
     return {"ok": True}
+
+
+def _store_media_then_dispatch(media: tuple[str, str], device_id: str,
+                               phone: str, inbound: dict) -> None:
+    """Fetch the media, put it in object storage, then hand the message to the router.
+
+    Runs off the request so the webhook can answer in milliseconds. All of this was
+    previously inline before the 200 -- see the comment at the call site.
+
+    A fetch failure is RECORDED, not swallowed. The old code logged a warning and fell
+    through to "treating as text", so a customer's prescription silently became an empty
+    text message and the pharmacy never learned a photo had been sent.
+    """
+    kind, rel = media
+    try:
+        from wa import gowa_fetch_media
+        data = (gowa_fetch_media(rel) if not str(rel).startswith("http") else None)
+        if data is None and str(rel).startswith("http"):
+            import httpx
+            data = httpx.get(rel, timeout=120).content
+    except Exception:
+        log.exception("could not fetch media %s from %s", rel, phone)
+        data = None
+
+    tenant = resolve_pharmacy_by_device(device_id)
+
+    if not data:
+        # Durable, not silent. The media URL has probably expired by now, so this is
+        # unrecoverable -- which is exactly why it must be visible rather than inferred
+        # from a gap.
+        log.error("media fetch FAILED for %s from %s (kind=%s); recording and telling them",
+                  rel, phone, kind)
+        if tenant:
+            ex("""insert into wa_messages (pharmacy_id, wa_id, direction, from_phone,
+                                           msg_type, body, error, handled)
+                  values (%s,%s,'in',%s,%s,%s,%s,true)
+                  on conflict (wa_id) do nothing""",
+               (tenant, inbound.get("wa_id"), phone, kind, "",
+                f"media fetch failed: {rel}"))
+        inbound.update({"type": "text",
+                        "text": "", "media_fetch_failed": kind})
+        if tenant:
+            inbound["pharmacy_id"] = tenant
+        handle_inbound(inbound)
+        return
+
+    if not tenant:
+        # Unknown device: we do not know whose prescription this is, and filing it under a
+        # configured default would put a patient's Rx in another pharmacy's bucket.
+        log.warning("media from unknown device %s; not stored", device_id)
+        return
+
+    staff = q1("""select id from staff where phone=%s and pharmacy_id=%s
+                   and is_active""", (phone, tenant))
+    ext = str(rel).rsplit(".", 1)[-1].lower().split("?")[0]
+    is_doc = kind == "document" or ext in _CSV_EXTS
+
+    if is_doc:
+        # Documents always go to the invoices bucket regardless of staff/customer. A
+        # distributor sending a stock CSV is never staff but the file belongs in the same
+        # store as GRN invoices.
+        bucket = settings.BUCKET_INVOICES
+        if ext not in _CSV_EXTS and ext not in ("pdf",):
+            ext = "csv"          # safe fallback: we parse it as text anyway
+        mime = {
+            "csv": "text/csv",
+            "xls": "application/vnd.ms-excel",
+            "xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            "pdf": "application/pdf",
+        }.get(ext, "application/octet-stream")
+        path = f"{datetime.utcnow():%Y/%m}/{phone}/{uuid.uuid4().hex[:10]}.{ext}"
+        upload(bucket, path, data, mime)
+        log.info("gowa document stored bucket=%s path=%s bytes=%s ext=%s",
+                 bucket, path, len(data), ext)
+        inbound.update({"type": "document", "media_bucket": bucket,
+                        "media_path": path, "doc_ext": ext})
+    else:
+        bucket = settings.BUCKET_INVOICES if staff else settings.BUCKET_RX
+        if ext not in ("jpg", "jpeg", "png", "webp", "pdf"):
+            ext = "jpg"
+        path = f"{datetime.utcnow():%Y/%m}/{phone}/{uuid.uuid4().hex[:10]}.{ext}"
+        upload(bucket, path, data,
+               "application/pdf" if ext == "pdf" else "image/jpeg")
+        log.info("gowa media stored bucket=%s path=%s bytes=%s", bucket, path, len(data))
+        inbound.update({"type": "image", "media_bucket": bucket, "media_path": path})
+
+    inbound["pharmacy_id"] = tenant
+    log.info("gowa media inbound from=%s type=%s pharmacy=%s", phone, inbound["type"], tenant)
+    handle_inbound(inbound)
 
 
 # ============================================================ M-Pesa
