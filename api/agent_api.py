@@ -23,16 +23,40 @@ from utils import kes
 
 log = logging.getLogger(__name__)
 router = APIRouter(prefix="/agent", tags=["agent"])
+import tenancy
 from tenancy import pid          # tenant comes from the request, not from .env
 
 
 def _agent(token: str | None) -> dict:
+    """Authenticate an agent AND bind its pharmacy for the rest of the request.
+
+    The binding is the fix for a total failure of Loop B. This function looked the
+    pharmacy up and then discarded it -- `a["pharmacy_id"]` was never read. Every endpoint
+    below went on to call pid(), which reads a ContextVar that nothing had set, so it
+    raised NoTenant and the endpoint returned 500. The agent's outbox retried to
+    MAX_ATTEMPTS and parked the batch. No POS sale, monthly history row or stock snapshot
+    has ever landed: the variance report and every demand forecast were reading empty
+    tables, silently.
+
+    The tenant comes from the DATABASE, keyed on the per-install token, and never from the
+    request body or a header naming a pharmacy. A leaked token can therefore only write to
+    the pharmacy it was issued to -- which is what the enrolment handshake exists to
+    guarantee.
+
+    set_pharmacy, not pharmacy_scope, because there is no block to wrap here. That is safe
+    only because every caller is an `async def` endpoint: FastAPI runs each in its own Task
+    with a copied context, so the value cannot survive into another request. If an endpoint
+    below is ever changed to a plain `def`, it will run on a REUSED threadpool worker and
+    this binding will leak into the next request on that worker -- so wrap that handler in
+    `with tenancy.pharmacy_scope(...)` instead of relying on this.
+    """
     if not token:
         raise HTTPException(401, "missing agent token")
     a = q1("select * from agents where agent_token = %s", (token,))
     if not a:
         raise HTTPException(401, "unknown agent token")
     ex("update agents set last_seen_at = now() where id = %s", (a["id"],))
+    tenancy.set_pharmacy(str(a["pharmacy_id"]))
     return a
 
 
