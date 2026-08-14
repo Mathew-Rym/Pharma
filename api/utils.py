@@ -157,3 +157,27 @@ def kes(amount) -> str:
         return f"KES {float(amount):,.2f}"
     except (TypeError, ValueError):
         return "KES 0.00"
+
+
+# ------------------------------------------------------------------ approval PINs
+def hash_pin(pin: str) -> str:
+    """sha-256 hex of an approval PIN.
+
+    Matches dashboard/identity.py's _hash for login codes deliberately, rather than
+    introducing a second scheme: two hashing conventions in one codebase is how one of them
+    ends up unmaintained.
+
+    The PIN was stored and compared in PLAINTEXT (`str(pin).strip() ==
+    str(staff["approval_pin"]).strip()`). Anyone with read access to the staff table could
+    approve a prescription-only medicine as a named pharmacist, against that pharmacist's
+    PPB registration number -- and the POM approval log, which is the regulatory record,
+    would show a valid approval. That makes the audit trail forgeable, which is worse than
+    it being absent.
+
+    A 4-6 digit PIN is trivially brute-forced from a hash, so this is not confidentiality
+    against an attacker with the table -- the lockout counter is what limits guessing
+    online. What it does remove is the ability to read a working PIN straight out of a
+    backup, a log, or a support query, which is the realistic exposure.
+    """
+    import hashlib
+    return hashlib.sha256(str(pin).strip().encode()).hexdigest()

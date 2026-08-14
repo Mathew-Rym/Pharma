@@ -181,9 +181,17 @@ def setup_page(q, ex, PID: str, me: dict) -> None:
                     if not newpin.isdigit() or not (4 <= len(newpin) <= 6):
                         st.error("PIN must be 4-6 digits.")
                     else:
+                        import os as _os, sys as _sys
+                        _api = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)),
+                                             "..", "api")
+                        if _api not in _sys.path:
+                            _sys.path.insert(0, _api)
+                        from utils import hash_pin
+                        # Store the HASH. The column held plaintext, so a database
+                        # reader could approve a POM as a named pharmacist.
                         ex("""update staff set approval_pin=%s, pin_failed_count=0,
                                   pin_locked_until=null where id=%s""",
-                           (newpin, s["id"]))
+                           (hash_pin(newpin), s["id"]))
                         st.success(f"PIN set for {s['name']}.")
                         st.rerun()
 

@@ -745,8 +745,16 @@ else:
             if not newpin.isdigit() or len(newpin) < 4:
                 st.error("PIN must be at least 4 digits.")
             else:
+                import os as _os, sys as _sys
+                _api = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)),
+                                     "..", "api")
+                if _api not in _sys.path:
+                    _sys.path.insert(0, _api)
+                from utils import hash_pin
+                # Store the HASH -- see api/utils.hash_pin for why plaintext was unsafe.
                 ex("""update staff set approval_pin=%s, pin_failed_count=0,
-                          pin_locked_until=null where id=%s""", (newpin, ps["id"]))
+                          pin_locked_until=null where id=%s""",
+                   (hash_pin(newpin), ps["id"]))
                 st.success(f"PIN set for {ps['name']}.")
                 st.rerun()
 
