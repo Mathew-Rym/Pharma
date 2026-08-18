@@ -71,7 +71,12 @@ def test_correctly_signed_message_is_accepted(secret, monkeypatch):
     #
     # None means "device resolves to no tenant", which leaves pharmacy_id unset -- exactly
     # what a real platform-line message does, so the shape under test stays realistic.
-    monkeypatch.setattr(main, "resolve_pharmacy_by_device", lambda d: None)
+    # Resolution('unknown') is the new seam: tenancy.resolve() now returns an explicit
+    # device_kind so gateway_intercept can distinguish platform from unknown devices.
+    # 'unknown' matches the old mock's effect: no pharmacy_id, no tenant assignment.
+    import tenancy
+    from tenancy import Resolution
+    monkeypatch.setattr(tenancy, "resolve", lambda **kw: Resolution("unknown"))
 
     raw, headers = _signed(TEXT_EVENT, secret)
     r = _client().post("/webhook/gowa", content=raw, headers=headers)

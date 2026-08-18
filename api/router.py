@@ -82,7 +82,7 @@ def handle_inbound(msg: dict) -> None:
             _ask_which_pharmacy(phone, candidates)
             return
         else:
-            _greet_unknown(phone)
+            _greet_unknown(phone, msg)
             return
 
     with tenancy.pharmacy_scope(resolved_pid):
@@ -103,13 +103,18 @@ def _ask_which_pharmacy(phone: str, candidates: list[str]) -> None:
                           f"Which one?\n\n{listing}\n\nReply with the number.")
 
 
-def _greet_unknown(phone: str) -> None:
+def _greet_unknown(phone: str, msg: dict) -> None:
     """No relationship anywhere.
 
-    Cannot reply: the anti-ban gates require a relationship, and inventing a customer row
-    to satisfy them would let anyone who texts create data in a pharmacy of their choosing.
-    Logged so it is visible rather than silent.
+    If the message arrived on the platform/master device, open the onboarding gateway
+    so the sender can register a pharmacy or join an existing one.  If it arrived on a
+    tenant device, tell them to contact the pharmacy administrator.
+
+    When neither condition applies (no platform row, unrecognised device), we cannot
+    reply safely, so we log and stay silent.
     """
+    if register.gateway_intercept(phone, msg):
+        return
     log.info("unresolved sender %s -- no pharmacy relationship; not replying", phone)
 
 

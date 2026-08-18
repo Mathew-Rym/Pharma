@@ -35,6 +35,19 @@ from state import clear_state, get_state, set_state
 from utils import is_valid_ke_mobile, norm_phone
 from wa import UnroutableMessage, compose, deliver
 
+# First message sent to an unknown sender on the platform line.
+# Deliberately short and keyword-driven: the REGISTER flow already handles everything
+# from this point, so there is no new state machine here.
+_GATEWAY_WELCOME = (
+    "Welcome to Pharma OS \U0001f44b\n\n"
+    "It looks like this number isn't registered yet.\n\n"
+    "To set up a new pharmacy, reply:\n"
+    "  *REGISTER*\n\n"
+    "If your employer gave you an invitation code, reply:\n"
+    "  *JOIN <your-code>*  or  *OWNER <your-code>*\n\n"
+    "Type *CANCEL* at any time to stop."
+)
+
 log = logging.getLogger(__name__)
 
 START = "reg_owner_name"
@@ -736,3 +749,108 @@ def _log_inbound(phone: str, msg: dict, pharmacy_id: str | None) -> None:
           values (%s,%s,'in',%s,'text',%s,true)
           on conflict (wa_id) do nothing""",
        (pharmacy_id, msg["wa_id"], phone, (msg.get("text") or "")[:4000]))
+
+
+# ------------------------------------------------------------------ the platform gateway
+def gateway_intercept(phone: str, msg: dict) -> bool:
+    """Handle an unknown sender's FIRST message that was not caught by intercept().
+
+    Called from router._greet_unknown() after the sender has no staff/supplier
+    relationship anywhere and normal routing produced no tenant.  Branches EXPLICITLY on
+    device_kind (set by main.webhook_gowa via tenancy.resolve()); never infers device
+    type from the presence or absence of pharmacy_id.
+
+    Three device kinds, three behaviours:
+
+      'tenant'   -- The sending device belongs to a live tenant but the sender is not
+                     in its staff or suppliers.  Tell them to contact the administrator.
+                     Never start onboarding on a tenant device.
+
+      'platform' -- The master/onboarding WhatsApp line.  If the sender already has a
+                     tenant relationship (staff or supplier anywhere), they are not a
+                     stranger: do not start onboarding.  For a genuinely unknown sender,
+                     open the REGISTER flow.
+
+      'unknown'  -- Completely unrecognised device.  Fail closed -- no reply, no state,
+                     no pharmacy created.
+
+    Returns True when handled (reply sent or duplicate).  False means caller should log.
+    """
+    device_kind = msg.get("device_kind", "unknown")
+
+    # ---- Case A: tenant device, unknown sender --------------------------------
+    if device_kind == "tenant":
+        inbound_pid = msg.get("pharmacy_id")
+        if not inbound_pid:
+            # Safety: device_kind='tenant' without pharmacy_id is a main.py bug.
+            # Fail closed rather than guessing a tenant.
+            log.error("device_kind='tenant' but pharmacy_id missing from msg (sender %s)"
+                      " -- refusing to guess a tenant", phone)
+            return False
+
+        # _make_contactable writes to onboarding_contacts (Gate 2) and
+        # inbound_history (Gate 3).  This contactability record exists ONLY to
+        # permit the immediate "contact your administrator" response through the
+        # existing outbound safety gates.  It does NOT establish tenant membership,
+        # create a staff/customer/supplier row, grant inventory access, or bind the
+        # phone to this tenant in any way.
+        _make_contactable(phone, inbound_pid)
+        admin_msg = (
+            "This number is not registered with this pharmacy.\n\n"
+            "Please contact your pharmacy administrator for access."
+        )
+        _say(phone, admin_msg, inbound_pid)
+        log.info("unknown sender %s on tenant device %s: directed to contact admin",
+                 phone, inbound_pid)
+        return True
+
+    # ---- Case C: unknown/unrecognised device ---------------------------------
+    if device_kind != "platform":
+        # An unrecognised device is an infrastructure problem, not a registrant.
+        # Stay silent: a reply to an unknown device would leave by an unknown account.
+        log.warning("unknown sender %s on unrecognised device (device_kind=%r)"
+                    " -- failing closed", phone, device_kind)
+        return False
+
+    # ---- Case B: platform line -----------------------------------------------
+    platform = platform_pid()
+    if not platform:
+        log.error("unknown sender %s on platform device but no platform pharmacy row"
+                  " -- cannot reply", phone)
+        return False
+
+    # Check whether this phone already has a legitimate tenant relationship.
+    #
+    # A Tenant A staff member texting the master number must NOT be treated as a new
+    # stranger.  tenancy.resolve_by_sender() excludes platform rows and returns only
+    # tenant pharmacies the phone acts for.  If there are any, the router's own sender-
+    # resolution path should have resolved them before _greet_unknown() was called.
+    # Reaching here with existing relationships indicates a race or routing gap; refuse
+    # to open onboarding rather than creating a duplicate identity.
+    import tenancy as _tenancy
+    existing = _tenancy.resolve_by_sender(phone)
+    if existing:
+        log.info("sender %s is already known at %d tenant(s) but fell through to "
+                 "gateway -- not starting onboarding", phone, len(existing))
+        return False
+
+    # Duplicate guard: GOWA may redeliver.  The same wa_id must never produce two
+    # welcome messages; _log_inbound's ON CONFLICT alone is insufficient because the
+    # state write and _say() happen after it.
+    if msg.get("wa_id") and q1(
+            "select 1 from wa_messages where wa_id = %s", (msg["wa_id"],)):
+        log.info("duplicate gateway message %s -- already handled", msg["wa_id"])
+        return True
+
+    _log_inbound(phone, msg, platform)
+    _make_contactable(phone, platform)
+
+    # Set state to START so the NEXT message from this phone enters intercept() as
+    # a mid-flow reply.  intercept() calls _step() to collect the owner's name, or
+    # treats a REGISTER keyword as a flow restart.  Either path reaches pharmacy
+    # creation without duplicating the state machine.
+    set_state(phone, START, {"sender": phone}, ttl_min=_TTL_MIN, pharmacy_id=platform)
+    _say(phone, _GATEWAY_WELCOME, platform)
+    log.info("opened onboarding for unknown sender %s via platform line %s",
+             phone, platform)
+    return True

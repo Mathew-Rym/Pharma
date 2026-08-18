@@ -18,6 +18,7 @@ from config import settings
 from db import ensure_buckets, ex, q, q1, upload
 from jobs import GLOBAL_JOBS, JOBS, for_every_tenant
 from router import handle_inbound
+import tenancy
 from tenant import resolve_pharmacy_by_device, resolve_tenant
 from utils import from_pieces, kes, norm_phone
 
@@ -286,18 +287,26 @@ async def webhook_gowa(request: Request, background: BackgroundTasks,
                             body.get("device_id") or "", phone, inbound)
         return {"ok": True, "media": media[0]}
 
-    # Resolve pharmacy from GOWA device and inject into the message
-    # The device that RECEIVED this message names the tenant. When it does not resolve,
-    # leave pharmacy_id unset and let the router fall back to the sender's identity --
-    # which is the honest path while one number serves several pharmacies. What must not
-    # happen is defaulting to a configured pharmacy: that silently files a stranger's
-    # conversation into whichever tenant .env happens to name.
-    device_pharmacy = resolve_pharmacy_by_device(body.get("device_id") or "")
-    if device_pharmacy:
-        inbound["pharmacy_id"] = device_pharmacy
+    # Resolve device kind EXPLICITLY using tenancy.resolve() rather than the shim.
+    #
+    # The shim (resolve_pharmacy_by_device) was the right call when only the tenant
+    # pharmacy_id mattered, but it collapses platform and unknown into the same None
+    # result.  gateway_intercept() must distinguish the two: an unknown device must fail
+    # closed rather than silently starting the onboarding welcome.
+    #
+    # Three outcomes, never two:
+    #   'tenant'  -> pharmacy_id is the tenant UUID
+    #   'platform' -> the master/onboarding line; pharmacy_id is not set (platform is not
+    #                 a tenant and has no inventory)
+    #   'unknown' -> unrecognised device; no reply, no state created
+    dev_res = tenancy.resolve(device_jid=body.get("device_id") or "")
+    inbound["device_kind"] = dev_res.kind          # 'platform' | 'tenant' | 'unknown'
+    if dev_res.kind == "tenant":
+        inbound["pharmacy_id"] = dev_res.pharmacy_id
 
-    log.info("gowa inbound from=%s type=%s device=%s pharmacy=%s",
-             phone, inbound["type"], body.get("device_id"), device_pharmacy)
+    log.info("gowa inbound from=%s type=%s device=%s kind=%s pharmacy=%s",
+             phone, inbound["type"], body.get("device_id"),
+             dev_res.kind, dev_res.pharmacy_id)
     background.add_task(handle_inbound, inbound)
     return {"ok": True}
 
