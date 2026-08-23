@@ -25,8 +25,6 @@ Do not ship this to a second paying customer without that work.
 """
 import re
 
-import streamlit as st
-
 ROLES = ["owner", "manager", "pharmacist", "attendant"]
 
 ROLE_HELP = {
@@ -65,6 +63,7 @@ def _valid(phone: str) -> bool:
 
 def first_run(q, ex) -> None:
     """Shown only when `pharmacies` is empty — the database has to be enterable."""
+    import streamlit as st
     st.title("Set up your pharmacy")
     st.caption("Nothing exists yet. Create the pharmacy, then add the owner's "
                "WhatsApp number.")
@@ -119,6 +118,7 @@ def first_run(q, ex) -> None:
 
 def setup_page(q, ex, PID: str, me: dict) -> None:
     """The Setup page: pharmacy details, staff numbers, PINs, new pharmacies."""
+    import streamlit as st
     st.header("Setup")
 
     ph = q("""select name, ppb_licence, mpesa_paybill, wa_number
