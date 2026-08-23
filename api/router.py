@@ -54,6 +54,12 @@ def handle_inbound(msg: dict) -> None:
     if not phone:
         return
 
+    # Fail closed immediately on unrecognised devices. Do not allow them to trigger
+    # onboarding, and do not fall back to sender resolution.
+    if msg.get("device_kind") == "unknown":
+        log.warning("unresolved device (kind=unknown) for inbound from %s -- dropping", phone)
+        return
+
     # Onboarding runs BEFORE resolution, because everything it handles comes from someone
     # the resolver cannot place: a stranger sending REGISTER, or a new hire who is not
     # staff until the moment their JOIN code is accepted. Resolving first would send both
