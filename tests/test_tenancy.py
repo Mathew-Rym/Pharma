@@ -45,7 +45,11 @@ def pair():
     made["jid_platform"] = f"254700{mark[:6]}@s.whatsapp.net"
     yield made
     for key in ("a", "b", "platform"):
-        for t in ("inbound_history", "wa_messages", "customers", "staff"):
+        # suppliers and onboarding_contacts included: a leaked suppliers row would make
+        # resolve_by_sender return a deleted pharmacy on a later run, which reads as a
+        # resolution bug rather than test residue.
+        for t in ("inbound_history", "wa_messages", "customers", "staff", "suppliers",
+                  "onboarding_contacts"):
             ex(f"delete from {t} where pharmacy_id=%s", (made[key],))
         ex("delete from pharmacies where id=%s", (made[key],))
 
@@ -100,18 +104,150 @@ def test_a_person_at_two_pharmacies_is_reported_as_ambiguous(pair):
     """First-match-wins would silently lock them into one tenant forever.
 
     Would fail if resolve_by_sender returned a single id: this person legitimately
-    exists at both, and the caller has to ask rather than guess.
+    works at both, and the caller has to ask rather than guess.
+
+    Uses STAFF, not customers. Being staff somewhere is an operational relationship and
+    genuinely identifies who a number acts for; being a customer does not (see
+    test_being_a_customer_is_not_an_identity below). This test's job is to keep the
+    ambiguity branch -- and router._ask_which_pharmacy -- reachable at all.
+    """
+    import tenancy
+    from db import ex
+
+    for pid in (pair["a"], pair["b"]):
+        ex("""insert into staff (pharmacy_id, name, phone, role, is_active)
+              values (%s,'Works At Both','254755666777','pharmacist',true)""", (pid,))
+
+    found = tenancy.resolve_by_sender("254755666777")
+    assert len(found) == 2
+    assert set(found) == {pair["a"], pair["b"]}
+
+
+@db
+def test_being_a_customer_is_not_an_identity(pair):
+    """THE test in this file after the A1 finding.
+
+    resolve_by_sender answers "which pharmacy does this number act FOR?". Shopping at a
+    pharmacy is not acting for it, and it is many-to-many by nature -- a person who buys
+    from three chemists is ordinary, not ambiguous. Reading customers here was a category
+    error with a concrete cost, proven by driving the real flow:
+
+      a stranger's FIRST message auto-creates a customers row (router._handle_customer ->
+      rx.get_or_create_customer), before consent. So a pharmacy owner who registered
+      through a host line and later sent that line any ordinary message resolved to TWO
+      pharmacies and was answered "which one?" from then on, permanently.
+
+    Filtering on consent_given does not fix it -- the collision just moves from "texted
+    once" to "consented at two", and consenting at two pharmacies is ordinary behaviour.
     """
     import tenancy
     from db import ex
 
     for pid in (pair["a"], pair["b"]):
         ex("""insert into customers (pharmacy_id, phone, name)
-              values (%s,'254755666777','Shops At Both')""", (pid,))
+              values (%s,'254755777888','Shops At Both')""", (pid,))
 
-    found = tenancy.resolve_by_sender("254755666777")
-    assert len(found) == 2
-    assert set(found) == {pair["a"], pair["b"]}
+    assert tenancy.resolve_by_sender("254755777888") == [], (
+        "customers must not be an identity signal; device_id names the tenant for "
+        "customer traffic")
+
+
+@db
+def test_a_supplier_still_resolves(pair):
+    """Suppliers stay in the resolver: a distributor texting about a delivery IS acting
+    for a pharmacy. Note the shape though -- one distributor serving twenty pharmacies is
+    twenty rows, so at scale this returns twenty candidates and asks. Asking is correct;
+    guessing would not be. Recorded so it is not rediscovered as a surprise."""
+    import tenancy
+    from db import ex
+
+    ex("""insert into suppliers (pharmacy_id, name, phone)
+          values (%s,'Distributor','254755999000')""", (pair["a"],))
+    assert tenancy.resolve_by_sender("254755999000") == [pair["a"]]
+
+
+@db
+def test_loyalty_points_do_not_leak_between_pharmacies(pair):
+    """Loyalty is keyed (pharmacy_id, phone) and must never consult resolve_by_sender.
+
+    Now that a customer resolves to no pharmacy at all, any balance lookup that reached
+    for the resolver would read zero pharmacies and either fail or fall back. It must
+    read the BOUND tenant instead -- and return that pharmacy's points only, never the
+    other's and never a sum. Points are money; a sum would let someone spend A's balance
+    at B.
+    """
+    import tenancy
+    from db import ex, q1
+
+    phone = "254756111222"
+    ex("""insert into customers (pharmacy_id, phone, name, loyalty_points)
+          values (%s,%s,'Both Shops',300)""", (pair["a"], phone))
+    ex("""insert into customers (pharmacy_id, phone, name, loyalty_points)
+          values (%s,%s,'Both Shops',25)""", (pair["b"], phone))
+
+    def balance():
+        return q1("select loyalty_points from customers where pharmacy_id=%s and phone=%s",
+                  (tenancy.pid(), phone))["loyalty_points"]
+
+    with tenancy.pharmacy_scope(pair["a"]):
+        assert balance() == 300
+    with tenancy.pharmacy_scope(pair["b"]):
+        assert balance() == 25
+
+    # Sanity: both rows really do exist, so the scoped reads above were selective rather
+    # than accidentally correct because one row was missing.
+    total = q1("select sum(loyalty_points) s from customers where phone=%s", (phone,))["s"]
+    assert total == 325
+
+
+@db
+def test_a_customer_on_a_bound_device_still_reaches_the_customer_branch(pair, monkeypatch):
+    """The regression that removing customers from the resolver could plausibly cause.
+
+    Customers are now invisible to resolve_by_sender, so if the router consulted the
+    sender BEFORE the device, every customer message would hit _greet_unknown and the
+    entire ordering flow would go silent -- with nothing in the logs but "unresolved
+    sender". It does not: main.webhook_gowa sets pharmacy_id from device_id, and the
+    router only falls back to the sender when that is absent.
+
+    Asserts the ORDER, not just the outcome.
+    """
+    import router
+    from db import ex
+
+    phone = "254756555666"
+    ex("insert into customers (pharmacy_id, phone) values (%s,%s)", (pair["a"], phone))
+
+    reached = []
+    monkeypatch.setattr(router, "_handle_customer",
+                        lambda ph, msg, text: reached.append(ph))
+    monkeypatch.setattr(router, "_greet_unknown",
+                        lambda ph: reached.append("GREETED-AS-UNKNOWN"))
+
+    router.handle_inbound({"wa_id": f"tenancy-{secrets.token_hex(4)}", "from": phone,
+                           "type": "text", "text": "do you have panadol",
+                           "pharmacy_id": pair["a"]})
+
+    assert reached == [phone], f"expected the customer branch, got {reached}"
+
+
+@db
+def test_gate_two_still_passes_for_a_customer_only_number(pair):
+    """Gate 2 and the resolver read `customers` for DIFFERENT reasons, and only the
+    resolver changed.
+
+    Gate 2 asks "may we reply to this number?" -- and a customer we have a row for is
+    exactly who we may reply to. If this regressed, every ordinary customer conversation
+    would go silent while looking perfectly healthy in the logs.
+    """
+    import safety
+    from db import ex
+
+    phone = "254756333444"
+    ex("""insert into customers (pharmacy_id, phone) values (%s,%s)""", (pair["a"], phone))
+
+    assert safety.has_relationship(phone, pair["a"]) is True
+    assert safety.has_relationship(phone, pair["b"]) is False, "and only at that pharmacy"
 
 
 @db

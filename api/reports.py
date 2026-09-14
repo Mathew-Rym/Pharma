@@ -130,22 +130,28 @@ def _period_bounds(period: str, start: str | None = None, end: str | None = None
 
 def get_stock(product_query: str | None = None, low_stock_only: bool = False,
               limit: int = 15, pharmacy_id: str | None = None) -> str:
-    pid = pharmacy_id or pid()
+    tenant_id = pharmacy_id or pid()
     if product_query:
         rows = q(
             """select name, legacy_code, pack_size, qty_pieces, earliest_expiry, sell_price
                  from v_stock_on_hand
                 where pharmacy_id = %s and (name ilike %s or similarity(name,%s) > 0.3)
                 order by similarity(name,%s) desc limit %s""",
-            (pid, f"%{product_query}%", product_query, product_query, limit),
+            (tenant_id, f"%{product_query}%", product_query, product_query, limit),
         )
         if not rows:
             return f"No product matching '{product_query}'."
         out = []
         for r in rows:
             exp = f", earliest expiry {r['earliest_expiry']:%b %Y}" if r["earliest_expiry"] else ""
+            # Never quote a zero price. A product created from an invoice line carries the
+            # COST but no sell price yet, and "@ KES 0.00" reads to a customer as free --
+            # a claim the pharmacy would have to honour or argue about at the counter.
+            # Saying the price is not set is the truth and prompts someone to set it.
+            price = (kes(r["sell_price"]) if r["sell_price"] and float(r["sell_price"]) > 0
+                     else "price not set")
             out.append(f"• {r['name']} — {from_pieces(r['qty_pieces'], r['pack_size'])} "
-                       f"({r['qty_pieces']} pcs) @ {kes(r['sell_price'])}{exp}")
+                       f"({r['qty_pieces']} pcs) @ {price}{exp}")
         return "\n".join(out)
 
     rows = q(
@@ -153,7 +159,7 @@ def get_stock(product_query: str | None = None, low_stock_only: bool = False,
              from v_stock_on_hand
             where pharmacy_id = %s and qty_pieces <= greatest(reorder_level_pieces, 0)
             order by qty_pieces asc limit %s""",
-        (pid, limit),
+        (tenant_id, limit),
     )
     if not rows:
         return "Nothing is below its reorder level."
@@ -165,13 +171,13 @@ def get_stock(product_query: str | None = None, low_stock_only: bool = False,
 
 
 def get_expiry_risk(days: int = 90, limit: int = 20, pharmacy_id: str | None = None) -> str:
-    pid = pharmacy_id or pid()
+    tenant_id = pharmacy_id or pid()
     rows = q(
         """select name, batch_no, expiry_date, qty_pieces, value_at_risk, days_left
              from v_expiry_risk
             where pharmacy_id = %s and days_left <= %s
             order by expiry_date limit %s""",
-        (pid, days, limit),
+        (tenant_id, days, limit),
     )
     if not rows:
         return f"Nothing expiring in the next {days} days."
@@ -187,7 +193,7 @@ def get_expiry_risk(days: int = 90, limit: int = 20, pharmacy_id: str | None = N
 
 def get_sales_summary(period: str = "today", start: str | None = None,
                       end: str | None = None, pharmacy_id: str | None = None) -> str:
-    pid = pharmacy_id or pid()
+    tenant_id = pharmacy_id or pid()
     s, e = _period_bounds(period, start, end)
     row = q1(
         """select count(distinct o.id) as orders,
@@ -196,14 +202,14 @@ def get_sales_summary(period: str = "today", start: str | None = None,
              from orders o
             where o.pharmacy_id = %s and o.status in ('paid','packed','dispatched','delivered')
               and o.created_at::date between %s and %s""",
-        (pid, s, e),
+        (tenant_id, s, e),
     )
     units = q1(
         """select coalesce(-sum(m.delta_pieces),0) as pieces
              from stock_movements m
             where m.pharmacy_id = %s and m.reason='sale'
               and m.created_at::date between %s and %s""",
-        (pid, s, e),
+        (tenant_id, s, e),
     )
     return (f"{s:%d %b} – {e:%d %b %Y}\n"
             f"• Revenue: {kes(row['revenue'])}\n"
@@ -214,7 +220,7 @@ def get_sales_summary(period: str = "today", start: str | None = None,
 
 def get_top_products(days: int = 30, limit: int = 10, by: str = "value",
                      pharmacy_id: str | None = None) -> str:
-    pid = pharmacy_id or pid()
+    tenant_id = pharmacy_id or pid()
     order_col = "value" if by == "value" else "pieces"
     rows = q(
         f"""select p.name,
@@ -227,7 +233,7 @@ def get_top_products(days: int = 30, limit: int = 10, by: str = "value",
                and m.created_at > now() - (%s || ' days')::interval
              group by p.id, p.name
              order by {order_col} desc limit %s""",
-        (pid, str(days), limit),
+        (tenant_id, str(days), limit),
     )
     if not rows:
         return f"No sales recorded in the last {days} days."
@@ -240,14 +246,14 @@ def get_top_products(days: int = 30, limit: int = 10, by: str = "value",
 def find_supplier(supplier_name: str | None = None,
                   product_query: str | None = None,
                   pharmacy_id: str | None = None) -> str:
-    pid = pharmacy_id or pid()
+    tenant_id = pharmacy_id or pid()
     if supplier_name:
         rows = q(
             """select name, phone, alt_phone, rep_name, email, mpesa_paybill
                  from suppliers
                 where pharmacy_id=%s and (name ilike %s or similarity(name,%s) > 0.3)
                 order by similarity(name,%s) desc limit 5""",
-            (pid, f"%{supplier_name}%", supplier_name, supplier_name),
+            (tenant_id, f"%{supplier_name}%", supplier_name, supplier_name),
         )
     elif product_query:
         rows = q(
@@ -260,11 +266,11 @@ def find_supplier(supplier_name: str | None = None,
                 where g.pharmacy_id = %s
                   and (p.name ilike %s or similarity(p.name,%s) > 0.3)
                 limit 5""",
-            (pid, f"%{product_query}%", product_query),
+            (tenant_id, f"%{product_query}%", product_query),
         )
     else:
         rows = q("select name, phone, rep_name from suppliers where pharmacy_id=%s "
-                 "order by name limit 25", (pid,))
+                 "order by name limit 25", (tenant_id,))
     if not rows:
         return "No supplier found for that."
     out = []
@@ -283,7 +289,7 @@ def find_supplier(supplier_name: str | None = None,
 
 
 def get_reorder_suggestions(limit: int = 20, pharmacy_id: str | None = None) -> str:
-    pid = pharmacy_id or pid()
+    tenant_id = pharmacy_id or pid()
     rows = q(
         """select s.name, s.pack_size, s.qty_pieces, s.reorder_level_pieces,
                   coalesce(v.avg_daily, 0) as avg_daily,
@@ -297,7 +303,7 @@ def get_reorder_suggestions(limit: int = 20, pharmacy_id: str | None = None) -> 
             order by case when coalesce(v.avg_daily,0) > 0
                           then s.qty_pieces / v.avg_daily else 9999 end asc
             limit %s""",
-        (pid, limit),
+        (tenant_id, limit),
     )
     if not rows:
         return "Nothing needs reordering right now."
@@ -629,25 +635,172 @@ TOOL_IMPLS = {
 }
 
 
+# ------------------------------------------------------------ customer tools
+# A SEPARATE list, deliberately not inside TOOLS: TOOLS feeds tools_for(role), and a
+# customer tool in the staff list would both widen what the model may pick for staff
+# and break the role-cap invariants test_role_tools pins (owner == TOOLS | extras).
+# The customer agent gets exactly these two, and run_tool dispatches them specially
+# because they need the sender's phone (to log demand and later notify them), which
+# the staff tool impls' signature has no room for.
+CUSTOMER_TOOLS = [
+    {
+        "name": "check_stock",
+        "description": "Check live stock and price for a medicine the customer asks "
+                       "about — brand or generic, any language. Use for EVERY "
+                       "availability or price question; never answer from memory.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "product_query": {"type": "string",
+                                  "description": "The medicine name as the customer "
+                                                 "wrote it"},
+            },
+            "required": ["product_query"],
+        },
+    },
+    {
+        "name": "notify_me_when_back",
+        "description": "The customer agreed to be alerted when an out-of-stock item is "
+                       "back. Call ONCE, only after they said yes.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "product_query": {"type": "string",
+                                  "description": "The medicine name they asked for"},
+            },
+            "required": ["product_query"],
+        },
+    },
+]
+
+
+# ------------------------------------------------------------------ who may run what
+#
+# The customer/staff boundary was enforced (CUSTOMER_TOOLS is filtered to get_stock).
+# Within staff it was not: router handed the whole TOOLS list to every role, so an
+# attendant could ask "how did we do today" and be told the day's takings. The
+# deterministic shortcuts were a wider hole still, because no model was involved at all --
+# `TODAY` called get_sales_summary directly.
+#
+# Cumulative by rank, asserted by a test: attendant ⊆ pharmacist ⊆ manager ⊆ owner. A gap
+# would mean a promotion could REMOVE a tool someone relied on, which is the same silent
+# privilege loss as the JOIN-demotes-a-manager bug.
+#
+# Two judgement calls worth naming rather than burying:
+#   * find_supplier sits at manager. An attendant receiving a delivery might reasonably
+#     want the rep's number, but supplier relationships are procurement, and procurement is
+#     where money decisions live. Easy to move down if the shop floor asks for it.
+#   * get_expiry_risk sits at pharmacist, not attendant. Expiry is a dispensing-safety
+#     question before it is a stock question.
+# CAPABILITIES, not just tools. The first version of this policy covered reports.TOOLS and
+# nothing else, which left a hole its own test could not see: the keyword commands PO,
+# VARIANCE, WHY, SYNC, PC and PROBE are handled directly in router._handle_staff without
+# ever calling run_tool. A structural test counting run_tool call sites therefore passed
+# while PO -- which drafts purchase orders and sends them for approval, a money action --
+# stayed open to every role. Anything a role can DO gets a name here.
+_EXTRA_CAPS = {
+    "draft_po",      # PO      — creates draft purchase orders and routes them for approval
+    "variance",      # VARIANCE— till-vs-stock discrepancies, i.e. sales-adjacent figures
+    "forecast_why",  # WHY x   — explains a reorder suggestion, so it exposes the same data
+    "pc_sync",       # SYNC    — ask the shop PC to refresh; no sensitive output
+    "pc_status",     # PC      — is the shop PC online; status only
+    "pc_probe",      # PROBE   — scans the shop PC for its database; infrastructure
+    "receive_goods", # RECEIVE — start an invoice intake; an attendant's core job
+}
+
+# find_supplier is at ATTENDANT deliberately, and was moved down from manager. The problem
+# this product set out to solve at New Lemuma was supplier contacts living on one person's
+# personal phone -- so the attendant standing at the door with a short delivery has to go
+# find someone. Gating a phone number behind manager recreates exactly that. Procurement
+# DECISIONS are manager-level (draft_po, get_reorder_suggestions); a phone number is not a
+# decision.
+_ATTENDANT = {"get_stock", "find_supplier", "pc_sync", "pc_status", "receive_goods"}
+_PHARMACIST = _ATTENDANT | {"get_expiry_risk"}
+_MANAGER = _PHARMACIST | {"get_sales_summary", "get_top_products",
+                          "get_reorder_suggestions", "generate_report_pdf",
+                          "draft_po", "variance", "forecast_why", "pc_probe"}
+
+ROLE_CAPS: dict[str, set[str]] = {
+    "attendant": _ATTENDANT,
+    "pharmacist": _PHARMACIST,
+    "manager": _MANAGER,
+    "owner": {t["name"] for t in TOOLS} | _EXTRA_CAPS,
+}
+
+# Every keyword _staff_help advertises, mapped to the capability it needs. A test asserts
+# this covers the help text, so adding a command to the help without deciding who may run
+# it fails the build -- which is the check that would have caught PO.
+STAFF_COMMANDS: dict[str, str] = {
+    "EXPIRY": "get_expiry_risk",
+    "LOW": "get_stock",
+    "TODAY": "get_sales_summary",
+    "ORDER": "get_reorder_suggestions",
+    "REPORT": "generate_report_pdf",
+    "PO": "draft_po",
+    "WHY": "forecast_why",
+    "VARIANCE": "variance",
+    "SYNC": "pc_sync",
+    "PC": "pc_status",
+    "PROBE": "pc_probe",
+    "RECEIVE": "receive_goods",
+}
+
+
+def tools_for(role: str | None) -> list[dict]:
+    """The reports.TOOLS entries this role may use, for handing to the model."""
+    return [t for t in TOOLS if may_use(role, t["name"])]
+
+
+def may_use(role: str | None, tool: str) -> bool:
+    """Fail closed. An unknown or missing role gets nothing.
+
+    The previous default was "every tool", so a role that is not in this table -- a typo, or
+    one added to the CHECK constraint and forgotten here -- must not inherit it.
+    """
+    return tool in ROLE_CAPS.get(role or "", frozenset())
+
+
+def denial_message(role: str | None, tool: str) -> str:
+    """Say which role is needed, rather than pretending the tool does not exist.
+
+    Hiding it teaches staff the system is broken and they stop trusting it. Naming the role
+    tells them who to ask, which is the actual answer to their question.
+    """
+    needed = [r for r in ("attendant", "pharmacist", "manager", "owner")
+              if tool in ROLE_CAPS.get(r, frozenset())]
+    who = needed[0] if needed else "the owner"
+    return (f"That needs *{who}* access — you're signed in as *{role or 'unknown'}*.\n\n"
+            f"Ask the pharmacy owner if you should have it.")
+
+
 def run_tool(name: str, args: dict, phone: str, pharmacy_id: str | None = None) -> str:
     """Execute a tool. generate_report_pdf has a side effect (sends a document)."""
-    pid = pharmacy_id
-    if not pid and phone:
+    tenant_id = pharmacy_id
+    if not tenant_id and phone:
         from tenant import resolve_tenant
-        pid = resolve_tenant(phone)
-    pid = pid or pid()
+        tenant_id = resolve_tenant(phone)
+    tenant_id = tenant_id or pid()
 
     if name == "generate_report_pdf":
         from wa import send_document
-        path, fname = build_report_pdf(args.get("period", "month"), pharmacy_id=pid)
+        path, fname = build_report_pdf(args.get("period", "month"), pharmacy_id=tenant_id)
         url = signed_url(settings.BUCKET_DOCS, path, 86400)
         send_document(phone, url, fname, "Your Pharma OS report")
         return "Report PDF generated and sent to the user as a WhatsApp document."
+    # Customer tools need the sender's phone (stockout demand log + restock alert),
+    # so they are dispatched here rather than through TOOL_IMPLS' phone-less
+    # signature. They are not in TOOLS, so no staff role can be handed them.
+    if name == "check_stock":
+        from restock import check_stock_customer
+        return check_stock_customer(args.get("product_query", ""), phone or "")
+    if name == "notify_me_when_back":
+        from restock import request_restock_alert
+        return request_restock_alert(args.get("product_query", ""), phone or "")
     fn = TOOL_IMPLS.get(name)
     if not fn:
         return f"Unknown tool {name}"
     try:
-        return fn(**args, pharmacy_id=pid)
+        return fn(**args, pharmacy_id=tenant_id)
     except Exception as e:
         log.exception("tool %s failed", name)
         return f"Tool error: {type(e).__name__}: {e}"

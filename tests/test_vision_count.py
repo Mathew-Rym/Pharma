@@ -275,7 +275,7 @@ def test_unconfirmed_discrepancy_survives_approval(grn, monkeypatch):
 
     staff = q1("select * from staff where pharmacy_id=%s limit 1",
                (os.environ["PHARMACY_ID"],))
-    monkeypatch.setattr(grnmod, "send_text", lambda *a, **k: None)
+    monkeypatch.setattr(grnmod, "reply_text", lambda *a, **k: None)
     grnmod.approve(grn_id, staff, staff["phone"])
 
     g = q1("""select status, unresolved_count_note from grns where id=%s""", (grn_id,))
@@ -303,7 +303,7 @@ def test_a_confirmed_count_is_not_logged_as_unresolved(grn, monkeypatch):
 
     staff = q1("select * from staff where pharmacy_id=%s limit 1",
                (os.environ["PHARMACY_ID"],))
-    monkeypatch.setattr(grnmod, "send_text", lambda *a, **k: None)
+    monkeypatch.setattr(grnmod, "reply_text", lambda *a, **k: None)
     grnmod.approve(grn_id, staff, staff["phone"])
 
     g = q1("select discrepancy_note, unresolved_count_note from grns where id=%s",
@@ -324,7 +324,7 @@ def test_agreeing_count_leaves_nothing_open(grn, monkeypatch):
     grnmod.apply_vision_count(grn_id, ["p.jpg"])
     staff = q1("select * from staff where pharmacy_id=%s limit 1",
                (os.environ["PHARMACY_ID"],))
-    monkeypatch.setattr(grnmod, "send_text", lambda *a, **k: None)
+    monkeypatch.setattr(grnmod, "reply_text", lambda *a, **k: None)
     grnmod.approve(grn_id, staff, staff["phone"])
     g = q1("select unresolved_count_note from grns where id=%s", (grn_id,))
     assert g["unresolved_count_note"] is None

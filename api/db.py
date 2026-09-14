@@ -35,7 +35,13 @@ pool = ConnectionPool(
     max_lifetime=1800,
     # Fail a request rather than hang forever when the database is unreachable.
     timeout=15,
-    kwargs={"row_factory": dict_row, "prepare_threshold": None},
+    # connect_timeout bounds each ATTEMPT to open a connection. The pool's `timeout`
+    # only bounds how long a caller waits for a pooled connection -- a worker stuck in
+    # an unbounded connect (observed against the Supabase pooler) would never return a
+    # connection to the pool at all, and every request behind it would die at 15s until
+    # restart. With this, a stalled attempt fails in 10s and the pool replaces it.
+    kwargs={"row_factory": dict_row, "prepare_threshold": None,
+            "connect_timeout": 10},
 )
 
 # Close the pool on the way out. Without this every short-lived process -- a cron job,
@@ -145,6 +151,26 @@ def tx():
 
 
 # ------------------------------------------------------------ stock movements
+class InsufficientStock(RuntimeError):
+    """A movement would take a batch below zero.
+
+    Raised, never absorbed: a sale the pharmacy cannot physically fulfil must not be
+    recorded as fulfilled. The batch update in apply_movement is the atomic guard --
+    `where qty_pieces + delta >= 0` -- so two concurrent takers of the last units
+    serialise on the row lock and exactly one succeeds. The loser raises, its
+    transaction rolls back, and no ledger row survives.
+    """
+
+    def __init__(self, batch_id: str, delta: int, available: int):
+        self.batch_id = batch_id
+        self.delta = delta
+        self.available = available
+        super().__init__(
+            f"batch {batch_id} has {available} pcs; movement of {delta} would take it "
+            f"below zero -- refusing"
+        )
+
+
 def apply_movement(cur, batch_id: str, delta: int, reason: str,
                    actor_staff: str | None = None, ref_table: str | None = None,
                    ref_id: str | None = None, note: str | None = None) -> None:
@@ -152,17 +178,79 @@ def apply_movement(cur, batch_id: str, delta: int, reason: str,
 
     Writes the ledger row and moves the batch quantity in one statement pair,
     inside the caller's transaction. Never UPDATE batches.qty_pieces anywhere else.
+
+    The pharmacy is DERIVED FROM THE BATCH, and cross-tenant access is refused.
+
+    It used to be settings.PHARMACY_ID -- whichever pharmacy .env named -- so every
+    pharmacy's movements were filed against that one: the batch under tenant A, the ledger
+    row under the .env pharmacy. Invisible while a single pharmacy existed, and the last of
+    the nine module-level `PID = settings.PHARMACY_ID` constants tenancy.py exists to
+    remove. It survived the sweep in test_tenancy.py because it is an argument inside a
+    function rather than a constant at module scope. It became a hard failure only when the
+    .env pharmacy was deleted:
+
+        ForeignKeyViolation: Key (pharmacy_id)=(cee0072c-…) is not present in table
+        "pharmacies"
+
+    -- receiving broken for every pharmacy, at the last step before the ledger.
+
+    The obvious repair is pid(), and it is not enough. A low-level ledger writer should not
+    trust ambient context it cannot check: if a caller binds the wrong tenant, or a batch id
+    arrives from somewhere unexpected, pid() supplies a plausible answer and the ledger row
+    silently disagrees with the stock it moved. Verified by test: with pid(), moving tenant
+    B's batch while bound to A writes A's ledger row AND decrements B's stock, leaving no
+    trace under B.
+
+    The batch is the one source that cannot disagree with the row being written, so the
+    pharmacy comes from there -- and if it differs from the bound tenant that is a bug in the
+    caller, raised rather than absorbed. Both queries use the caller's cursor, so the check
+    and the write are in the same transaction.
+
+    tenancy is imported lazily because tenancy imports db.
     """
+    from tenancy import NoTenant, pid
+
+    cur.execute("select pharmacy_id, qty_pieces from batches where id = %s", (batch_id,))
+    row = cur.fetchone()
+    if not row:
+        raise ValueError(f"no such batch {batch_id}; refusing to write a stock movement")
+    owner = str(row["pharmacy_id"])
+    available = int(row["qty_pieces"] or 0)
+
+    try:
+        bound = pid()
+    except NoTenant:
+        # No tenant bound at all. The batch still names its owner, so the write is
+        # unambiguous -- but nothing legitimate reaches here unscoped, so say so.
+        bound = None
+        log.warning("apply_movement called with no tenant bound; filing batch %s under its "
+                    "owner %s", batch_id, owner)
+    if bound and bound != owner:
+        raise ValueError(
+            f"batch {batch_id} belongs to pharmacy {owner}, not the bound tenant {bound}; "
+            f"refusing to move another tenant's stock")
+
     cur.execute(
         """insert into stock_movements
              (pharmacy_id, batch_id, delta_pieces, reason, actor_staff, ref_table, ref_id, note)
            values (%s,%s,%s,%s,%s,%s,%s,%s)""",
-        (settings.PHARMACY_ID, batch_id, delta, reason, actor_staff, ref_table, ref_id, note),
+        (owner, batch_id, delta, reason, actor_staff, ref_table, ref_id, note),
     )
+    # Atomic non-negative guard. The WHERE clause is evaluated under the row lock the
+    # UPDATE takes, so a concurrent movement on the same batch cannot interleave: one
+    # transaction's update commits first, the other re-evaluates qty_pieces against the
+    # committed value. A delta that would go below zero matches zero rows and raises,
+    # rolling back the ledger insert above with it. This is the invariant "inventory
+    # cannot become negative" enforced at the only sanctioned mutation point, so every
+    # caller (POS, dispensing, GRN corrections) inherits it without knowing about it.
     cur.execute(
-        "update batches set qty_pieces = qty_pieces + %s where id = %s",
-        (delta, batch_id),
+        """update batches set qty_pieces = qty_pieces + %s
+            where id = %s and qty_pieces + %s >= 0
+            returning qty_pieces""",
+        (delta, batch_id, delta),
     )
+    if cur.fetchone() is None:
+        raise InsufficientStock(batch_id, delta, available)
 
 
 # ------------------------------------------------------------------- storage

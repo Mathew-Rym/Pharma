@@ -30,6 +30,144 @@ def add_page(phone: str, storage_path: str) -> None:
     )
 
 
+# ------------------------------------------------------------ typed receiving
+# The photo path needs vision, and vision needs quota. Typing the lines is the
+# no-model fallback: the staff member reads the paper invoice and types one line per
+# item, and the SAME review/approve flow runs afterwards. A human typed it, so no
+# goods-count photo gate is needed -- the typist IS the verifier.
+
+import re as _re
+
+_DATEISH = _re.compile(
+    r"^\s*(\d{1,2}/\d{2,4}|[0-9]{4}-\d{1,2}|\d{1,2}-\d{2,4}"
+    r"|[A-Za-z]{3,9}[-/ ]?\d{2,4})\s*$"
+)
+_BARE_INT = _re.compile(r"^\s*\d+\s*$")
+_PRICEISH = _re.compile(r"^\s*\d+(?:[.,]\d{1,2})?\s*$")
+_WP_STRICT = _re.compile(r"^\s*\d+\s*[wW]\s*\d*\s*[pP]?\s*$")
+
+
+def parse_invoice_text(text: str) -> list[dict]:
+    """Turn typed WhatsApp text into invoice-extraction-shaped line dicts. See
+    _parse_invoice_text_traced for the field-classification rules."""
+    return _parse_invoice_text_traced(text)[0]
+
+
+def _parse_invoice_text_traced(text: str) -> tuple[list[dict], list[str]]:
+    """Parse + report. Returns (lines, rejected_raw_lines).
+
+    A bulk paste of 30 lines where 4 silently fail to parse is stock that never
+    enters the system and nobody knows -- so the caller is told exactly which
+    source lines produced nothing, verbatim, to fix and resend.
+    """
+    out, rejected = [], []
+    for raw in (text or "").splitlines():
+        raw = raw.strip()
+        if not raw:
+            continue
+        # Pipes/semicolons/tabs first (tab = Excel paste). Commas are a fallback
+        # separator ONLY when no other exists, because a decimal comma ("80,50") is
+        # indistinguishable from a comma separator -- splitting on both would turn one
+        # price into two fields.
+        parts = [p.strip() for p in _re.split(r"[|;\t]", raw) if p.strip()]
+        if len(parts) == 1:
+            parts = [p.strip() for p in raw.split(",") if p.strip()]
+        if len(parts) < 2:
+            rejected.append(raw)     # a name alone carries no receiving information
+            continue
+
+        expiry = next((p for p in parts
+                       if _DATEISH.match(p) and parse_expiry(p)), None)
+        qty = next((p for p in parts if _WP_STRICT.match(p)), None)
+        if qty is None:
+            qty = next((p for p in parts
+                        if _BARE_INT.match(p) and p is not expiry), None)
+        # Keep price as the ORIGINAL STRING for the exclusion tests below -- parts
+        # are strings, and comparing a converted float against them never excludes
+        # anything, which is how "160" ended up as both the price and the batch.
+        price_s = next((p for p in parts
+                        if p not in (qty, expiry) and _PRICEISH.match(p)), None)
+        name = next((p for p in parts
+                     if p not in (qty, expiry, price_s)
+                     and not _PRICEISH.match(p)), None)
+        batch = next((p for p in parts
+                      if p not in (qty, expiry, price_s, name)), None)
+        if not name or qty is None:
+            rejected.append(raw)
+            continue
+
+        price = float(price_s.replace(",", ".")) if price_s is not None else None
+        w, pi = parse_wp(qty)
+        # Supplier unit prices are per PACK. Loose pieces have no honest price until
+        # the product (and its pack_size) is matched, so only whole packs are totalled.
+        line_total = (round(w * price, 2) if price is not None and w else None)
+        out.append({
+            "line_no": len(out) + 1,
+            "description": name,
+            "batch_no": batch,
+            "expiry_raw": expiry,
+            "qty_whole": w,
+            "qty_pieces": pi,
+            "unit_price": price,
+            "line_total": line_total,
+            "confidence": 0.99,     # a human typed it; flags below still apply
+        })
+    return out, rejected
+
+
+def add_text_lines(phone: str, text: str) -> None:
+    """Accumulate typed invoice lines inside the grn_collect flow.
+
+    Built for BULK paste: a whole invoice's worth of lines in one message (WhatsApp
+    allows ~4000 chars per message, roughly 60-100 lines) works exactly like one
+    line at a time. Lines that fail to parse are REPORTED, not silently dropped --
+    a line nobody was told about is stock that never enters the system.
+    """
+    lines, rejected = _parse_invoice_text_traced(text)
+
+    if not lines:
+        reply_text(phone,
+                   "I could not read that as an invoice line. Type one item per line:\n"
+                   "_name | batch | expiry | qty | price_\n"
+                   "e.g. *Amoxil 500mg | B123 | 08/2027 | 5W0P | 540*\n"
+                   "You can paste MANY lines in one message.\n"
+                   "or reply *DONE* / *CANCEL*.")
+        return
+
+    st = get_state(phone)
+    ctx = st["context"] if st["flow"] == "grn_collect" else {}
+    so_far = ctx.get("text_lines", [])
+    so_far.extend(lines)
+    set_state(phone, "grn_collect", {**ctx, "text_lines": so_far})
+
+    msg = (f"*{len(lines)} line(s) noted* · {len(so_far)} total. "
+           "Send more, or reply *DONE* to review the delivery.")
+    if rejected:
+        shown = "\n".join(f"✗ {r[:60]}" for r in rejected[:5])
+        more = f"\n…and {len(rejected) - 5} more" if len(rejected) > 5 else ""
+        msg += (f"\n\n⚠️ {len(rejected)} line(s) I could NOT read — fix and resend:\n"
+                f"{shown}{more}")
+    reply_text(phone, msg)
+
+
+def process_text_lines(phone: str, staff: dict) -> None:
+    """DONE after typed lines: persist them and go straight to review."""
+    st = get_state(phone)
+    lines = st["context"].get("text_lines", []) if st["flow"] == "grn_collect" else []
+    if not lines:
+        reply_text(phone, "No lines yet. Type one item per line "
+                          "(_name | batch | expiry | qty | price_), or *CANCEL*.")
+        return
+    data = {"supplier_name": None, "invoice_no": None, "lines": lines}
+    grn_id = _persist(data, [], staff, model="text_input")
+    if not grn_id:
+        clear_state(phone)
+        reply_text(phone, "Nothing could be saved from those lines. Nothing was changed.")
+        return
+    _to_review(phone, grn_id, f"Typed in by {staff.get('name') or 'staff'} — "
+                              "no photo was taken.")
+
+
 # ------------------------------------------------------------ extraction
 def process_pages(phone: str, staff: dict) -> None:
     st = get_state(phone)
@@ -272,7 +410,7 @@ def persist_from_paths(pages: list[str], staff: dict) -> str | None:
     return _persist(data, pages, staff)
 
 
-def _persist(data: dict, pages: list[str], staff: dict) -> str | None:
+def _persist(data: dict, pages: list[str], staff: dict, model: str | None = None) -> str | None:
     lines = data.get("lines") or []
     if not lines:
         return None
@@ -290,7 +428,7 @@ def _persist(data: dict, pages: list[str], staff: dict) -> str | None:
          parse_date_loose(data.get("invoice_date")), data.get("po_ref"),
          data.get("printed_subtotal"), data.get("printed_vat"), data.get("printed_net"),
          parsed_total, __import__("json").dumps(pages),
-         __import__("json").dumps(data), settings.MODEL_VISION),
+          __import__("json").dumps(data), model or settings.MODEL_VISION),
     )
     grn_id = grn["id"]
 
@@ -471,6 +609,14 @@ def handle_review(phone: str, staff: dict, text: str) -> None:
     t = text.strip()
     up = t.upper()
 
+    # A multi-line paste is BULK: one command per line, applied in order, one summary
+    # back. The single-command path below stays byte-for-byte unchanged -- review is
+    # the last gate before stock moves, so its behaviour must not shift under it.
+    lines_in = [l.strip() for l in t.splitlines() if l.strip()]
+    if len(lines_in) > 1:
+        _handle_review_bulk(phone, staff, grn_id, lines_in)
+        return
+
     if up in ("CANCEL", "STOP"):
         ex1("update grns set status='rejected' where id=%s returning id", (grn_id,))
         clear_state(phone)
@@ -491,6 +637,30 @@ def handle_review(phone: str, staff: dict, text: str) -> None:
                 reply_text(phone, f"Line {left.strip()} counted as {right.strip()}. "
                                  "More corrections, or reply *OK*.")
                 return
+
+    # Checked before the per-line parser, since "ALL NEW" does not start with a digit and
+    # would otherwise fall through to the "I did not understand that" branch.
+    if _is_all_new(t):
+        created = _link_all_unmatched(grn_id)
+        still = q("""select line_no from grn_lines where grn_id=%s and product_id is null
+                      order by line_no""", (grn_id,))
+        if not created and not still:
+            reply_text(phone, "Every line is already linked to a product. Reply *OK* to "
+                             "receive into stock.")
+            return
+        msg = (f"Added {len(created)} product(s) to your list and linked them:\n"
+               + "\n".join(f"• {n}" for n in created[:12]))
+        if len(created) > 12:
+            msg += f"\n…and {len(created) - 12} more"
+        if still:
+            nums = ", ".join(str(r["line_no"]) for r in still[:8])
+            msg += (f"\n\n⚠️ Line(s) {nums} had no readable description, so I did not "
+                    f"invent a product for them. Fix with *{still[0]['line_no']} NEW* "
+                    f"after checking the invoice.")
+        else:
+            msg += "\n\nReply *OK* to receive into stock."
+        reply_text(phone, msg)
+        return
 
     # "<line> EXP 06/2028" | "<line> BATCH X" | "<line> NEW"
     parts = t.split(None, 2)
@@ -531,7 +701,83 @@ def handle_review(phone: str, staff: dict, text: str) -> None:
               "• *7 EXP 06/2028* — fix an expiry\n"
               "• *7 BATCH ST26-0439* — fix a batch number\n"
               "• *7 NEW* — add as a new product\n"
+              "• *ALL NEW* — add every unlinked line as a new product\n"
               "• *CANCEL* — discard")
+
+
+def _handle_review_bulk(phone: str, staff: dict, grn_id: str, lines_in: list[str]) -> None:
+    """Apply several review commands pasted in one message, then reply once.
+
+    Accepted per line: the same commands the single-line path takes -- `5:2W`,
+    `7 EXP 06/2028`, `7 BATCH ST26-0439`, `7 NEW`, `ALL NEW`, `OK`, `CANCEL`.
+    Corrections apply in order; OK at the end approves (and sends the usual
+    received-into-stock message); CANCEL discards immediately. Unreadable lines
+    are listed back verbatim so nothing is silently skipped.
+    """
+    applied, bad, want_ok = [], [], False
+
+    for ln in lines_in:
+        u = ln.upper().strip()
+
+        if u in ("CANCEL", "STOP"):
+            ex1("update grns set status='rejected' where id=%s returning id", (grn_id,))
+            clear_state(phone)
+            reply_text(phone, f"Discarded ({len(applied)} correction(s) had been applied "
+                              "first — no stock was changed).")
+            return
+
+        if u in ("OK", "DONE"):
+            want_ok = True
+            continue
+
+        if _is_all_new(ln):
+            created = _link_all_unmatched(grn_id)
+            applied.append(f"ALL NEW — added {len(created)} product(s)")
+            continue
+
+        # "5:2W"
+        if ":" in ln:
+            left, right = ln.split(":", 1)
+            if left.strip().isdigit() and parse_wp(right):
+                _set_counted(grn_id, int(left.strip()), parse_wp(right))
+                applied.append(f"line {left.strip()} counted as {right.strip()}")
+                continue
+
+        # "7 EXP 06/2028" | "7 BATCH X" | "7 NEW"
+        parts = ln.split(None, 2)
+        if parts and parts[0].isdigit():
+            line_no = int(parts[0])
+            kind = parts[1].upper() if len(parts) > 1 else ""
+            val = parts[2].strip() if len(parts) > 2 else ""
+            if kind == "EXP" and val and parse_expiry(val):
+                d = parse_expiry(val)
+                _update_line(grn_id, line_no, "expiry_date", d, "missing_expiry")
+                applied.append(f"line {line_no} expiry → {d.strftime('%b %Y')}")
+                continue
+            if kind == "BATCH" and val:
+                _update_line(grn_id, line_no, "batch_no", val, "missing_batch")
+                applied.append(f"line {line_no} batch → {val}")
+                continue
+            if kind == "NEW":
+                name = _create_product_from_line(grn_id, line_no)
+                applied.append(f"line {line_no} NEW → {name}" if name
+                               else f"line {line_no} NEW → line not found")
+                continue
+
+        bad.append(ln)
+
+    msg = f"✅ Applied {len(applied)} correction(s):\n" + \
+          "\n".join(f"• {a}" for a in applied[:15])
+    if len(applied) > 15:
+        msg += f"\n…and {len(applied) - 15} more"
+    if bad:
+        msg += ("\n\n⚠️ Not understood — resend these:\n"
+                + "\n".join(f"✗ {b[:60]}" for b in bad[:5]))
+    reply_text(phone, msg)
+
+    if want_ok:
+        # approve() sends its own confirmation and the stock-received notice.
+        approve(grn_id, staff, phone)
 
 
 def _set_counted(grn_id: str, line_no: int, wp: tuple[int, int]) -> None:
@@ -563,6 +809,58 @@ def _update_line(grn_id: str, line_no: int, col: str, value, drop_flag: str) -> 
              where grn_id = %s and line_no = %s returning id""",
         (value, drop_flag, grn_id, line_no),
     )
+
+
+def _is_all_new(text: str) -> bool:
+    """True for `ALL NEW` in any casing or spacing, and nothing else.
+
+    Deliberately not a prefix or substring match. `7 NEW` must keep working -- on an
+    established pharmacy, a few unfamiliar items among fifty known ones deserve a decision
+    each, and a greedy match here would take that away.
+    """
+    return (text or "").strip().upper().replace(" ", "") == "ALLNEW"
+
+
+def _link_all_unmatched(grn_id: str) -> list[str]:
+    """Create a product for every unmatched line on this GRN. Returns the names created.
+
+    This exists because the per-line remedy is a dead end on a NEW pharmacy. approve()
+    refuses while anything is unmatched and says to reply `<n> NEW` for each -- which is
+    right when three lines out of fifty are new, and impossible when all fifty are, because
+    there are no products to match against yet.
+
+    A real pharmacy demonstrated it: 232 extracted invoice lines, and products, batches and
+    stock_movements all zero. Gemini had read the invoices correctly. Finishing would have
+    meant ~58 separate WhatsApp messages, so nobody did, and a customer asking for a
+    medicine got "No product matching".
+
+    Scope is deliberately narrow: this LINKS lines to catalogue entries. It does not
+    approve, does not write batches or stock_movements, and does not touch the physical
+    count or the POM gate. Creating a catalogue entry and moving stock are different
+    decisions and stay that way -- the user still replies OK afterwards, and still counts
+    the goods.
+
+    Idempotent: a second call finds nothing unmatched and returns []. Someone will send it
+    twice.
+    """
+    rows = q("""select line_no, raw_description from grn_lines
+                 where grn_id = %s and product_id is null
+                 order by line_no""", (grn_id,))
+    created, skipped = [], []
+    for r in rows:
+        # A line with no description would become a product called "Unknown item" that a
+        # pharmacist could later dispense from. Skip it and name it, so a human decides.
+        if not (r["raw_description"] or "").strip():
+            skipped.append(r["line_no"])
+            continue
+        name = _create_product_from_line(grn_id, r["line_no"])
+        if name:
+            created.append(name)
+        else:
+            skipped.append(r["line_no"])
+    if skipped:
+        log.info("grn %s: lines %s left unmatched (no usable description)", grn_id, skipped)
+    return created
 
 
 def _create_product_from_line(grn_id: str, line_no: int) -> str | None:
@@ -612,8 +910,16 @@ def approve(grn_id: str, staff: dict, phone: str) -> None:
     unmatched = [l for l in lines if not l["product_id"]]
     if unmatched:
         nums = ", ".join(str(l["line_no"]) for l in unmatched[:8])
-        reply_text(phone, f"Cannot receive yet — line(s) {nums} are not linked to a product. "
-                         f"Reply *{unmatched[0]['line_no']} NEW* to add, for each.")
+        # Offer the bulk form FIRST when most of the invoice is unmatched. On a new
+        # pharmacy that is every line, and naming only the per-line command is what left
+        # 232 extracted lines stranded: correct advice nobody could act on 58 times.
+        bulk = len(unmatched) >= 3 or len(unmatched) == len(lines)
+        how = (f"Reply *ALL NEW* to add all {len(unmatched)} as new products, "
+               f"or *{unmatched[0]['line_no']} NEW* one at a time."
+               if bulk else
+               f"Reply *{unmatched[0]['line_no']} NEW* to add, for each.")
+        reply_text(phone, f"Cannot receive yet — line(s) {nums} are not linked to a "
+                         f"product. {how}")
         return
 
     g = q1("select * from grns where id=%s", (grn_id,))
@@ -728,3 +1034,13 @@ def approve(grn_id: str, staff: dict, phone: str) -> None:
                   f"{kes(g['net_total'] or g['parsed_total'])} · {received} lines · "
                   f"by {staff['name']}"
                   + (f"\n⚠️ {len(short_lines)} count discrepancy(ies)" if short_lines else ""))
+
+    # Close the restock loop: customers who asked to be told when an item came back.
+    # Strictly after the transaction above (stock must exist before anyone is told it
+    # does) and strictly non-fatal — receiving itself has already succeeded, and a
+    # notification failure must never make the approver think it hadn't.
+    try:
+        from restock import notify_restocked
+        notify_restocked(grn_id)
+    except Exception:
+        log.exception("restock notifications skipped (receiving itself succeeded)")

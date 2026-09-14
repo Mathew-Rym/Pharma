@@ -90,6 +90,112 @@ The command then waits and prints `PAIRED` when the session comes up.
 
 ---
 
+## 2c. Or let the pharmacy register itself — `REGISTER`
+
+Steps 2b and 3 are you, at a terminal, onboarding one pharmacy. This is the same thing
+driven entirely from WhatsApp, by the owner, with no terminal at all.
+
+**The owner texts `REGISTER`** to the platform number and answers five questions:
+
+```text
+REGISTER
+> First — what is your name?
+Peter Otieno
+> What is the pharmacy's registered name?
+Testline Chemist
+> What is the PPB premises licence number for Testline Chemist?
+PPB/98765/2025
+> Which town or estate is Testline Chemist in?
+Kakamega
+> Which WhatsApp number will the pharmacy use for its bot?
+0733222111
+> [summary] Reply YES to create it, or EDIT to start again.
+YES
+```
+
+`YES` creates the pharmacy, makes the sender its owner, and replies with three things:
+
+* the **8-character link code** from WhatsApp — for the pharmacy's own handset
+* an **OWNER code** — managers text `OWNER <code>` to join
+* a **JOIN code** — attendants text `JOIN <code>` to join
+
+The link code comes from GOWA (`/app/login-with-code`), not from us. A locally generated
+code is the failure this flow was rebuilt to avoid: it looks right, reads out fine, and
+links nothing.
+
+### Then the handset has to link
+
+The owner types the code on the shop's phone. Nothing tells us when that finishes, so
+something has to look:
+
+```bash
+./run.sh activate      # binds the JID of anything that has linked, and tells the owner
+```
+
+Run it a couple of times while they type, or leave it on cron. Until it succeeds the
+pharmacy is `pending_activation`: it exists, has stock and staff, and cannot send or
+receive a thing. That state is deliberate and visible rather than looking like an outage.
+
+`activate` refuses to bind a slot that linked to a **different** number than the one
+registered — that means somebody else typed the code, and binding it would hand a stranger
+the pharmacy's conversations.
+
+### Runtime slot creation works — and this is what makes it scale
+
+Each registering pharmacy gets its **own** GOWA slot, created on the fly, named
+`ph-<digits>` from the handset number. `pharmacy-1` is never reused. That is the whole basis
+for onboarding fifty pharmacies from one platform line, so it is worth being clear that it
+is confirmed working: after the DNS fix, `POST /app/login` against a slot created minutes
+earlier returned `SUCCESS` with a real `qr_link`, and a subsequent scan put a JID on it.
+
+An earlier commit message recorded this as a KNOWN LIMITATION — *"pairing a runtime-created
+slot fails with `AUTHENTICATION_ERROR: reconnect error`"*. **That was wrong**, and it read as
+"the model does not scale". The slot was fine; the container could not resolve
+`web.whatsapp.com` at all. `reconnect error` means **no route to WhatsApp**, not a bad slot.
+
+So when pairing fails with that message, check connectivity first — it is a one-liner:
+
+```bash
+docker logs pharmaos-gowa | grep "i/o timeout"
+```
+
+Any hits mean DNS. See the `--dns` flags in `run.sh` and `wa-gowa/docker-compose.yml`.
+
+### Sessions survive a restart
+
+Sessions live in the `gowa-storage` volume at `/app/storages/whatsapp.db`. **`docker stop`
+then `docker start` cannot lose a pairing** — the files never move. Neither does a full
+`docker rm` + `docker run`: on 2 August GOWA logged `auto-connected device pharmacy-1` after
+exactly that, which is the session loading from disk.
+
+An earlier note claimed a recreate *had* lost the session. It had not. The millisecond log
+shows why the two look identical from outside:
+
+```text
+10:55:52.033  auto-connected device pharmacy-1        ← loaded from disk
+10:55:52.655  [REMOTE_LOGOUT] 254777602338:2          ← WhatsApp invalidated it, 622ms later
+```
+
+The session was restored and then killed server-side. Only deleting the volume loses a
+pairing locally; everything else is WhatsApp's decision. See RUNBOOK.md for the backup
+procedure and its caveats.
+
+### The platform line
+
+Onboarding means messaging people with no history, which is exactly the pattern WhatsApp
+bans numbers for. It belongs on a line of its own:
+
+```bash
+./run.sh pair 254700000000 platform    # a number reserved for this
+./run.sh platform platform             # designate it
+```
+
+Without one, `REGISTER` still works — it is answered by whichever pharmacy owns the number
+that was texted, and every occurrence is logged as a warning. That is fine for a pilot
+with one SIM and should not outlive it: the ban risk sits on a real pharmacy's number.
+
+---
+
 ## 3. Bind the paired slot to a pharmacy
 
 Pairing gives GOWA a session. Binding tells the app whose it is.
@@ -128,7 +234,7 @@ or they all appear identically to customers.
 Idempotent — re-run it to reset to a known state before each rehearsal. It prints the
 isolation moment so you can see it worked:
 
-```
+```text
 nebivolol     A: Nebilong 5mg KES 780   B: Nebilet 5mg KES 890
 atorvastatin  A: Atorvachol KES 950     B: not stocked
 ```
@@ -166,14 +272,25 @@ This is the step that decides whether the demo works. It prints:
 * who can be messaged (they have texted the bot before)
 * who is related but **not reachable** because they never texted in
 
-Two things silence a participant, and both look identical to a broken bot:
+### Which gate grants access, and who grants it
 
-1. **Not on `WA_ALLOWLIST`.** Add them to `.env`. Takes effect immediately, no restart.
-2. **Never messaged the bot.** They must send one message first. The system deliberately
-   refuses to message anyone who has not — that is what stops the number being banned.
+| | Gate 1 · allowlist | Gate 3 · chat established |
+| --- | --- | --- |
+| Granted by | you, editing `WA_ALLOWLIST` | them, texting the bot |
+| Automatic | never — the code only reads it | yes, on their first message |
+| When to use | while developing | always on |
 
-So for every demo participant: **add their number to the allowlist, and have them text the
-bot once.**
+**Gate 1 is off by default** (`WA_ALLOWLIST=` empty), which is the production posture. In
+that state **texting the bot once is all a participant needs** — Gate 3 records it and they
+become reachable. Strangers are still refused by Gate 2 and cold numbers by Gate 3.
+
+Turn Gate 1 on only while building, when an accidental send to a real number would be
+costly: a seed script holding live numbers, or a test that really sends. It is deliberately
+manual — auto-populating it on inbound would make it identical to Gate 3 and it would stop
+being a second layer.
+
+With Gate 1 ON, a participant needs BOTH an `.env` entry and an inbound message, and
+forgetting the entry looks exactly like a broken bot. That is the trade-off.
 
 ---
 
@@ -190,6 +307,12 @@ alert, so running it would only produce failures that look like bugs.
 
 Available: `expiry_sweep`, `forecast_refresh`, `variance_report`, `low_stock_check`,
 `daily_digest`, `weekly_report`, `refill_reminders`, `reconcile`.
+
+`activation_sweep` is the exception: it runs **once for the whole platform**, not once per
+tenant, and returns `{"scope": "platform", ...}`. It has to, because the per-tenant loop
+selects pharmacies that are already paired — precisely the ones it has nothing to do for.
+Put it on a short cron (every minute or two) if pharmacies register unattended; otherwise
+`./run.sh activate` by hand is enough.
 
 ---
 
@@ -231,12 +354,14 @@ and re-run `./run.sh bind <slot>`.
 ## Command reference
 
 | Command | Does |
-|---|---|
+| --- | --- |
 | `./run.sh migrate` | Apply schema, in numeric order |
 | `./run.sh whatsapp` | Start the GOWA container |
 | `./run.sh qr` | Pair by QR, self-refreshing |
 | `./run.sh pair <phone> [slot]` | Pair by 8-character code — for remote pharmacies |
 | `./run.sh bind <slot> [name]` | Attach a paired slot to a pharmacy |
+| `./run.sh platform <slot>` | Designate the line that answers `REGISTER` |
+| `./run.sh activate` | Bind handsets that have finished linking; tell their owners |
 | `./run.sh unpair` | Log a slot out |
 | `./run.sh brand` | Push display name + photo for `GOWA_DEVICE_ID` |
 | `./run.sh safety` | **Anti-ban posture and who is reachable** |

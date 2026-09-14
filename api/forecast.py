@@ -158,10 +158,32 @@ def reorder_message(limit: int = 12) -> str:
     return "\n\n".join(out)
 
 
+def open_po_product_ids() -> set[str]:
+    """Products already sitting on an unsent PO (draft or awaiting approval).
+
+    Shared by every draft-PO creator so they agree on what "already ordered" means:
+    the 07:00 low-stock job, an owner's ORDER/PO reply, and the stockout trigger can
+    all fire for the same product inside a day, and each used to mint its own PO --
+    the approval queue filled with near-identical orders to triage. Deliberately
+    excludes sent/received POs: a genuinely new restock need after a PO was sent is
+    a legitimate second PO.
+    """
+    return {str(r["product_id"]) for r in q(
+        """select distinct l.product_id
+             from po_lines l join purchase_orders po on po.id = l.po_id
+            where po.pharmacy_id = %s
+              and po.status in ('draft','awaiting_approval')""",
+        (pid(),),
+    )}
+
+
 def create_draft_pos(staff_id: str | None = None,
                      supplier_filter: str | None = None) -> list[dict]:
     """Turn the suggestion list into draft purchase orders awaiting one-tap approval."""
     rows = reorder_list(60)
+    # Dedup: a product already sitting on an unsent PO must not get a second one.
+    already_open = open_po_product_ids()
+    rows = [r for r in rows if str(r["product_id"]) not in already_open]
     if supplier_filter:
         rows = [r for r in rows
                 if r["supplier"] and supplier_filter.lower() in r["supplier"].lower()]

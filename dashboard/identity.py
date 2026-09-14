@@ -61,8 +61,18 @@ def send_code(phone_raw: str, q, ex) -> tuple[bool, str]:
     """
     from onboarding import norm_phone
     phone = norm_phone(phone_raw)
+    # One message for every outcome, so the box cannot be used to discover who works here.
+    #
+    # The second sentence is the recovery path for the one failure this flow genuinely
+    # has: WhatsApp will not let us message someone who has never messaged us (Gate 3), so
+    # a staff member who has only ever been added in the dashboard cannot receive a code.
+    # It has to be said here, generically, because saying it only to real staff would leak
+    # exactly what the first sentence is protecting.
     generic = ("If that number belongs to a staff member, a 6-digit code is on its "
-               "way to it on WhatsApp.")
+               "way to it on WhatsApp.\n\n"
+               "No code after a minute? Send *HI* to the pharmacy's WhatsApp number "
+               "from that phone, then try again — WhatsApp blocks us from messaging a "
+               "number that has never messaged us.")
     if not phone:
         return False, "Enter the WhatsApp number you were registered with."
 
@@ -92,11 +102,24 @@ def send_code(phone_raw: str, q, ex) -> tuple[bool, str]:
     api = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "api")
     if api not in sys.path:
         sys.path.insert(0, api)
-    from wa import reply_text
-    reply_text(phone,
-              f"*{code}* is your Pharma OS sign-in code.\n\n"
-              f"It expires in {CODE_TTL_MIN} minutes. If you did not try to sign in, "
-              f"ignore this message and tell the owner.")
+    # send_for(), not reply_text(): reply_text swallows GateBlocked into a log line, which
+    # would leave this function reporting "a code is on its way" for a message that was
+    # never sent. The staff member then waits for a code that does not exist and the UI
+    # agrees with them. Catch it here so the log says which staff member is unreachable
+    # and why.
+    from safety import GateBlocked
+    from wa import UnroutableMessage, send_for
+    try:
+        send_for(str(s["pharmacy_id"]), phone, "text",
+                 f"*{code}* is your Pharma OS sign-in code.\n\n"
+                 f"It expires in {CODE_TTL_MIN} minutes. If you did not try to sign in, "
+                 f"ignore this message and tell the owner.")
+    except GateBlocked as e:
+        log.warning("sign-in code for staff %s NOT sent: %s", s["id"], e)
+        return True, generic          # still generic: do not confirm the account exists
+    except UnroutableMessage as e:
+        log.error("sign-in code for staff %s undeliverable: %s", s["id"], e)
+        return True, generic
     log.info("login code sent to staff %s", s["id"])
     return True, generic
 

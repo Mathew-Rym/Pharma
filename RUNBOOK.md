@@ -167,8 +167,70 @@ HELP · EXPIRY · LOW · TODAY · REPORT · report for july · who supplies pren
 ./run.sh test -k gowa      # a subset
 ```
 
-DB-backed tests need `.env` loaded; `run.sh` does that for you. They create and delete
-their own rows and leave the database as they found it.
+DB-backed tests need `.env` loaded; `run.sh` does that for you.
+
+**The suite creates its own pharmacy.** `tests/conftest.py` inserts a `PYTEST-<mark>`
+pharmacy at import time, exports its id as `PHARMACY_ID`, and deletes it (and everything
+hanging off it, in FK order) at the end of the session. It used to bind
+`settings.PHARMACY_ID` — a real pharmacy — so every run wrote into live data and cleanup was
+manual. An explicit `PHARMACY_ID` in the environment still wins if you want to aim a run at
+a specific pharmacy.
+
+Five tests skip without a real Supabase project or a running GOWA, marked `needs_supabase`
+and `needs_gowa`. They are skipped explicitly rather than left failing, because a suite that
+always shows one red trains everyone to ignore red.
+
+Against a throwaway local Postgres (`pharma-test-pg` on `127.0.0.1:55432`) the whole suite
+runs in about 6 seconds with `PHARMACY_ID` unset:
+
+```bash
+env -u PHARMACY_ID DATABASE_URL=postgresql://test:test@127.0.0.1:55432/test \
+  PHARMAOS_TESTING=1 GEMINI_API_KEY=test-only SHARED_SECRET=test-secret \
+  SUPABASE_URL=https://test.supabase.co SUPABASE_SERVICE_KEY=test.test.test \
+  .venv/bin/python -m pytest tests/ -q
+```
+
+---
+
+## Backing up the WhatsApp sessions
+
+Sessions live in the `gowa-storage` volume at `/app/storages/whatsapp.db` (plus `-wal` and
+`-shm`). **`docker stop` / `docker start` cannot lose them** — the files never move. Only
+deleting the volume can. A container recreate keeps them too: on 2 August GOWA logged
+`auto-connected device pharmacy-1` after a full `docker rm` + `docker run`, which is the
+session loading from disk.
+
+Read-only, and it does not require GOWA to be running:
+
+```bash
+mkdir -p ~/gowa-backups
+docker run --rm -v gowa-storage:/v:ro -v ~/gowa-backups:/out alpine \
+  tar czf /out/gowa-sessions-$(date +%F-%H%M).tgz \
+  -C /v whatsapp.db whatsapp.db-wal whatsapp.db-shm
+```
+
+Restore by stopping GOWA, extracting back into the volume, and starting it.
+
+Three things to know before trusting a backup:
+
+- **Check it is not empty.** A snapshot taken after a logout contains a `whatsmeow_device`
+  table with zero rows and restores nothing. Both snapshots currently in `~/gowa-backups`
+  are empty for exactly that reason — they were taken after WhatsApp invalidated the
+  session. **Re-run the backup after you next pair.** To check:
+
+  ```bash
+  docker run --rm -v gowa-storage:/v:ro alpine sh -c \
+    'apk add -q sqlite; cp /v/whatsapp.db /tmp/w.db; \
+     sqlite3 /tmp/w.db "select count(*) from whatsmeow_device;"'
+  ```
+
+- **The volume is on ONE host.** A host failure loses every pharmacy's session at once, and
+  each one needs a physical handset to re-pair. That is the single largest operational risk
+  in the deployment, and copying the tarball off this machine is the whole mitigation.
+
+- **Portability across GOWA versions is UNVERIFIED.** It is a SQLite schema owned by
+  whatsmeow; a major version bump could change it. Nobody has tested a restore into a
+  different version.
 
 ---
 

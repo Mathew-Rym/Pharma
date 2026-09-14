@@ -3,6 +3,7 @@
 The webhook returns 200 immediately and does the real work in a background task.
 Baileys will time out and re-deliver if you make it wait for a 30-second vision call.
 """
+import asyncio
 import hashlib
 import hmac
 import json
@@ -14,9 +15,10 @@ from fastapi import BackgroundTasks, FastAPI, Header, HTTPException, Request, Up
 from fastapi.responses import HTMLResponse, JSONResponse
 
 from config import settings
-from db import ensure_buckets, q, q1, upload
-from jobs import JOBS, for_every_tenant
+from db import ensure_buckets, ex, q, q1, upload
+from jobs import GLOBAL_JOBS, JOBS, for_every_tenant
 from router import handle_inbound
+import tenancy
 from tenant import resolve_pharmacy_by_device, resolve_tenant
 from utils import from_pieces, kes, norm_phone
 
@@ -38,13 +40,67 @@ def _auth(secret: str | None) -> None:
         raise HTTPException(status_code=401, detail="bad secret")
 
 
+# How often to look for handsets that have finished linking. Pairing is asynchronous --
+# someone walks to another room and types a code -- and only GOWA knows when it completed.
+ACTIVATION_POLL_SECS = 60
+
+
+async def _activation_loop() -> None:
+    """Bind newly linked handsets, forever, inside this process.
+
+    IN-PROCESS on purpose, not cron and not a systemd timer: activation_sweep talks to GOWA
+    on localhost:3001, so it has to run somewhere that can reach it. This is that place.
+
+    It exists because the owner has no terminal. Until now every activation waited on a
+    human running ./run.sh activate, which is fine for us and impossible for a pharmacist
+    in Kakamega -- they type the code, nothing happens, and the product looks broken at the
+    one moment it most needs not to.
+
+    MULTI-WORKER HAZARD, and the choice made: with more than one uvicorn worker this loop
+    runs once per worker, so two workers would both try to bind the same handset. The
+    obvious guard is a Postgres advisory lock, but those are SESSION-scoped and DATABASE_URL
+    points at Supabase's TRANSACTION pooler (6543), where a session-scoped lock is not
+    reliably held on the same backend -- exactly the finding that made tenancy.LIVE_SQL
+    necessary. Using DIRECT_URL for one long-lived lock connection would work and is the
+    upgrade path if this ever runs multi-worker.
+
+    Single worker is therefore a REQUIREMENT, and it is documented, not enforced -- nothing
+    here detects the worker count, and claiming otherwise would be worse than the gap. Both
+    launchers run one worker today (run.sh and api/Dockerfile pass no --workers).
+
+    If it is ever run multi-worker the failure is bounded rather than corrupting: the UPDATE
+    writes the same JID either way, so the worst case is _confirm_activation sending the
+    owner the same "you're live" message twice.
+    """
+    import register
+    while True:
+        try:
+            res = register.activation_sweep()
+            if res.get("activated"):
+                log.info("activation loop: activated %s", res["activated"])
+        except Exception:
+            # Never let one bad sweep kill the loop; a pharmacy waiting to go live would
+            # then wait forever, with nothing in the log to say why.
+            log.exception("activation sweep failed; will retry")
+        await asyncio.sleep(ACTIVATION_POLL_SECS)
+
+
 @app.on_event("startup")
-def _startup() -> None:
+async def _startup() -> None:
     try:
         ensure_buckets()
     except Exception:
         log.warning("bucket check skipped", exc_info=True)
-    log.info("pharmaos api up · model=%s", settings.MODEL_VISION)
+    app.state.activation_task = asyncio.create_task(_activation_loop())
+    log.info("pharmaos api up · model=%s · activation sweep every %ss",
+             settings.MODEL_VISION, ACTIVATION_POLL_SECS)
+
+
+@app.on_event("shutdown")
+async def _shutdown() -> None:
+    task = getattr(app.state, "activation_task", None)
+    if task:
+        task.cancel()
 
 
 @app.get("/health")
@@ -114,6 +170,24 @@ async def webhook_media(background: BackgroundTasks,
 
 
 # ============================================================ GOWA webhook
+#
+# Kinds we look for on an inbound payload. Only IMAGE is something this system can act on;
+# everything else is detected so it can be REFUSED deliberately rather than misread.
+#
+# 'voice' and 'ptt' are here without confirmation. The GOWA binary contains the bare strings
+# `voice`/`Voice`/`VOICE` and json tags `json:"audio"` / `json:"ptt"` -- but those tags are
+# on its SEND request structs, not on the inbound webhook payload, so the key a real voice
+# note arrives under is still unverified. Detecting a key that never appears costs nothing;
+# failing to detect one means a voice note falls through as an empty text message. Broad
+# detection, narrow action.
+_MEDIA_KINDS = ("image", "document", "video", "audio", "voice", "ptt", "sticker")
+
+# What the pharmacy can actually process. Photos and documents (CSV/Excel stock files).
+_ACTIONABLE_MEDIA = ("image", "document")
+
+_CSV_EXTS = ("csv", "xls", "xlsx")
+
+
 def _gowa_media_path(payload: dict) -> tuple[str, str] | None:
     """Return (kind, relative_path) for the first media field GOWA sent, else None.
 
@@ -122,7 +196,7 @@ def _gowa_media_path(payload: dict) -> tuple[str, str] | None:
     {"path": ..., "caption": ...}; with auto-download off it is {"url": ...}. Handle
     all three rather than assuming one.
     """
-    for kind in ("image", "document", "video", "audio", "sticker"):
+    for kind in _MEDIA_KINDS:
         v = payload.get(kind)
         if not v:
             continue
@@ -180,57 +254,150 @@ async def webhook_gowa(request: Request, background: BackgroundTasks,
     }
 
     media = _gowa_media_path(payload)
-    if media:
+
+    # Refuse non-image media BEFORE fetching or storing a byte of it.
+    #
+    # The previous code computed `kind` correctly and then threw it away: the extension was
+    # forced to .jpg for anything outside jpg/jpeg/png/webp/pdf, the upload was tagged
+    # image/jpeg, and inbound["type"] was hardcoded "image". So a voice note was downloaded,
+    # written into the PRESCRIPTIONS bucket as a fake JPEG, and handed to _handle_customer
+    # -- which sends any image to the prescription vision extractor. For staff it became a
+    # GRN invoice page. A spoken message parsed as a prescription is the worst failure this
+    # system can produce, and it was three lines of hardcoding away.
+    if media and media[0] not in _ACTIONABLE_MEDIA:
         kind, rel = media
-        from wa import gowa_fetch_media
-        data = (gowa_fetch_media(rel) if not str(rel).startswith("http")
-                else None)
-        if data is None and str(rel).startswith("http"):
-            try:
-                import httpx
-                data = httpx.get(rel, timeout=120).content
-            except Exception:
-                log.exception("could not fetch remote media %s", rel)
-        if data:
-            # Resolve which pharmacy received this media
-            media_tenant = resolve_pharmacy_by_device(body.get("device_id") or "")
-            if not media_tenant:
-                # Unknown device: we do not know whose prescription this is, and filing it
-                # under a configured default would put a patient's Rx in another
-                # pharmacy's bucket.
-                log.warning("media from unknown device %s; not stored",
-                            body.get("device_id"))
-                return {"ok": True, "ignored": "unknown device"}
-            staff = q1("""select id from staff where phone=%s and pharmacy_id=%s
-                           and is_active""", (phone, media_tenant))
-            bucket = settings.BUCKET_INVOICES if staff else settings.BUCKET_RX
-            ext = str(rel).rsplit(".", 1)[-1].lower().split("?")[0]
-            if ext not in ("jpg", "jpeg", "png", "webp", "pdf"):
-                ext = "jpg"
-            path = f"{datetime.utcnow():%Y/%m}/{phone}/{uuid.uuid4().hex[:10]}.{ext}"
-            upload(bucket, path, data,
-                   "application/pdf" if ext == "pdf" else "image/jpeg")
-            log.info("gowa media stored bucket=%s path=%s bytes=%s",
-                     bucket, path, len(data))
-            inbound.update({"type": "image", "media_bucket": bucket,
-                            "media_path": path})
-        else:
-            log.warning("gowa media %s could not be retrieved; treating as text", rel)
+        log.info("refusing %s from %s: not an actionable media type", kind, phone)
+        inbound.update({"type": kind, "media_path": str(rel), "unsupported_media": kind})
+        background.add_task(handle_inbound, inbound)
+        return {"ok": True, "unsupported": kind}
 
-    # Resolve pharmacy from GOWA device and inject into the message
-    # The device that RECEIVED this message names the tenant. When it does not resolve,
-    # leave pharmacy_id unset and let the router fall back to the sender's identity --
-    # which is the honest path while one number serves several pharmacies. What must not
-    # happen is defaulting to a configured pharmacy: that silently files a stranger's
-    # conversation into whichever tenant .env happens to name.
-    device_pharmacy = resolve_pharmacy_by_device(body.get("device_id") or "")
-    if device_pharmacy:
-        inbound["pharmacy_id"] = device_pharmacy
+    if media:
+        # Fetch and store in the BACKGROUND, then dispatch. Not inline.
+        #
+        # This block used to run before the 200: gowa_fetch_media, then a fallback
+        # httpx.get(rel, timeout=120), then an upload to Supabase. On a slow link the
+        # webhook could block for two minutes. GOWA redelivers, and Meta will too after the
+        # Cloud API migration -- so a pharmacy on a bad connection received the same
+        # prescription twice, which is precisely the duplicate the dedup lock in
+        # router._dispatch now has to catch. Better not to provoke it.
+        #
+        # The media URL expires in minutes, so the background task fetches immediately; it
+        # does not queue for later.
+        background.add_task(_store_media_then_dispatch, media,
+                            body.get("device_id") or "", phone, inbound)
+        return {"ok": True, "media": media[0]}
 
-    log.info("gowa inbound from=%s type=%s device=%s pharmacy=%s",
-             phone, inbound["type"], body.get("device_id"), device_pharmacy)
+    # Resolve device kind EXPLICITLY using tenancy.resolve() rather than the shim.
+    #
+    # The shim (resolve_pharmacy_by_device) was the right call when only the tenant
+    # pharmacy_id mattered, but it collapses platform and unknown into the same None
+    # result.  gateway_intercept() must distinguish the two: an unknown device must fail
+    # closed rather than silently starting the onboarding welcome.
+    #
+    # Three outcomes, never two:
+    #   'tenant'  -> pharmacy_id is the tenant UUID
+    #   'platform' -> the master/onboarding line; pharmacy_id is not set (platform is not
+    #                 a tenant and has no inventory)
+    #   'unknown' -> unrecognised device; no reply, no state created
+    dev_res = tenancy.resolve(device_jid=body.get("device_id") or "")
+    inbound["device_kind"] = dev_res.kind          # 'platform' | 'tenant' | 'unknown'
+    if dev_res.kind == "tenant":
+        inbound["pharmacy_id"] = dev_res.pharmacy_id
+
+    log.info("gowa inbound from=%s type=%s device=%s kind=%s pharmacy=%s",
+             phone, inbound["type"], body.get("device_id"),
+             dev_res.kind, dev_res.pharmacy_id)
     background.add_task(handle_inbound, inbound)
     return {"ok": True}
+
+
+def _store_media_then_dispatch(media: tuple[str, str], device_id: str,
+                               phone: str, inbound: dict) -> None:
+    """Fetch the media, put it in object storage, then hand the message to the router.
+
+    Runs off the request so the webhook can answer in milliseconds. All of this was
+    previously inline before the 200 -- see the comment at the call site.
+
+    A fetch failure is RECORDED, not swallowed. The old code logged a warning and fell
+    through to "treating as text", so a customer's prescription silently became an empty
+    text message and the pharmacy never learned a photo had been sent.
+    """
+    kind, rel = media
+    try:
+        from wa import gowa_fetch_media
+        data = (gowa_fetch_media(rel) if not str(rel).startswith("http") else None)
+        if data is None and str(rel).startswith("http"):
+            import httpx
+            data = httpx.get(rel, timeout=120).content
+    except Exception:
+        log.exception("could not fetch media %s from %s", rel, phone)
+        data = None
+
+    tenant = resolve_pharmacy_by_device(device_id)
+
+    if not data:
+        # Durable, not silent. The media URL has probably expired by now, so this is
+        # unrecoverable -- which is exactly why it must be visible rather than inferred
+        # from a gap.
+        log.error("media fetch FAILED for %s from %s (kind=%s); recording and telling them",
+                  rel, phone, kind)
+        if tenant:
+            ex("""insert into wa_messages (pharmacy_id, wa_id, direction, from_phone,
+                                           msg_type, body, error, handled)
+                  values (%s,%s,'in',%s,%s,%s,%s,true)
+                  on conflict (wa_id) do nothing""",
+               (tenant, inbound.get("wa_id"), phone, kind, "",
+                f"media fetch failed: {rel}"))
+        inbound.update({"type": "text",
+                        "text": "", "media_fetch_failed": kind})
+        if tenant:
+            inbound["pharmacy_id"] = tenant
+        handle_inbound(inbound)
+        return
+
+    if not tenant:
+        # Unknown device: we do not know whose prescription this is, and filing it under a
+        # configured default would put a patient's Rx in another pharmacy's bucket.
+        log.warning("media from unknown device %s; not stored", device_id)
+        return
+
+    staff = q1("""select id from staff where phone=%s and pharmacy_id=%s
+                   and is_active""", (phone, tenant))
+    ext = str(rel).rsplit(".", 1)[-1].lower().split("?")[0]
+    is_doc = kind == "document" or ext in _CSV_EXTS
+
+    if is_doc:
+        # Documents always go to the invoices bucket regardless of staff/customer. A
+        # distributor sending a stock CSV is never staff but the file belongs in the same
+        # store as GRN invoices.
+        bucket = settings.BUCKET_INVOICES
+        if ext not in _CSV_EXTS and ext not in ("pdf",):
+            ext = "csv"          # safe fallback: we parse it as text anyway
+        mime = {
+            "csv": "text/csv",
+            "xls": "application/vnd.ms-excel",
+            "xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            "pdf": "application/pdf",
+        }.get(ext, "application/octet-stream")
+        path = f"{datetime.utcnow():%Y/%m}/{phone}/{uuid.uuid4().hex[:10]}.{ext}"
+        upload(bucket, path, data, mime)
+        log.info("gowa document stored bucket=%s path=%s bytes=%s ext=%s",
+                 bucket, path, len(data), ext)
+        inbound.update({"type": "document", "media_bucket": bucket,
+                        "media_path": path, "doc_ext": ext})
+    else:
+        bucket = settings.BUCKET_INVOICES if staff else settings.BUCKET_RX
+        if ext not in ("jpg", "jpeg", "png", "webp", "pdf"):
+            ext = "jpg"
+        path = f"{datetime.utcnow():%Y/%m}/{phone}/{uuid.uuid4().hex[:10]}.{ext}"
+        upload(bucket, path, data,
+               "application/pdf" if ext == "pdf" else "image/jpeg")
+        log.info("gowa media stored bucket=%s path=%s bytes=%s", bucket, path, len(data))
+        inbound.update({"type": "image", "media_bucket": bucket, "media_path": path})
+
+    inbound["pharmacy_id"] = tenant
+    log.info("gowa media inbound from=%s type=%s pharmacy=%s", phone, inbound["type"], tenant)
+    handle_inbound(inbound)
 
 
 # ============================================================ M-Pesa
@@ -254,9 +421,17 @@ async def mpesa_callback(request: Request):
 def run_job(name: str, x_pharmaos_secret: str | None = Header(None),
             x_dishii_secret: str | None = Header(None)):
     _auth(x_pharmaos_secret or x_dishii_secret)
+
+    # Platform-wide jobs run once, with no tenant bound. activation_sweep is about
+    # pharmacies that are NOT yet paired, and the per-tenant loop below deliberately skips
+    # exactly those -- so routing it through the loop would silently never run it.
+    if name in GLOBAL_JOBS:
+        return {"job": name, "scope": "platform", "result": GLOBAL_JOBS[name]()}
+
     fn = JOBS.get(name)
     if not fn:
-        raise HTTPException(404, f"unknown job. available: {list(JOBS)}")
+        raise HTTPException(404, f"unknown job. available: "
+                                 f"{list(JOBS) + list(GLOBAL_JOBS)}")
     # Cron has no inbound message and therefore no tenant, so the job runs once per paired
     # tenant with that tenant bound. Calling fn() directly would raise NoTenant -- which is
     # the intended behaviour of pid(), and the reason this loop has to be here rather than
@@ -328,10 +503,25 @@ async def simulate(request: Request, background: BackgroundTasks,
     curl -X POST $API/dev/simulate -H "x-pharmaos-secret: $S" \
          -H 'content-type: application/json' \
          -d '{"from":"254700000001","text":"EXPIRY"}'
+
+    DRY-RUN: the reply is composed and logged (./run.sh say prints it) but NEVER
+    delivered. Now that a real gateway is paired, a simulate that delivered would
+    text numbers whose inbound was fabricated -- unsolicited outbound that risks
+    the account and texts people who never reached out.
     """
     _auth(x_pharmaos_secret or x_dishii_secret)
     body = await request.json()
     body.setdefault("wa_id", f"sim-{uuid.uuid4().hex[:12]}")
     body.setdefault("type", "text")
-    background.add_task(handle_inbound, body)
-    return {"ok": True, "wa_id": body["wa_id"]}
+
+    async def _run_dry():
+        from starlette.concurrency import run_in_threadpool
+        import wa
+        token = wa._dry_run.set(True)
+        try:
+            await run_in_threadpool(handle_inbound, body)
+        finally:
+            wa._dry_run.reset(token)
+
+    background.add_task(_run_dry)
+    return {"ok": True, "wa_id": body["wa_id"], "dry_run": True}

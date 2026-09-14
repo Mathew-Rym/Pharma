@@ -11,7 +11,8 @@ import uuid
 from datetime import date, timedelta
 
 from config import settings
-from db import apply_movement, download, ex, ex1, q, q1, signed_url, tx
+from db import (InsufficientStock, apply_movement, download, ex, ex1, q, q1,
+                signed_url, tx)
 from llm import extract_prescription
 from state import clear_state, get_state, set_state
 from utils import from_pieces, kes, parse_date_loose
@@ -205,6 +206,28 @@ def _notify_pharmacists(rx_id: str, cust: dict, drugs: list[dict], flags: list[s
                   f"No price is sent to the customer until you do.")
 
 
+def _can_verify_prescriptions(staff: dict) -> bool:
+    """Verification authority is a capability, not a job title.
+
+    PPB keys dispensing authority on registration, not on who owns the shop. A
+    pharmacist role carries the capability outright; an owner or manager carries it
+    only with a PPB registration number on file -- an operational title alone must
+    never satisfy a clinical gate. Callers surface the remedy ("add your PPB number")
+    rather than a bare refusal.
+    """
+    if staff["role"] == "pharmacist":
+        return True
+    return staff["role"] in ("owner", "manager") and bool(staff.get("ppb_reg_no"))
+
+
+def _verification_refusal(staff: dict) -> str:
+    if staff["role"] == "pharmacist":
+        return "Your role cannot verify prescriptions."
+    return ("Your role cannot verify prescriptions on its own. A licensed pharmacist "
+            "must verify, or add your PPB registration number to your staff profile "
+            "first (dashboard → staff).")
+
+
 # ------------------------------------------------------------ pharmacist decision
 def pharmacist_approve(rx_id: str, staff_id: str) -> None:
     """Called from the Streamlit dashboard. Writes who approved and when."""
@@ -212,8 +235,14 @@ def pharmacist_approve(rx_id: str, staff_id: str) -> None:
     staff = q1("select * from staff where id=%s", (staff_id,))
     if not rx or not staff:
         raise ValueError("unknown prescription or staff")
-    if staff["role"] not in ("pharmacist", "owner", "manager"):
-        raise PermissionError("only a pharmacist may verify a prescription")
+    if not _can_verify_prescriptions(staff):
+        raise PermissionError(_verification_refusal(staff))
+
+    # Idempotent no-op on re-approval. Without this, a dashboard double-click set the
+    # order back to 'awaiting_payment' even after it was paid -- regressing a
+    # fulfilled order's state machine because someone clicked Approve twice.
+    if rx["status"] == "verified":
+        return
 
     ex("""update prescriptions set status='verified', verified_by=%s, verified_at=now()
            where id=%s""", (staff_id, rx_id))
@@ -302,13 +331,59 @@ def on_payment_success(order_id: str, receipt: str) -> None:
     if not order or order["status"] not in ("awaiting_payment", "quoted"):
         return
 
+    # Bind the ORDER'S OWN pharmacy for everything below. The router and the SMS
+    # path call this inside the sender's scope, but Safaricom's callback
+    # (/mpesa/callback) arrives with no tenant bound at all -- so the reply_text()
+    # and staff notifications further down raised NoTenant, the caller's except
+    # swallowed it, and the payment committed while the customer receipt and the
+    # dispatch message silently never went out. The order is the one record that
+    # cannot disagree with itself about tenancy; pharmacy_scope restores whatever
+    # was bound before, so nesting inside an existing scope is safe.
+    import tenancy
+    with tenancy.pharmacy_scope(str(order["pharmacy_id"])):
+        _on_payment_success_scoped(order, receipt)
+
+
+def _on_payment_success_scoped(order: dict, receipt: str) -> None:
+    order_id = order["id"]
     lines = q("select * from order_lines where order_id=%s", (order_id,))
-    with tx() as cur:
-        for l in lines:
-            if l["batch_id"]:
-                apply_movement(cur, l["batch_id"], -int(l["qty_pieces"]), "sale",
-                               ref_table="orders", ref_id=order_id)
-        cur.execute("update orders set status='paid' where id=%s", (order_id,))
+    try:
+        with tx() as cur:
+            for l in lines:
+                if l["batch_id"]:
+                    apply_movement(cur, l["batch_id"], -int(l["qty_pieces"]), "sale",
+                                   ref_table="orders", ref_id=order_id)
+            cur.execute("update orders set status='paid' where id=%s", (order_id,))
+    except InsufficientStock as e:
+        # The money moved but the shelf cannot honour the quote: stock was sold (POS,
+        # another order) between FEFO allocation and payment. The atomic guard in
+        # apply_movement rolled the whole dispensing back, so the ledger and the batch
+        # agree. Do NOT mark the order paid -- a paid order nobody can pack is worse
+        # than a payment to refund. Surface it to staff and be honest with the
+        # customer; a human resolves it (restock + reconfirm, or refund).
+        log.error("insufficient stock for paid order %s: %s", order_id, e)
+        ex("""insert into alerts (pharmacy_id, kind, severity, payload)
+              values (%s,'payment_stock_conflict','error',%s)""",
+           (pid(), __import__("json").dumps({
+               "order_id": str(order_id), "receipt": receipt,
+               "batch_id": str(e.batch_id), "delta": e.delta,
+               "available": e.available,
+               "action": "refund or restock, then reconfirm with the customer"})))
+        cust0 = q1("select phone from customers where id=%s", (order["customer_id"],))
+        if cust0:
+            reply_text(cust0["phone"],
+                       "We have received your payment, but the stock for your order "
+                       "needs to be reconfirmed with the pharmacist. They will contact "
+                       "you shortly to confirm delivery or arrange a refund. Sorry for "
+                       "the delay.")
+        for s in q("""select phone from staff where pharmacy_id=%s and is_active
+                       and role in ('pharmacist','owner','manager')""", (pid(),)):
+            reply_text(s["phone"],
+                       f"⚠️ Paid order {str(order_id)[:8].upper()} ({receipt}) cannot be "
+                       f"dispensed: batch short by {-e.delta} pcs "
+                       f"(has {e.available}). Refund or restock, then reconfirm with "
+                       f"the customer.")
+        return
 
     points = int(float(order["total"]) // settings.POINTS_PER_KES)
     if points:

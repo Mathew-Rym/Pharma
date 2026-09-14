@@ -6,13 +6,44 @@ from dotenv import load_dotenv
 load_dotenv()
 
 
+# Placeholders for PHARMAOS_TESTING=1, for the settings whose FORM is parsed rather than
+# merely read. `test-supabase_url` is a string, not a URL: supabase-py validates against
+# ^(https?)://.+ and raises SupabaseException("Invalid URL") while api/db.py is still being
+# imported -- so every test that imports any api module died at collection, which read as 80
+# broken tests rather than one bad string. psycopg was quieter about the same problem and
+# only warned ('missing "=" after "test-database_url" in connection info string'), 261 times
+# in one run, which buries whatever the run was actually trying to tell you.
+#
+# These must never reach anything real. They are shaped to parse and to fail to connect:
+# test.supabase.co does not resolve and nothing listens on localhost:5432 in CI.
+#
+# SUPABASE_SERVICE_KEY is here for the same reason and is easy to miss: supabase-py
+# validates the key against a JWT shape too (^seg.seg.seg$), so `test-key` fails exactly
+# like `test-supabase_url` did, one line further down the same constructor. Three dotted
+# segments is the whole requirement -- it is not decoded and not sent anywhere -- so the
+# value is deliberately the least credential-looking thing that satisfies the regex.
+_TEST_PLACEHOLDERS = {
+    "SUPABASE_URL": "https://test.supabase.co",
+    "DATABASE_URL": "postgresql://test:test@localhost:5432/test",
+    "SUPABASE_SERVICE_KEY": "test.test.test",
+}
+
+
 def _req(key: str) -> str:
+    """A real environment variable ALWAYS wins; the placeholder is only a last resort.
+
+    os.getenv is consulted first and returned unconditionally when set, so production
+    behaviour is unchanged and PHARMAOS_TESTING cannot override a value someone has
+    deliberately supplied -- including in CI, where the workflow sets these explicitly as
+    well. The placeholder exists so that importing an api module does not require a
+    database to exist.
+    """
     v = os.getenv(key)
-    if not v:
-        if os.getenv("PHARMAOS_TESTING") == "1":
-            return f"test-{key.lower()}"
-        raise RuntimeError(f"Missing required env var: {key}")
-    return v
+    if v:
+        return v
+    if os.getenv("PHARMAOS_TESTING") == "1":
+        return _TEST_PLACEHOLDERS.get(key, f"test-{key.lower()}")
+    raise RuntimeError(f"Missing required env var: {key}")
 
 
 class Settings:
@@ -36,6 +67,17 @@ class Settings:
     LLM_PROVIDER = os.getenv("LLM_PROVIDER", "gemini" if GEMINI_API_KEY else "anthropic")
     MODEL_VISION = os.getenv("MODEL_VISION", "gemini-3.6-flash" if GEMINI_API_KEY else "claude-opus-5")
     MODEL_CHAT = os.getenv("MODEL_CHAT", "gemini-3.6-flash" if GEMINI_API_KEY else "claude-sonnet-5")
+
+    # --- OpenRouter fallback (chat only, never vision) ---
+    # When the primary provider raises -- typically the Gemini free tier's 20 req/DAY
+    # during a burst -- chat falls back to OpenRouter so the reply degrades instead of
+    # erroring. Vision does NOT fall back: free router models are text-only, and an
+    # invoice silently read by a different engine is worse than a visible failure.
+    # Key from https://openrouter.ai/keys; free tool-capable models include
+    # openrouter/free (auto-route) and google/gemma-4-31b-it:free.
+    OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
+    OPENROUTER_BASE_URL = os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
+    OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "openrouter/free")
 
     # --- whatsapp transport ---
     # 'gowa'    = go-whatsapp-web-multidevice (github.com/aldinokemal). Multi-device,

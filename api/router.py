@@ -8,13 +8,15 @@ import json
 import logging
 
 import tenancy
+import register
 from db import ex, q, q1
 from llm import chat
-from reports import TOOLS, run_tool
+from reports import (CUSTOMER_TOOLS as REPORTS_CUSTOMER_TOOLS, TOOLS, denial_message,
+                     may_use, run_tool, tools_for)
 from safety import record_inbound
-from state import clear_state, get_state
+from state import clear_state, get_state, set_state
 from utils import norm_phone
-from wa import reply_text
+from wa import reply_text, set_paused, set_typing
 
 log = logging.getLogger(__name__)
 
@@ -24,6 +26,12 @@ You are talking to a staff member on WhatsApp.
 Use the provided tools to answer from live pharmacy data. Never invent stock figures,
 prices, expiry dates or supplier phone numbers — if a tool returns nothing, say so.
 
+The user may write in English, Kiswahili or Sheng. Understand intent across all three:
+map symptoms and local phrasing to generic drug names for tool calls (e.g. "dawa ya
+kichwa" -> paracetamol/Panadol, "dawa ya maumivu" -> pain relief like ibuprofen,
+"vantamedi" -> the catalogue by that name). Tool ARGUMENTS should use the English or
+generic name; the REPLY should be in the language the user wrote in.
+
 Reply in WhatsApp style: short, plain, no markdown headings, no tables. Use *bold* for
 emphasis and • for lists. Amounts in KES. Keep it under 8 lines unless the user asked
 for a full list.
@@ -32,18 +40,43 @@ If the user asks something outside pharmacy operations, say briefly that you onl
 pharmacy operations."""
 
 CUSTOMER_SYSTEM = """You are the WhatsApp assistant for a Kenyan retail pharmacy, talking
-to a customer.
+to a customer. You are the pharmacy's front door: helpful, honest, and you never lose
+a customer.
 
-You may: confirm whether a medicine is in stock and its price, explain how to order,
-explain delivery, and check order status.
+STOCK AND PRICE: use the check_stock tool for EVERY question about a medicine —
+availability, price, "do you have X", brand or generic, any language. Never answer
+from memory; the tool reads live stock and knows the rules for each case.
 
-You must NOT: give medical advice, suggest a dose, recommend a medicine for symptoms,
-or say a prescription-only medicine will be supplied. For anything clinical, tell them
-a pharmacist will help and offer to have one call them.
+WHEN THE TOOL SAYS OUT OF STOCK — redirect language, and these rules are the job:
+- NEVER open with "we don't have it" or "it's not available".
+- ALWAYS acknowledge first: "Let me check that for you."
+- Ask ONE clarifying question: what they're treating, or how urgent it is.
+- If the tool says an alternative is in stock, offer it: "We may have something
+  suitable — can I confirm what you need it for?"
+- If they want the exact item, offer a restock alert: "I've noted your request —
+  would you like me to alert you when it's back?" If they say yes, call
+  notify_me_when_back once.
+- If nothing fits, offer the pharmacist: "Our pharmacist can advise on alternatives —
+  shall I connect you?"
+- If they say it's urgent: "I understand this is urgent — let me check with our
+  supplier now."
+- NEVER promise a restock date or timeframe.
+- NEVER say "we have it" when the tool said otherwise.
 
-Reply warmly and briefly, 4 lines maximum. Use tools for stock and price questions."""
+WHEN THE TOOL SAYS PRESCRIPTION-ONLY: do not discuss availability and do not offer a
+restock alert. Say that item needs a pharmacist's review and offer to connect them
+with the pharmacist who can guide them properly.
 
-CUSTOMER_TOOLS = [t for t in TOOLS if t["name"] == "get_stock"]
+You must NOT: give medical advice, suggest a dose, or recommend a medicine for
+symptoms yourself. For anything clinical, a pharmacist will help and you can offer to
+have one call them.
+
+The customer may write in English, Kiswahili or Sheng. Reply in the language they
+wrote in.
+
+Keep replies warm and under 3 sentences. Use the tools; they carry the facts."""
+
+CUSTOMER_TOOLS = REPORTS_CUSTOMER_TOOLS
 
 
 # ------------------------------------------------------------------ entry point
@@ -51,6 +84,19 @@ def handle_inbound(msg: dict) -> None:
     """msg: {wa_id, from, type, text, media_bucket, media_path, mime}"""
     phone = norm_phone(msg.get("from", ""))
     if not phone:
+        return
+
+    # Fail closed immediately on unrecognised devices. Do not allow them to trigger
+    # onboarding, and do not fall back to sender resolution.
+    if msg.get("device_kind") == "unknown":
+        log.warning("unresolved device (kind=unknown) for inbound from %s -- dropping", phone)
+        return
+
+    # Onboarding runs BEFORE resolution, because everything it handles comes from someone
+    # the resolver cannot place: a stranger sending REGISTER, or a new hire who is not
+    # staff until the moment their JOIN code is accepted. Resolving first would send both
+    # down the unknown-sender path and answer neither.
+    if register.intercept(phone, msg):
         return
 
     # Which pharmacy is this message for?
@@ -74,7 +120,7 @@ def handle_inbound(msg: dict) -> None:
             _ask_which_pharmacy(phone, candidates)
             return
         else:
-            _greet_unknown(phone)
+            _greet_unknown(phone, msg)
             return
 
     with tenancy.pharmacy_scope(resolved_pid):
@@ -95,74 +141,183 @@ def _ask_which_pharmacy(phone: str, candidates: list[str]) -> None:
                           f"Which one?\n\n{listing}\n\nReply with the number.")
 
 
-def _greet_unknown(phone: str) -> None:
+def _greet_unknown(phone: str, msg: dict) -> None:
     """No relationship anywhere.
 
-    Cannot reply: the anti-ban gates require a relationship, and inventing a customer row
-    to satisfy them would let anyone who texts create data in a pharmacy of their choosing.
-    Logged so it is visible rather than silent.
+    If the message arrived on the platform/master device, open the onboarding gateway
+    so the sender can register a pharmacy or join an existing one.  If it arrived on a
+    tenant device, tell them to contact the pharmacy administrator.
+
+    When neither condition applies (no platform row, unrecognised device), we cannot
+    reply safely, so we log and stay silent.
     """
+    if register.gateway_intercept(phone, msg):
+        return
     log.info("unresolved sender %s -- no pharmacy relationship; not replying", phone)
 
 
 def _dispatch(phone: str, msg: dict, resolved_pid: str) -> None:
     """Everything below runs with the tenant bound, so pid() is correct throughout."""
-    # Record inbound — this opens Gate 3 for future replies to this phone
-    record_inbound(phone, resolved_pid)
-
-    # idempotency — Baileys re-delivers on reconnect
-    if msg.get("wa_id"):
-        dup = q1("select 1 from wa_messages where wa_id = %s", (msg["wa_id"],))
-        if dup:
-            log.info("duplicate message %s ignored", msg["wa_id"])
-            return
-
+    # IDEMPOTENCY. The insert IS the lock -- not a SELECT followed by an insert.
+    #
+    # It used to be `select 1 ... where wa_id` and then, several lines later, an insert with
+    # `on conflict do nothing`. Both GOWA (on reconnect) and Meta (on any slow 200) redeliver,
+    # and two concurrent redeliveries both passed the SELECT before either reached the
+    # INSERT. The unique constraint protected the ROW; nothing protected the side effects.
+    # Both copies went on to the handler: two GRNs from one invoice, two POM approvals
+    # against one prescription, two stock movements from one delivery.
+    #
+    # `on conflict (wa_id) do nothing returning id` makes Postgres the arbiter: exactly one
+    # caller gets a row back, every other gets nothing and stops here. The window closes
+    # because the check and the claim are the same statement.
     text = (msg.get("text") or "").strip()
-    ex(
+    claimed = q1(
         """insert into wa_messages (pharmacy_id, wa_id, direction, from_phone, msg_type,
                                     body, media_path, handled)
            values (%s,%s,'in',%s,%s,%s,%s,false)
-           on conflict (wa_id) do nothing""",
+           on conflict (wa_id) do nothing
+           returning id""",
         (resolved_pid, msg.get("wa_id"), phone, msg.get("type", "text"),
          text[:4000], msg.get("media_path")),
     )
+    if msg.get("wa_id") and not claimed:
+        log.info("duplicate message %s ignored -- already claimed", msg["wa_id"])
+        return
+
+    # AFTER the lock, deliberately. This opens Gate 3 for future replies to this phone, and
+    # it used to run before the dedup check -- so every redelivery inflated
+    # inbound_history.message_count, which is the number ./run.sh safety prints as evidence
+    # of a real conversation. A retry storm made a quiet number look like an engaged
+    # customer.
+    record_inbound(phone, resolved_pid)
 
     staff = q1(
         "select * from staff where phone=%s and pharmacy_id=%s and is_active",
         (phone, resolved_pid),
     )
+    supplier = q1(
+        "select * from suppliers where phone=%s and pharmacy_id=%s",
+        (phone, resolved_pid),
+    ) if not staff else None
+
+    # Typing dots while we think. Keyword answers are instant, so this mostly covers
+    # the LLM path (2-5s) and the vision path (~30s): the user sees the bot is alive.
+    set_typing(phone)
+
     try:
-        if staff:
+        # Unsupported media stops here, before either branch. _handle_staff sends any image
+        # to grn.add_page and _handle_customer sends any image to the prescription
+        # extractor, so a voice note reaching either is the failure this guard exists for.
+        # The row above already recorded its TRUE msg_type and media_path.
+        if msg.get("unsupported_media"):
+            _refuse_unsupported_media(phone, msg["unsupported_media"])
+        elif staff:
             _handle_staff(phone, staff, msg, text)
+        elif supplier:
+            _handle_supplier(phone, supplier, msg, text)
         else:
             _handle_customer(phone, msg, text)
     except Exception as e:
         log.exception("handler failed for %s", phone)
-        reply_text(phone, "Something went wrong on our side. Please try again, "
-                         "or type *HELP*.")
+        # Bilingual because a Swahili speaker who just got an English-only error
+        # cannot tell whether the outage or their language caused it. It also names
+        # the keyword commands, which need no model at all and keep working.
+        reply_text(phone,
+                   "Samahani — siwezi kujibu hivi sasa. Tafadhali jaribu tena baadaye, "
+                   "au andika *HELP* kuona commands.\n"
+                   "(Sorry — I can't answer that just now. Please try again shortly, "
+                   "or type *HELP* for the command list.)")
         ex("update wa_messages set error=%s where wa_id=%s",
            (f"{type(e).__name__}: {e}"[:500], msg.get("wa_id")))
     finally:
+        set_paused(phone)     # clear the dots even if no reply went out
         ex("update wa_messages set handled=true where wa_id=%s", (msg.get("wa_id"),))
+
+
+_MEDIA_REFUSALS = {
+    "audio": "I can't listen to voice notes yet",
+    "voice": "I can't listen to voice notes yet",
+    "ptt":   "I can't listen to voice notes yet",
+    "video": "I can't watch videos",
+    "sticker": "I can't read stickers",
+}
+
+
+def _refuse_unsupported_media(phone: str, kind: str) -> None:
+    """Say so once, and say what WILL work.
+
+    Silence would be worse than the old behaviour in one respect: the sender would keep
+    resending. Naming the alternative -- text, or a photo -- is what turns a refusal into an
+    instruction. One message per inbound, and inbound is deduplicated by wa_id, so a
+    re-delivered message cannot produce a second refusal.
+    """
+    what = _MEDIA_REFUSALS.get(kind, f"I can't handle {kind} messages")
+    log.info("refused unsupported media (%s) from %s", kind, phone)
+    reply_text(phone, f"{what}. Please send it as *text*, or as a *photo* if it's a "
+                      f"prescription or an invoice.")
 
 
 # ------------------------------------------------------------------ staff branch
 def _handle_staff(phone: str, staff: dict, msg: dict, text: str) -> None:
     import grn
+    import distributor
 
     st = get_state(phone)
     up = text.upper()
 
-    # --- images always mean "receiving a delivery" for staff.
-    # Which KIND of photo depends on where we are: mid-receiving, after the invoice has
-    # been read, a photo is the goods being counted rather than another invoice page.
-    # Getting this order wrong would file a photo of the delivery as invoice page 3 and
-    # send it to the extractor.
+    # --- CSV / Excel stock sheets from a distributor or admin staff
+    if msg.get("type") == "document" and msg.get("media_path"):
+        distributor.process_stock_sheet(
+            phone,
+            str(staff["pharmacy_id"]),
+            msg["media_path"],
+            msg.get("media_bucket", ""),
+            msg.get("doc_ext", "csv"),
+        )
+        return
+
+    # --- RECEIVE declares intent, so a photo is never a guess.
+    #
+    # Every staff image used to become an invoice page unconditionally. That gave a
+    # pharmacist photographing a walk-in's prescription no way to say so: it was extracted
+    # as a supplier invoice, and if the extractor found line-shaped text it would move
+    # stock. There is no undo for that, and nothing in the reply would look wrong.
+    #
+    # Deterministic keyword, no model. Intent in a privilege-adjacent path must not depend
+    # on a classifier being right, for the same reason register.py is a pure function.
+    if up in ("RECEIVE", "RECEIVING"):
+        clear_state(phone)
+        set_state(phone, "grn_collect", {"pages": [], "text_lines": []})
+        reply_text(phone,
+                   "Receiving a delivery. Two ways to give me the lines:\n\n"
+                   "📸 *PHOTO* — photograph the supplier invoice, all pages\n"
+                   "⌨️ *TYPE* — one item per line, paste as MANY as you like in one "
+                   "message:\n"
+                   "_name | batch | expiry | qty | price_\n"
+                   "e.g. *Amoxil 500mg | B123 | 08/2027 | 5W0P | 540*\n"
+                   "     *Panadol 500mg | P456 | 01/2028 | 10W | 160*\n\n"
+                   "Reply *DONE* when finished, *CANCEL* to stop.")
+        return
+
     if msg.get("type") == "image" and msg.get("media_path"):
+        # Which KIND of photo depends on where we are: after the invoice has been read, a
+        # photo is the goods being counted rather than another invoice page. Getting this
+        # order wrong would file a photo of the delivery as invoice page 3.
         if st["flow"] == "grn_goods":
             grn.add_goods_photo(phone, msg["media_path"])
-        else:
+            return
+        if st["flow"] == "grn_collect":
             grn.add_page(phone, msg["media_path"])
+            return
+        # No active flow: ASK. The two things a staff photo can be are a supplier invoice
+        # and a customer's prescription, and they move in opposite directions -- one adds
+        # stock, the other dispenses it. Assuming was the bug.
+        reply_text(phone, "What is this photo?\n\n"
+                          "• Reply *RECEIVE* if it's a supplier invoice — I'll take the "
+                          "pages and add the stock\n"
+                          "• For a customer's prescription, have the customer send it to "
+                          "this number themselves so it's linked to them\n\n"
+                          "I haven't filed it anywhere yet.")
         return
 
     if up == "HELP":
@@ -177,10 +332,18 @@ def _handle_staff(phone: str, staff: dict, msg: dict, text: str) -> None:
     # --- mid-flow handling takes priority over anything else
     if st["flow"] == "grn_collect":
         if up == "DONE":
-            grn.process_pages(phone, staff)
+            # Typed lines go the text path; photos go to vision. If both were sent,
+            # typed lines win -- they are already human-verified data, and mixing the
+            # two would double-receive the same items.
+            if st["context"].get("text_lines"):
+                grn.process_text_lines(phone, staff)
+            else:
+                grn.process_pages(phone, staff)
+        elif text.strip() and not msg.get("media_path"):
+            grn.add_text_lines(phone, text)
         else:
-            reply_text(phone, "Send the next invoice page, or reply *DONE* to process "
-                             "what you have sent, or *CANCEL*.")
+            reply_text(phone, "Send more invoice pages or item lines (paste as many "
+                             "as you like), reply *DONE* to process, or *CANCEL*.")
         return
 
     if st["flow"] == "grn_goods":
@@ -196,22 +359,31 @@ def _handle_staff(phone: str, staff: dict, msg: dict, text: str) -> None:
         return
 
     # --- deterministic shortcuts before any model call
+    #
+    # Guarded by the SAME policy as the agent path. These bypass the model entirely, so
+    # scoping only the tool list handed to the LLM would have left the cheapest route to
+    # the day's takings -- one word, `TODAY` -- completely open.
     if up in ("EXPIRY", "EXPIRING"):
-        reply_text(phone, run_tool("get_expiry_risk", {"days": 90}, phone))
+        _guard(phone, staff, "get_expiry_risk", {"days": 90})
         return
     if up in ("LOW", "LOWSTOCK", "LOW STOCK"):
-        reply_text(phone, run_tool("get_stock", {"low_stock_only": True}, phone))
+        _guard(phone, staff, "get_stock", {"low_stock_only": True})
         return
     if up in ("TODAY", "SALES"):
-        reply_text(phone, run_tool("get_sales_summary", {"period": "today"}, phone))
+        _guard(phone, staff, "get_sales_summary", {"period": "today"})
         return
     if up in ("REPORT", "REPORT MONTH"):
-        run_tool("generate_report_pdf", {"period": "month"}, phone)
+        _guard(phone, staff, "generate_report_pdf", {"period": "month"}, reply=False)
         return
     if up == "REPORT WEEK":
-        run_tool("generate_report_pdf", {"period": "week"}, phone)
+        _guard(phone, staff, "generate_report_pdf", {"period": "week"}, reply=False)
         return
     if up in ("ORDER", "REORDER"):
+        # Not run_tool, but the same data -- what to buy and how much. Gated on the tool
+        # that answers that question, or ORDER becomes the way round the guard.
+        if not may_use(staff["role"], "get_reorder_suggestions"):
+            _deny(phone, staff, "get_reorder_suggestions")
+            return
         from forecast import reorder_message
         reply_text(phone, reorder_message())
         return
@@ -225,6 +397,9 @@ def _handle_staff(phone: str, staff: dict, msg: dict, text: str) -> None:
 
     # --- draft purchase orders from the forecast
     if up == "PO" or up.startswith("PO "):
+        # Money action: drafts purchase orders and routes them for approval.
+        if not may_use(staff["role"], "draft_po"):
+            _deny(phone, staff, "draft_po"); return
         from approvals import send_po_for_approval
         from forecast import create_draft_pos
         filt = text[3:].strip() or None
@@ -238,6 +413,8 @@ def _handle_staff(phone: str, staff: dict, msg: dict, text: str) -> None:
 
     # --- talk to the agent on the pharmacy PC
     if up in ("SYNC", "RESYNC", "SYNC NOW"):
+        if not may_use(staff["role"], "pc_sync"):
+            _deny(phone, staff, "pc_sync"); return
         from agent_api import queue_command
         if queue_command("resync", reply_to=phone, requested_by=str(staff["id"])):
             reply_text(phone, "Asking the pharmacy PC to sync now. This takes up to a "
@@ -248,11 +425,15 @@ def _handle_staff(phone: str, staff: dict, msg: dict, text: str) -> None:
         return
 
     if up in ("PC", "AGENT", "PC STATUS"):
+        if not may_use(staff["role"], "pc_status"):
+            _deny(phone, staff, "pc_status"); return
         from agent_api import agent_status
         reply_text(phone, agent_status())
         return
 
     if up == "PROBE":
+        if not may_use(staff["role"], "pc_probe"):
+            _deny(phone, staff, "pc_probe"); return
         from agent_api import queue_command
         if queue_command("probe", reply_to=phone, requested_by=str(staff["id"])):
             reply_text(phone, "Scanning the pharmacy PC for the phAMACore database...")
@@ -261,38 +442,98 @@ def _handle_staff(phone: str, staff: dict, msg: dict, text: str) -> None:
         return
 
     if up in ("VARIANCE", "RECON", "SHRINKAGE"):
+        # Till-vs-stock figures. An attendant denied TODAY must not read them here.
+        if not may_use(staff["role"], "variance"):
+            _deny(phone, staff, "variance"); return
         from agent_api import reconciliation_summary
         reply_text(phone, reconciliation_summary())
         return
 
     if up.startswith("WHY "):
+        # Explains a reorder suggestion, so it exposes the same sales-derived data.
+        if not may_use(staff["role"], "forecast_why"):
+            _deny(phone, staff, "forecast_why"); return
         from forecast import forecast_explain
         reply_text(phone, forecast_explain(text[4:].strip()))
         return
 
     # --- everything else: let the model pick a tool
-    _agent_reply(phone, text, STAFF_SYSTEM, TOOLS)
+    # Role-scoped. The model cannot call what it was never shown, and _guard
+    # re-checks at execution in case the list and the policy ever drift.
+    _agent_reply(phone, text, STAFF_SYSTEM, tools_for(staff["role"]))
+
+
+# Every advertised command, with the capability it needs. A test asserts this covers
+# STAFF_COMMANDS exactly, so a command added to one and not the other fails the build --
+# which is the check that would have caught PO sitting ungated behind a help entry.
+_HELP_LINES: list[tuple[str, str]] = [
+    ("receive_goods",           "• *RECEIVE* — then invoice photos OR typed lines, then *DONE*"),
+    ("get_stock",               "• *LOW* — what is below reorder level"),
+    ("get_stock",               "• *do we have amoxil* — stock check"),
+    ("find_supplier",           "• *who supplies prenor* — supplier contact"),
+    ("pc_sync",                 "• *SYNC* — pull fresh data from the pharmacy PC"),
+    ("pc_status",               "• *PC* — is the pharmacy PC online"),
+    ("get_expiry_risk",         "• *EXPIRY* — what is expiring in 90 days"),
+    ("get_sales_summary",       "• *TODAY* — today's sales"),
+    ("get_reorder_suggestions", "• *ORDER* — what to reorder"),
+    ("generate_report_pdf",     "• *REPORT* — full PDF report"),
+    ("draft_po",                "• *PO* — draft purchase orders from the forecast"),
+    ("forecast_why",            "• *WHY prenor* — why the system suggests ordering it"),
+    ("variance",                "• *VARIANCE* — where the till and our stock disagree"),
+    ("pc_probe",                "• *PROBE* — scan the pharmacy PC for its database"),
+]
 
 
 def _staff_help(role: str) -> str:
-    base = (
-        "*Pharma OS commands*\n"
-        "📸 Send a photo of a supplier invoice → I receive the stock (batch + expiry)\n"
-        "• *EXPIRY* — what is expiring in 90 days\n"
-        "• *LOW* — what is below reorder level\n"
-        "• *TODAY* — today's sales\n"
-        "• *ORDER* — what to reorder\n"
-        "• *REPORT* — full PDF report\n"
-        "• *who supplies prenor* — supplier contact\n"
-        "• *do we have amoxil* — stock check\n"
-        "• *PO* — draft purchase orders from the forecast\n"
-        "• *WHY prenor* — why the system suggests ordering it\n"
-        "• *VARIANCE* — where the till and our stock disagree\n"
-        "• *SYNC* — pull fresh data from the pharmacy PC\n"
-        "• *PC* — is the pharmacy PC online\n"
-        "Or just ask me in your own words."
-    )
-    return base
+    """Only what this role can actually do.
+
+    The parameter was previously accepted and ignored -- every role got the same list,
+    including commands they would be refused. That is how the gap hid: the bot advertised
+    PO to an attendant, ran it for them, and nothing anywhere disagreed. Listing exactly
+    what will work makes help and enforcement the same statement.
+    """
+    lines = [text for cap, text in _HELP_LINES if may_use(role, cap)]
+    return ("*Pharma OS commands*\n"
+            "📸 Send a photo of a supplier invoice → I receive the stock (batch + expiry)\n"
+            + "\n".join(lines)
+            + "\nOr just ask me in your own words.")
+
+
+def _deny(phone: str, staff: dict, tool: str) -> None:
+    log.info("tool %s denied to %s (role=%s)", tool, phone, staff.get("role"))
+    reply_text(phone, denial_message(staff.get("role"), tool))
+
+
+def _guard(phone: str, staff: dict, tool: str, args: dict, reply: bool = True) -> None:
+    """Run a tool for a staff member, or say which role is needed.
+
+    One place, used by both the keyword shortcuts and (via the filtered list) the agent, so
+    the two cannot drift apart. They already had: CUSTOMER_TOOLS was filtered while the
+    staff path was not, and nothing failed to make that visible.
+    """
+    if not may_use(staff.get("role"), tool):
+        _deny(phone, staff, tool)
+        return
+    out = run_tool(tool, args, phone)
+    if reply and out:
+        reply_text(phone, out)
+
+
+# ------------------------------------------------------------ supplier branch
+def _handle_supplier(phone: str, supplier: dict, msg: dict, text: str) -> None:
+    import distributor
+
+    if msg.get("type") == "document" and msg.get("media_path"):
+        distributor.process_stock_sheet(
+            phone,
+            str(supplier["pharmacy_id"]),
+            msg["media_path"],
+            msg.get("media_bucket", ""),
+            msg.get("doc_ext", "csv"),
+        )
+        return
+        
+    reply_text(phone, "Please send stock update files as CSV or Excel documents.")
 
 
 # ------------------------------------------------------------ customer branch
@@ -302,6 +543,12 @@ def _handle_customer(phone: str, msg: dict, text: str) -> None:
     st = get_state(phone)
     up = text.upper()
     cust = rx.get_or_create_customer(phone)
+
+    # Documents from customers: tell them to text instead
+    if msg.get("type") == "document":
+        reply_text(phone, "Please send your request as a text message. "
+                         "For a prescription, send a photo.")
+        return
 
     if up == "DELETE":
         rx.delete_my_data(phone)

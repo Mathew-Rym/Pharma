@@ -12,6 +12,7 @@ import httpx
 
 from config import settings
 from db import ex, ex1, q1
+from tenancy import NoTenant, pid
 from utils import norm_phone
 
 log = logging.getLogger(__name__)
@@ -74,11 +75,34 @@ def stk_push(phone: str, amount: float, order_id: str,
     data = r.json()
     log.info("stk_push order=%s resp=%s", order_id, data)
 
+    # The pharmacy comes from the ORDER, not from .env and not from ambient context.
+    #
+    # It was settings.PHARMACY_ID, so a payment taken by pharmacy B was filed against
+    # whichever pharmacy .env named: the money and the order pointed at different tenants,
+    # and B's revenue appeared in someone else's books.
+    #
+    # pid() would fix that one case and leave the same weakness as db.apply_movement had --
+    # a caller with the wrong tenant bound would file the payment somewhere plausible and
+    # wrong. The order already knows which pharmacy it belongs to, and a payment that
+    # disagreed with its own order would be worse than either bug. So it is derived, and a
+    # mismatch with the bound tenant is refused rather than absorbed.
+    o = q1("select pharmacy_id from orders where id = %s", (order_id,))
+    if not o:
+        raise ValueError(f"no such order {order_id}; refusing to record a payment")
+    owner = str(o["pharmacy_id"])
+    try:
+        bound = pid()
+    except NoTenant:
+        bound = None
+    if bound and bound != owner:
+        raise ValueError(f"order {order_id} belongs to pharmacy {owner}, not the bound "
+                         f"tenant {bound}; refusing to record the payment")
+
     ex(
         """insert into payments (pharmacy_id, order_id, method, amount, phone,
                                  checkout_request_id, status, raw_callback)
            values (%s,%s,'mpesa_stk',%s,%s,%s,%s,%s)""",
-        (settings.PHARMACY_ID, order_id, amount, phone,
+        (owner, order_id, amount, phone,
          data.get("CheckoutRequestID"),
          "pending" if data.get("ResponseCode") == "0" else "failed",
          __import__("json").dumps(data)),

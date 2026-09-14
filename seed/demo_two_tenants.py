@@ -54,12 +54,13 @@ B_STOCK = [
 # Staff are seeded WITHOUT inbound history on purpose: the anti-ban gates require that a
 # person messages the bot before it can message them. Anyone who needs to RECEIVE an alert
 # during the demo must text the number first -- see WHATSAPP.md.
-A_STAFF = [("Owner A", "254700000101", "owner", None),
-           ("Pharmacist A", "254700000102", "pharmacist", "PPB-11111"),
-           ("Manager A", "254700000103", "manager", None)]
-B_STAFF = [("Owner B", "254700000201", "owner", None),
-           ("Pharmacist B", "254700000202", "pharmacist", "PPB-22222"),
-           ("Manager B", "254700000203", "manager", None)]
+# Deliberately EMPTY. Placeholder staff numbers are worse than no staff: they satisfy
+# Gate 2 (a relationship exists) while never being able to satisfy Gate 3 (they can never
+# text in), so they sit permanently in the "related but not reachable" list and no
+# staff-side flow can be demonstrated. Add REAL phones instead -- one manager per pharmacy
+# is all the isolation demo needs -- and have each text the bot once.
+A_STAFF: list = []
+B_STAFF: list = []
 
 
 def _wipe(pid: str) -> None:

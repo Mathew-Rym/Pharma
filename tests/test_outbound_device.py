@@ -21,6 +21,8 @@ import sys
 
 import pytest
 
+from conftest import needs_gowa
+
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "api"))
 
 DB = bool(os.getenv("DATABASE_URL"))
@@ -138,6 +140,7 @@ def test_compose_refuses_a_pharmacy_with_no_paired_device(two_tenants):
 
 
 @db
+@needs_gowa
 def test_deliver_refuses_when_the_slot_is_not_the_expected_handset(two_tenants):
     """Outbound is addressed by slot label, so the label must be proven before use.
 

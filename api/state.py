@@ -2,24 +2,60 @@
 
 Deliberately short-lived: a stale flow is worse than no flow, because a staff member
 typing "OK" an hour later should not silently approve a delivery.
+
+TENANT-AWARE: keyed on (pharmacy_id, phone) so the same person can interact with
+multiple pharmacies without state leaking between them. Before this change the key
+was phone alone, so a customer messaging two pharmacies would see one pharmacy's
+flow state from the other's conversation.
 """
 import json
+import logging
 from datetime import datetime, timedelta, timezone
 
-from config import settings
+import tenancy
 from db import ex, q1
+
+log = logging.getLogger(__name__)
 
 DEFAULT_TTL_MIN = 45
 
 
-def get_state(phone: str) -> dict:
+def get_state(phone: str, pharmacy_id: str | None = None) -> dict:
+    """Read the conversation state for (pharmacy_id, phone).
+
+    When pharmacy_id is not given, uses the currently bound tenant. This keeps
+    all existing call sites working without changes — they call get_state(phone)
+    from inside a pharmacy_scope block.
+    """
+    pid = pharmacy_id
+    if pid is None:
+        try:
+            pid = tenancy.pid()
+        except tenancy.NoTenant:
+            # No tenant bound. Fall back to phone-only lookup for backward
+            # compatibility (onboarding, where no tenant exists yet).
+            row = q1(
+                "select flow, context, expires_at from wa_state where phone = %s "
+                "order by updated_at desc limit 1", (phone,)
+            )
+            if not row:
+                return {"flow": "idle", "context": {}}
+            if row["expires_at"] and row["expires_at"] < datetime.now(timezone.utc):
+                clear_state(phone)
+                return {"flow": "idle", "context": {}}
+            ctx = row["context"] or {}
+            if isinstance(ctx, str):
+                ctx = json.loads(ctx)
+            return {"flow": row["flow"] or "idle", "context": ctx}
+
     row = q1(
-        "select flow, context, expires_at from wa_state where phone = %s", (phone,)
+        "select flow, context, expires_at from wa_state "
+        "where pharmacy_id = %s and phone = %s", (pid, phone)
     )
     if not row:
         return {"flow": "idle", "context": {}}
     if row["expires_at"] and row["expires_at"] < datetime.now(timezone.utc):
-        clear_state(phone)
+        clear_state(phone, pharmacy_id=pid)
         return {"flow": "idle", "context": {}}
     ctx = row["context"] or {}
     if isinstance(ctx, str):
@@ -27,19 +63,55 @@ def get_state(phone: str) -> dict:
     return {"flow": row["flow"] or "idle", "context": ctx}
 
 
-def set_state(phone: str, flow: str, context: dict, ttl_min: int = DEFAULT_TTL_MIN) -> None:
+def set_state(phone: str, flow: str, context: dict, ttl_min: int = DEFAULT_TTL_MIN,
+              pharmacy_id: str | None = None) -> None:
+    """Save the conversation's position for (pharmacy_id, phone).
+
+    `pharmacy_id` defaults to whichever tenant is bound for this message.
+
+    Fail-closed on a missing tenant: this used to fall back to settings.PHARMACY_ID
+    "as a last resort, with a warning" -- the last runtime place where the .env
+    pharmacy could own another tenant's conversation state. Every legitimate caller
+    either runs inside pharmacy_scope() (router dispatch, jobs) or passes
+    pharmacy_id explicitly (register's onboarding flows pass the platform row), so
+    reaching this without a tenant means a caller is missing its scope -- raise so
+    the bug is found, rather than filing state under a plausible wrong pharmacy.
+    """
+    if pharmacy_id is None:
+        try:
+            pharmacy_id = tenancy.pid()
+        except tenancy.NoTenant:
+            raise tenancy.NoTenant(
+                f"set_state({phone!r}, flow={flow!r}) with no tenant bound; refusing to "
+                f"label the row with a configured default pharmacy. Run the caller "
+                f"inside tenancy.pharmacy_scope() or pass pharmacy_id= explicitly.")
     expires = datetime.now(timezone.utc) + timedelta(minutes=ttl_min)
+    # default=str: flow contexts carry database ids straight from RETURNING clauses,
+    # which psycopg hands back as uuid.UUID. json.dumps raises on those, so the
+    # receiving flow crashed at the moment of showing the review summary -- after the
+    # GRN row was written, leaving state and stock half-way through a flow. UUID->str
+    # is lossless for a context that is only ever read back as opaque ids.
     ex(
         """insert into wa_state (phone, pharmacy_id, flow, context, expires_at, updated_at)
            values (%s,%s,%s,%s,%s, now())
-           on conflict (phone) do update
+           on conflict (pharmacy_id, phone) do update
              set flow = excluded.flow,
                  context = excluded.context,
                  expires_at = excluded.expires_at,
                  updated_at = now()""",
-        (phone, settings.PHARMACY_ID, flow, json.dumps(context), expires),
+        (phone, pharmacy_id, flow, json.dumps(context, default=str), expires),
     )
 
 
-def clear_state(phone: str) -> None:
-    ex("delete from wa_state where phone = %s", (phone,))
+def clear_state(phone: str, pharmacy_id: str | None = None) -> None:
+    """Remove the conversation state for (pharmacy_id, phone).
+
+    When pharmacy_id is not given, removes all state for this phone across
+    all pharmacies — the safe default for onboarding and for callers inside
+    a pharmacy_scope (where the old phone-only delete is the same thing).
+    """
+    if pharmacy_id:
+        ex("delete from wa_state where pharmacy_id = %s and phone = %s",
+           (pharmacy_id, phone))
+    else:
+        ex("delete from wa_state where phone = %s", (phone,))

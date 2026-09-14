@@ -13,6 +13,7 @@ from reports import build_report_pdf, get_expiry_risk, get_reorder_suggestions
 from utils import from_pieces, kes
 from wa import send_document, send_text
 
+import register
 import tenancy
 from tenancy import pid          # tenant comes from the request, not from .env
 
@@ -24,17 +25,21 @@ def for_every_tenant(job_fn) -> list[dict]:
 
     Three specifics that matter:
 
-    * Only tenants with a paired device. An unpaired pharmacy cannot receive the alert, so
-      running the job for it produces sends that must fail wa.compose()'s device check --
-      noise that looks like a bug. Skip at selection instead.
+    * Only tenants that are actually LIVE, via tenancy.LIVE_SQL -- the same definition
+      wa.compose() uses. This used to test gowa_device_id alone, which is weaker: a
+      pharmacy that has been issued a slot but whose handset never linked has a device and
+      no wa_jid, so it was selected, every send was composed, and every send was then
+      refused by deliver()'s JID guard. One registration produced six such messages. The
+      alert cannot arrive either way; skipping at selection is the difference between
+      silence and a log full of refusals that look like a bug.
     * Platform rows are excluded: no inventory, nobody to alert.
     * Each tenant is caught separately. One bad row must not abort the loop, or a single
       pharmacy with dirty data silences alerts for every other pharmacy -- and cron
       failures are invisible by nature, which is the whole reason job_runs exists.
     """
-    tenants = q("""select id, name from pharmacies
-                    where kind = 'tenant' and gowa_device_id is not null
-                    order by name""")
+    tenants = q(f"""select id, name from pharmacies
+                     where kind = 'tenant' and {tenancy.LIVE_SQL}
+                     order by name""")
     if not tenants:
         log.warning("no paired tenants; %s did not run", getattr(job_fn, "__name__", job_fn))
         return []
@@ -153,9 +158,18 @@ def low_stock_check() -> dict:
         if not rows:
             return {"items": 0}
 
-        # group by supplier so each supplier gets one draft PO
+        # group by supplier so each supplier gets one draft PO.
+        # Dedup against open POs (forecast.open_po_product_ids): this job runs daily,
+        # so a product that sits below its reorder level for a week used to mint one
+        # duplicate PO per day until someone approved or killed each by hand. The
+        # alert text below still lists every low item; only PO creation skips the
+        # already-ordered ones.
+        from forecast import open_po_product_ids
+        already_open = open_po_product_ids()
         by_sup: dict = {}
         for r in rows:
+            if str(r["product_id"]) in already_open:
+                continue
             by_sup.setdefault(r["preferred_supplier_id"], []).append(r)
 
         created = []
@@ -354,6 +368,17 @@ def variance_report() -> dict:
         return {"variances": rows[0]["n"], "value": float(rows[0]["v"])}
     return _run("variance_report", _go)
 
+
+# Jobs that run ONCE, across the whole platform, rather than once per tenant.
+#
+# activation_sweep is the only one so far, and it has to be here rather than in JOBS
+# because for_every_tenant() selects pharmacies that are already paired -- precisely the
+# ones activation has nothing left to do for. Running it through that loop would mean a
+# pharmacy waiting to be linked is never looked at, which is the one state this job exists
+# to get out of.
+GLOBAL_JOBS = {
+    "activation_sweep": register.activation_sweep,
+}
 
 JOBS = {
     "expiry_sweep": expiry_sweep,

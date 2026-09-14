@@ -24,6 +24,15 @@ services:
       # 3001 on purpose: wa-gateway/ already uses 3000, so both can coexist while
       # you compare them.
       - "3001:3000"
+    # Explicit resolvers, for the same reason run.sh passes --dns. A host running
+    # systemd-resolved keeps its stub on 127.0.0.53, which Docker cannot give a container,
+    # so it substitutes the upstream it can see -- on a phone hotspot that is the gateway,
+    # which does not answer DNS from Docker's network. The container then cannot resolve
+    # web.whatsapp.com, and the only visible symptom is "couldn't link device" on the
+    # handset while every endpoint here looks healthy.
+    dns:
+      - 1.1.1.1
+      - 8.8.8.8
     environment:
       APP_PORT: 3000
       APP_DEBUG: "false"
@@ -55,7 +64,18 @@ services:
       WHATSAPP_AUTO_DOWNLOAD_MEDIA: "true"
       # Leave 'unavailable' so the pharmacy's phone keeps notifying its owner. Setting
       # 'available' marks the account online and silences their handset.
-      WHATSAPP_PRESENCE_ON_CONNECT: unavailable
+      # available, not unavailable. An "unavailable" account does not return a delivery
+      # receipt, so everyone who messages the pharmacy sees ONE TICK forever -- the message
+      # still arrives over the multi-device protocol and the bot still replies, but the
+      # sender's phone says "not delivered". For a shopfront that reads as being ignored,
+      # and it cost an hour of debugging a system that was working correctly.
+      #
+      # The cost is that the account presents as online continuously, which is a bot
+      # signature. What makes that acceptable here is Gates 2 and 3: this account can only
+      # ever REPLY, never open a conversation. Online-and-only-ever-replying is what a busy
+      # shop looks like; online-and-initiating is what a broadcaster looks like, and that is
+      # the pattern WhatsApp restricts.
+      WHATSAPP_PRESENCE_ON_CONNECT: available
       WHATSAPP_AUTO_MARK_READ: "true"
       WHATSAPP_AUTO_REJECT_CALL: "true"
       WHATSAPP_ACCOUNT_VALIDATION: "true"

@@ -20,6 +20,13 @@ class ContentBlock:
     id: str = ""
     name: str = ""
     input: dict = field(default_factory=dict)
+    # Gemini 3 attaches a "thought signature" to every functionCall part it emits, and
+    # the API REJECTS a follow-up request whose echoed functionCall is missing it
+    # (400 INVALID_ARGUMENT, "Function call is missing a thought_signature"). The
+    # signature is opaque, per-call, and cannot be reconstructed -- so it must ride on
+    # the block and be written back out verbatim when the history is rebuilt, or the
+    # second turn of every tool loop dies. None for Anthropic, which has no equivalent.
+    thought_signature: str | None = None
 
 
 @dataclass
@@ -29,6 +36,7 @@ class ChatResponse:
 
 gemini_client = None
 anthropic_client = None
+openrouter_key = ""
 
 if settings.GEMINI_API_KEY:
     try:
@@ -39,10 +47,16 @@ if settings.GEMINI_API_KEY:
 
 if settings.ANTHROPIC_API_KEY:
     try:
+        # pyrefly: ignore [missing-import]
         from anthropic import Anthropic
         anthropic_client = Anthropic(api_key=settings.ANTHROPIC_API_KEY)
     except Exception as e:
         log.warning("Could not initialize Anthropic client: %s", e)
+
+# OpenRouter needs no client object -- plain httpx against the OpenAI-format API in
+# _chat_openai(). (An earlier attempt used AgentRouter, a coding-agent gateway whose
+# content filter rejected pharmacy queries outright -- drug names, symptoms, whole
+# languages. A general-purpose router is the only sane fallback for this domain.)
 
 
 # ============================================================== prompts
@@ -133,6 +147,45 @@ Critical rules:
 
 
 # ============================================================== core calls
+def _with_429_backoff(fn, *args, **kwargs):
+    """Run a Gemini generate_content call, waiting out rate-limit windows.
+
+    Free-tier keys are capped at 20 requests/minute per model. Without this, a burst of
+    WhatsApp messages during a demo turns into a wall of "Something went wrong on our
+    side" replies -- the SDK's own retry is far too short to outlast a rolling window.
+    The 429 body helpfully says "Please retry in Ns", so honour it: sleep a little past
+    that and try again, up to a total of ~75s. A reply that lands a minute late is
+    recoverable; an error reply mid-demo reads as broken.
+    """
+    import time
+    deadline = time.monotonic() + 75
+    attempt = 0
+    while True:
+        try:
+            return fn(*args, **kwargs)
+        except Exception as e:
+            msg = str(e)
+            if "429" not in msg[:300]:
+                raise
+            # A per-DAY quota is exhausted. No amount of retrying inside this request
+            # will help -- the window resets at midnight Pacific -- so raise NOW and let
+            # chat() fall back to the next provider in milliseconds. The API's own
+            # "Please retry in Ns" hint is about a per-minute limit and is actively
+            # misleading here: honouring it made every reply wait 75s before failing over.
+            if "PerDay" in msg or "PerProjectPerModel" in msg:
+                raise
+            if time.monotonic() >= deadline:
+                raise
+            attempt += 1
+            wait = min(15.0 * attempt, 30.0)
+            m = re.search(r"retry in ([\d.]+)s", msg)
+            if m:
+                wait = max(3.0, min(float(m.group(1)) + 1.5, 45.0))
+            log.warning("Gemini rate-limited (attempt %d); backing off %.1fs",
+                        attempt, wait)
+            time.sleep(wait)
+
+
 def _extract_json(text: str) -> dict:
     """Models occasionally wrap JSON in fences despite instructions. Be forgiving."""
     text = text.strip()
@@ -157,7 +210,8 @@ def vision_json(system: str, images: list[bytes], instruction: str,
             contents.append(types.Part.from_bytes(data=img, mime_type=mt))
         contents.append(instruction)
 
-        res = gemini_client.models.generate_content(
+        res = _with_429_backoff(
+            gemini_client.models.generate_content,
             model=settings.MODEL_VISION,
             contents=contents,
             config=types.GenerateContentConfig(
@@ -287,96 +341,289 @@ def extract_prescription(images: list[bytes], media_types: list[str] | None = No
     )
 
 
+def _gemini_function_call_part(name: str, args: dict, thought_signature: str | None):
+    """A functionCall part, carrying the thought signature through when there is one.
+
+    Part.from_function_call() cannot attach one, and a rebuilt functionCall without the
+    signature the model originally emitted is rejected by the API on the next turn.
+    """
+    from google.genai import types
+    return types.Part(
+        function_call=types.FunctionCall(name=name, args=args or {}),
+        thought_signature=thought_signature or None,
+    )
+
+
 def chat(system: str, messages: list[dict], tools: list[dict] | None = None,
          max_tokens: int = 2000):
+    """One turn of conversation, with provider selection and fallback.
+
+    Order of preference:
+      1. the configured provider (gemini by default),
+      2. OpenRouter (chat only) if the primary raised -- a rate-limited or dead
+         primary should degrade the reply, not kill it.
+    Vision never falls back: free router models cannot see images, and an invoice
+    silently read by the wrong engine is worse than a visible failure.
+    """
     provider = settings.LLM_PROVIDER
 
     if provider == "gemini" and gemini_client:
-        from google.genai import types
+        try:
+            return _chat_gemini(system, messages, tools)
+        except Exception as e:
+            if not settings.OPENROUTER_API_KEY:
+                raise
+            log.warning("primary LLM failed (%s); answering via OpenRouter",
+                        str(e).splitlines()[0][:200])
+            return _chat_openai(system, messages, tools, max_tokens)
 
-        # Build Gemini tools if provided
-        g_tools = None
-        if tools:
-            func_decls = []
-            for t in tools:
-                schema_props = {}
-                props = t.get("input_schema", {}).get("properties", {})
-                for p_name, p_info in props.items():
-                    t_type = "STRING"
-                    if p_info.get("type") == "boolean":
-                        t_type = "BOOLEAN"
-                    elif p_info.get("type") == "integer":
-                        t_type = "INTEGER"
-                    schema_props[p_name] = types.Schema(
-                        type=t_type,
-                        description=p_info.get("description", "")
-                    )
-                func_decls.append(types.FunctionDeclaration(
-                    name=t["name"],
-                    description=t.get("description", ""),
-                    parameters=types.Schema(type="OBJECT", properties=schema_props)
-                ))
-            g_tools = [types.Tool(function_declarations=func_decls)]
+    if provider == "openrouter" and settings.OPENROUTER_API_KEY:
+        return _chat_openai(system, messages, tools, max_tokens)
 
-        # Check if messages contains tool execution results from prior turn
-        prompt_text = ""
-        tool_results_text = ""
-        for m in messages:
-            role = m.get("role")
-            content = m.get("content")
-            if role == "user":
-                if isinstance(content, str):
-                    prompt_text = content
-                elif isinstance(content, list):
-                    for item in content:
-                        if isinstance(item, dict) and item.get("type") == "tool_result":
-                            tool_results_text += f"\nTool output: {item.get('content', '')}"
+    if anthropic_client:
+        return _chat_anthropic(anthropic_client, settings.MODEL_CHAT,
+                               system, messages, tools, max_tokens)
 
-        if tool_results_text:
-            combined_prompt = f"Tool Execution Output:\n{tool_results_text}\n\nOriginal Question: {prompt_text}\nProvide the final answer based on the tool output."
-            res = gemini_client.models.generate_content(
-                model=settings.MODEL_CHAT,
-                contents=combined_prompt,
-                config=types.GenerateContentConfig(
-                    system_instruction=system,
-                    temperature=0.0,
+    raise RuntimeError("No configured LLM client available.")
+
+
+def _chat_openai(system: str, messages: list[dict], tools: list[dict] | None,
+                 max_tokens: int):
+    """One turn via OpenRouter's OpenAI-format chat completions, tools included.
+
+    The tool loop keeps history in Anthropic-ish shapes (ContentBlock dataclasses from
+    Gemini turns, dicts from everywhere else), so both are translated to OpenAI's
+    wire format here: tool_use -> assistant.tool_calls, tool_result -> role:"tool".
+    """
+    import httpx
+
+    oai_msgs: list[dict] = [{"role": "system", "content": system}]
+    for m in messages:
+        role = "assistant" if m.get("role") == "assistant" else "user"
+        content = m.get("content", "")
+
+        if isinstance(content, str):
+            if content.strip():
+                oai_msgs.append({"role": role, "content": content})
+            continue
+
+        tool_calls, text_parts, tool_results = [], [], []
+        for item in content if isinstance(content, list) else []:
+            if isinstance(item, dict):
+                itype = item.get("type")
+                if itype == "tool_use":
+                    tool_calls.append({
+                        "id": item.get("id") or item.get("name"),
+                        "type": "function",
+                        "function": {"name": item["name"],
+                                     "arguments": json.dumps(item.get("input") or {})},
+                    })
+                elif itype == "tool_result":
+                    tool_results.append({"role": "tool",
+                                         "tool_call_id": item.get("tool_use_id"),
+                                         "content": str(item.get("content", ""))})
+                elif itype == "text" and item.get("text"):
+                    text_parts.append(item["text"])
+            else:
+                if getattr(item, "type", None) == "tool_use":
+                    tool_calls.append({
+                        "id": item.id or item.name,
+                        "type": "function",
+                        "function": {"name": item.name,
+                                     "arguments": json.dumps(item.input or {})},
+                    })
+                elif getattr(item, "type", None) == "text" and item.text:
+                    text_parts.append(item.text)
+
+        if tool_calls:
+            oai_msgs.append({"role": "assistant",
+                             "content": "\n".join(text_parts) or None,
+                             "tool_calls": tool_calls})
+        elif text_parts:
+            oai_msgs.append({"role": role, "content": "\n".join(text_parts)})
+        oai_msgs.extend(tool_results)
+
+    payload: dict = {
+        "model": settings.OPENROUTER_MODEL,
+        "messages": oai_msgs,
+        "max_tokens": max_tokens,
+        "temperature": 0,
+    }
+    if tools:
+        payload["tools"] = [{"type": "function",
+                             "function": {"name": t["name"],
+                                          "description": t.get("description", ""),
+                                          "parameters": t.get("input_schema",
+                                                              {"type": "object"})}}
+                            for t in tools]
+    r = httpx.post(
+        f"{settings.OPENROUTER_BASE_URL.rstrip('/')}/chat/completions",
+        headers={"Authorization": f"Bearer {settings.OPENROUTER_API_KEY}",
+                 "X-Title": "Pharma OS"},
+        json=payload, timeout=60,
+    )
+    r.raise_for_status()
+    msg = (r.json().get("choices") or [{}])[0].get("message") or {}
+
+    blocks = []
+    for tc in msg.get("tool_calls") or []:
+        fn = tc.get("function") or {}
+        try:
+            args = json.loads(fn.get("arguments") or "{}")
+        except json.JSONDecodeError:
+            args = {}
+        blocks.append(ContentBlock(type="tool_use", id=tc.get("id") or fn.get("name"),
+                                   name=fn.get("name"), input=args))
+    if msg.get("content"):
+        blocks.append(ContentBlock(type="text", text=msg["content"]))
+    return ChatResponse(content=blocks)
+
+
+def _blocks_to_anthropic_dicts(content) -> list:
+    """Normalise an assistant/content list to plain dicts for the Anthropic wire format.
+
+    The tool loop keeps history in two shapes depending on which engine produced the
+    previous turn: Gemini turns yield ContentBlock dataclasses, Anthropic-shaped turns
+    yield dicts. The Anthropic SDK serialises dicts only, so dataclasses are converted
+    and anything it cannot express is dropped rather than crashing the fallback.
+    """
+    out = []
+    for item in content if isinstance(content, list) else []:
+        if isinstance(item, dict):
+            if item.get("type") in ("tool_use", "tool_result", "text"):
+                out.append(item)
+        elif getattr(item, "type", None) == "tool_use":
+            out.append({"type": "tool_use", "id": item.id, "name": item.name,
+                        "input": item.input or {}})
+        elif getattr(item, "type", None) == "text" and item.text:
+            out.append({"type": "text", "text": item.text})
+    return out
+
+
+def _chat_anthropic(client, model: str, system: str, messages: list[dict],
+                    tools: list[dict] | None, max_tokens: int):
+    safe_messages = []
+    for m in messages:
+        content = m.get("content", "")
+        if isinstance(content, list):
+            content = _blocks_to_anthropic_dicts(content)
+        if content in ("", None, []):
+            continue        # the API rejects empty content entries outright
+        safe_messages.append({"role": m.get("role", "user"), "content": content})
+    kwargs: dict = {
+        "model": model,
+        "max_tokens": max_tokens,
+        "temperature": 0,
+        "system": system,
+        "messages": safe_messages,
+    }
+    if tools:
+        kwargs["tools"] = tools
+    return client.messages.create(**kwargs)
+
+
+def _chat_gemini(system: str, messages: list[dict], tools: list[dict] | None):
+    from google.genai import types
+
+    # Build Gemini tool declarations
+    g_tools = None
+    if tools:
+        func_decls = []
+        for t in tools:
+            schema_props = {}
+            props = t.get("input_schema", {}).get("properties", {})
+            for p_name, p_info in props.items():
+                t_type = "STRING"
+                if p_info.get("type") == "boolean":
+                    t_type = "BOOLEAN"
+                elif p_info.get("type") == "integer":
+                    t_type = "INTEGER"
+                elif p_info.get("type") == "number":
+                    t_type = "NUMBER"
+                schema_props[p_name] = types.Schema(
+                    type=t_type,
+                    description=p_info.get("description", "")
                 )
-            )
-        else:
-            res = gemini_client.models.generate_content(
-                model=settings.MODEL_CHAT,
-                contents=prompt_text,
-                config=types.GenerateContentConfig(
-                    tools=g_tools,
-                    system_instruction=system,
-                    temperature=0.0,
-                )
-            )
+            func_decls.append(types.FunctionDeclaration(
+                name=t["name"],
+                description=t.get("description", ""),
+                parameters=types.Schema(type="OBJECT", properties=schema_props)
+            ))
+        g_tools = [types.Tool(function_declarations=func_decls)]
 
-        blocks = []
-        if getattr(res, "function_calls", None):
-            for fc in res.function_calls:
-                blocks.append(ContentBlock(
-                    type="tool_use",
-                    id=fc.name,
-                    name=fc.name,
-                    input=dict(fc.args or {})
+    # Convert Anthropic-style message history to Gemini Content objects.
+    # Roles: "user" -> "user", "assistant" -> "model".
+    contents = []
+    for m in messages:
+        role = "model" if m.get("role") == "assistant" else "user"
+        content = m.get("content", "")
+
+        if isinstance(content, str):
+            if content.strip():
+                contents.append(types.Content(
+                    role=role,
+                    parts=[types.Part.from_text(text=content)]
                 ))
-        if getattr(res, "text", None):
-            blocks.append(ContentBlock(type="text", text=res.text))
 
-        return ChatResponse(content=blocks)
+        elif isinstance(content, list):
+            parts = []
+            for item in content:
+                if not isinstance(item, dict):
+                    # ContentBlock dataclass from a previous assistant turn
+                    if getattr(item, "type", None) == "tool_use":
+                        parts.append(_gemini_function_call_part(
+                            item.name, item.input or {},
+                            getattr(item, "thought_signature", None)))
+                    elif getattr(item, "type", None) == "text" and item.text:
+                        parts.append(types.Part.from_text(text=item.text))
+                    continue
 
-    elif anthropic_client:
-        kwargs: dict = {
-            "model": settings.MODEL_CHAT,
-            "max_tokens": max_tokens,
-            "temperature": 0,
-            "system": system,
-            "messages": messages,
-        }
-        if tools:
-            kwargs["tools"] = tools
-        return anthropic_client.messages.create(**kwargs)
-    else:
-        raise RuntimeError("No configured LLM client available.")
+                itype = item.get("type")
+                if itype == "tool_use":
+                    parts.append(_gemini_function_call_part(
+                        item["name"], item.get("input") or {},
+                        item.get("thought_signature")))
+                elif itype == "tool_result":
+                    parts.append(types.Part.from_function_response(
+                        name=item.get("tool_use_id", "tool"),
+                        response={"output": item.get("content", "")}
+                    ))
+                elif itype == "text" and item.get("text"):
+                    parts.append(types.Part.from_text(text=item["text"]))
+
+            if parts:
+                contents.append(types.Content(role=role, parts=parts))
+
+    res = _with_429_backoff(
+        gemini_client.models.generate_content,
+        model=settings.MODEL_CHAT,
+        contents=contents,
+        config=types.GenerateContentConfig(
+            tools=g_tools,
+            system_instruction=system,
+            temperature=0.0,
+        )
+    )
+
+    # Parse the RAW candidate parts rather than the res.function_calls convenience
+    # list: only the raw parts carry each call's thought_signature, which must be
+    # echoed back on the next turn or the API returns 400 INVALID_ARGUMENT.
+    blocks = []
+    try:
+        cand_parts = ((res.candidates or [None])[0].content.parts) or []
+    except Exception:
+        cand_parts = []
+    for p in cand_parts:
+        fc = getattr(p, "function_call", None)
+        if fc is not None:
+            blocks.append(ContentBlock(
+                type="tool_use",
+                id=fc.name,
+                name=fc.name,
+                input=dict(fc.args or {}),
+                thought_signature=getattr(p, "thought_signature", None),
+            ))
+    if getattr(res, "text", None):
+        blocks.append(ContentBlock(type="text", text=res.text))
+
+    return ChatResponse(content=blocks)

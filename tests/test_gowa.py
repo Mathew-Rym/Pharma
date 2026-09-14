@@ -59,6 +59,25 @@ def test_correctly_signed_message_is_accepted(secret, monkeypatch):
     import main
     monkeypatch.setattr(main, "handle_inbound", lambda b: seen.append(b))
 
+    # The webhook names the tenant from device_id before dispatching, which reads the
+    # pharmacies table. This test is about HMAC verification, not persistence, so the
+    # lookup is mocked at that seam.
+    #
+    # It is mocked rather than satisfied with a database on purpose. This assertion was
+    # CI's only failure for days -- PoolTimeout, not SupabaseException -- and the tempting
+    # fix is to give CI a database. That must not happen: the suite inserts staff and
+    # pharmacies and writes inbound_history, and a fabricated inbound_history row is what
+    # made 254746294224 reachable and cost this project a WhatsApp sending restriction.
+    #
+    # None means "device resolves to no tenant", which leaves pharmacy_id unset -- exactly
+    # what a real platform-line message does, so the shape under test stays realistic.
+    # Resolution('unknown') is the new seam: tenancy.resolve() now returns an explicit
+    # device_kind so gateway_intercept can distinguish platform from unknown devices.
+    # 'unknown' matches the old mock's effect: no pharmacy_id, no tenant assignment.
+    import tenancy
+    from tenancy import Resolution
+    monkeypatch.setattr(tenancy, "resolve", lambda **kw: Resolution("unknown"))
+
     raw, headers = _signed(TEXT_EVENT, secret)
     r = _client().post("/webhook/gowa", content=raw, headers=headers)
     assert r.status_code == 200, r.text

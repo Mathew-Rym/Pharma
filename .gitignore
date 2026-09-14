@@ -1,6 +1,13 @@
 .env
 .env.*
 !.env.example
+# Dot-less copies too. `.env` and `.env.*` cover .env.backup and .env.bak but NOT
+# env.backup, env.save or env.CURRENT -- and a hand-made backup is at least as likely to be
+# named without the leading dot. One `git add -A` is all it takes.
+env
+env.*
+*.env
+!*.env.example
 __pycache__/
 *.pyc
 node_modules/

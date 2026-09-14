@@ -30,7 +30,7 @@ from datetime import datetime, timedelta, timezone
 from config import settings
 from db import ex, ex1, q, q1, signed_url
 from state import clear_state, get_state, set_state
-from utils import from_pieces, kes
+from utils import from_pieces, hash_pin, kes
 from wa import reply_document, reply_image, reply_text, send_document, send_text
 
 log = logging.getLogger(__name__)
@@ -52,7 +52,13 @@ def check_pin(staff: dict, pin: str) -> tuple[bool, str]:
         return False, ("You have no approval PIN set. Ask the owner to set one on the "
                        "dashboard before you can approve.")
 
-    if str(pin).strip() == str(staff["approval_pin"]).strip():
+    # Hash comparison, constant-time. Was `str(pin).strip() == str(...).strip()` against a
+    # PLAINTEXT column: anyone with read access to `staff` could approve a POM as a named
+    # pharmacist against that pharmacist's PPB number, and the approval log -- the
+    # regulatory record -- would show it as valid. compare_digest because a plain ==
+    # short-circuits on the first differing character, and the lockout counter is the only
+    # thing limiting online guessing.
+    if secrets.compare_digest(hash_pin(pin), str(staff["approval_pin"]).strip()):
         ex("update staff set pin_failed_count=0, pin_locked_until=null where id=%s",
            (staff["id"],))
         return True, ""
@@ -305,8 +311,9 @@ def handle_pharmacist_reply(phone: str, staff: dict, text: str) -> bool:
 
 
 def _do_approve(rx_id: str, order_id: str, staff: dict, phone: str) -> None:
-    if staff["role"] not in ("pharmacist", "owner", "manager"):
-        reply_text(phone, "Your role cannot verify prescriptions.")
+    from rx import _can_verify_prescriptions, _verification_refusal
+    if not _can_verify_prescriptions(staff):
+        reply_text(phone, _verification_refusal(staff))
         return
     already = q1("select status, verified_by from prescriptions where id=%s", (rx_id,))
     if already and already["status"] == "verified":
