@@ -68,6 +68,17 @@ class Settings:
     MODEL_VISION = os.getenv("MODEL_VISION", "gemini-3.6-flash" if GEMINI_API_KEY else "claude-opus-5")
     MODEL_CHAT = os.getenv("MODEL_CHAT", "gemini-3.6-flash" if GEMINI_API_KEY else "claude-sonnet-5")
 
+    # --- OpenRouter fallback (chat only, never vision) ---
+    # When the primary provider raises -- typically the Gemini free tier's 20 req/DAY
+    # during a burst -- chat falls back to OpenRouter so the reply degrades instead of
+    # erroring. Vision does NOT fall back: free router models are text-only, and an
+    # invoice silently read by a different engine is worse than a visible failure.
+    # Key from https://openrouter.ai/keys; free tool-capable models include
+    # openrouter/free (auto-route) and google/gemma-4-31b-it:free.
+    OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
+    OPENROUTER_BASE_URL = os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
+    OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "openrouter/free")
+
     # --- whatsapp transport ---
     # 'gowa'    = go-whatsapp-web-multidevice (github.com/aldinokemal). Multi-device,
     #             so one server can hold a separate WhatsApp account per pharmacy.

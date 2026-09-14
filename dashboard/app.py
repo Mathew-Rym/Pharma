@@ -56,14 +56,19 @@ def _sb():
 
 
 def q(sql, params=None) -> list[dict]:
-    with psycopg.connect(DATABASE_URL, row_factory=dict_row) as conn:
+    # connect_timeout + prepare_threshold=None: same pooler rationale as db_helpers.py —
+    # an unbounded connect hangs forever on a moody Supabase pooler, and prepared
+    # statements are unsupported on the transaction pooler.
+    with psycopg.connect(DATABASE_URL, row_factory=dict_row,
+                         connect_timeout=10, prepare_threshold=None) as conn:
         with conn.cursor() as cur:
             cur.execute(sql, params)
             return cur.fetchall()
 
 
 def ex(sql, params=None):
-    with psycopg.connect(DATABASE_URL) as conn:
+    with psycopg.connect(DATABASE_URL, connect_timeout=10,
+                         prepare_threshold=None) as conn:
         with conn.cursor() as cur:
             cur.execute(sql, params)
 
@@ -812,20 +817,48 @@ else:
                  use_container_width=True, hide_index=True)
 
     st.subheader("Staff (WhatsApp access)")
-    sdf = st.data_editor(pd.DataFrame(q(
+    st.caption("A number only gets a reply if it is on this list. Onboarding adds numbers "
+               "here automatically (the REGISTER owner, then OWNER/JOIN code members); "
+               "use this page to add, edit or REMOVE numbers by hand. Removing a row "
+               "deletes it from the database — not just from this screen.")
+    staff_rows = q(
         """select id, phone, name, role, ppb_reg_no, is_active from staff
-            where pharmacy_id=%s order by name""", (PID,))),
-        use_container_width=True, hide_index=True, num_rows="dynamic", disabled=["id"])
+            where pharmacy_id=%s order by name""", (PID,))
+    sdf = st.data_editor(pd.DataFrame(staff_rows),
+                         use_container_width=True, hide_index=True, num_rows="dynamic",
+                         disabled=["id"], key="staff_editor")
     if st.button("💾 Save staff"):
+        db_ids = {str(r["id"]) for r in staff_rows}
+        seen_ids = set()
+        errors = []
         for _, r in sdf.iterrows():
             if pd.notna(r.get("id")):
+                sid = str(r["id"])
+                seen_ids.add(sid)
                 ex("""update staff set phone=%s, name=%s, role=%s, ppb_reg_no=%s,
                          is_active=%s where id=%s""",
                    (r["phone"], r["name"], r["role"], r["ppb_reg_no"],
-                    bool(r["is_active"]), r["id"]))
+                    bool(r["is_active"]), sid))
             elif pd.notna(r.get("phone")):
-                ex("""insert into staff (pharmacy_id, phone, name, role, ppb_reg_no)
-                      values (%s,%s,%s,%s,%s) on conflict (phone) do nothing""",
-                   (PID, r["phone"], r["name"], r["role"], r.get("ppb_reg_no")))
-        st.success("Saved.")
-        st.rerun()
+                try:
+                    ex("""insert into staff (pharmacy_id, phone, name, role, ppb_reg_no)
+                          values (%s,%s,%s,%s,%s) on conflict (phone) do nothing""",
+                       (PID, r["phone"], r["name"], r["role"], r.get("ppb_reg_no")))
+                except Exception as e:
+                    errors.append(f"{r['phone']}: {e}")
+        # Rows the user deleted in the editor no longer appear in sdf. Every DB row
+        # that vanished from the submitted frame is a removal — honour it, or the
+        # number keeps its WhatsApp access forever while the screen pretends it is gone.
+        for gone_id in db_ids - seen_ids:
+            try:
+                ex("delete from staff where id=%s", (gone_id,))
+            except Exception as e:
+                errors.append(f"removal of {gone_id[:8]}: {e}")
+        # Rerun only when everything succeeded, so the refreshed table replaces the
+        # screen. On error there is no rerun: the message has to stay visible for the
+        # user to fix the row, and a rerun would wipe it in the same frame it drew in.
+        if errors:
+            st.error("Some changes failed: " + "; ".join(errors))
+        else:
+            st.toast("Staff saved — additions, edits and removals are in the database.")
+            st.rerun()

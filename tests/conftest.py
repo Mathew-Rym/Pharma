@@ -34,6 +34,18 @@ import sys
 
 import pytest
 
+# Load .env BEFORE anything checks os.getenv("DATABASE_URL").
+# Without this, the integration tests skip because the connection string
+# lives in .env but is not exported in the shell environment.
+_shell_pharmacy_id = os.environ.get("PHARMACY_ID")
+from dotenv import load_dotenv
+load_dotenv(os.path.join(os.path.dirname(__file__), "..", ".env"), override=False)
+
+# If .env provided PHARMACY_ID but the shell didn't, remove it.
+# We MUST use a throwaway test pharmacy to avoid destroying the real database.
+if not _shell_pharmacy_id and "PHARMACY_ID" in os.environ:
+    del os.environ["PHARMACY_ID"]
+
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "api"))
 
 _OWNED_PHARMACY: str | None = None
@@ -121,13 +133,6 @@ def _sweep_abandoned() -> None:
         print(f"conftest: sweep skipped ({e})", file=sys.stderr)
 
 
-if not os.getenv("PHARMACY_ID"):
-    _OWNED_PHARMACY = _create_throwaway()
-    if _OWNED_PHARMACY:
-        os.environ["PHARMACY_ID"] = _OWNED_PHARMACY
-        _sweep_abandoned()
-
-
 # ---------------------------------------------------------------- external dependencies
 #
 # Some tests need a real Supabase project (signed URLs, storage buckets, Auth) or a running
@@ -181,6 +186,7 @@ def _teardown(pid: str) -> None:
         "delete from products where pharmacy_id = %s",
         "delete from suppliers where pharmacy_id = %s",
         "delete from staff_role_changes where pharmacy_id = %s",
+        "delete from stockout_log where pharmacy_id = %s",
         "delete from onboarding_contacts where pharmacy_id = %s",
         "delete from inbound_history where pharmacy_id = %s",
         "delete from wa_messages where pharmacy_id = %s",
@@ -203,6 +209,17 @@ def _teardown(pid: str) -> None:
                 conn.rollback()
                 print(f"conftest teardown: {' '.join(s.split()[:3])} -> {e}",
                       file=sys.stderr)
+
+
+# The create + sweep block lives HERE, after _teardown is defined, not up with
+# _create_throwaway. _sweep_abandoned calls _teardown; at the top of the module that
+# name did not exist yet, so every sweep died with "name '_teardown' is not defined"
+# and abandoned PYTEST pharmacies were never cleaned up.
+if not os.getenv("PHARMACY_ID"):
+    _OWNED_PHARMACY = _create_throwaway()
+    if _OWNED_PHARMACY:
+        os.environ["PHARMACY_ID"] = _OWNED_PHARMACY
+        _sweep_abandoned()
 
 
 @pytest.fixture(scope="session", autouse=True)

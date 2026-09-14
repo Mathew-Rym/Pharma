@@ -993,7 +993,7 @@ TABLES = ["pharmacies","staff","products","batches","stock_movements","orders",
           "order_lines","payments","prescriptions","suppliers","purchase_orders",
           "po_lines","grns","grn_lines","customers","job_runs","wa_messages",
           "agents","agent_commands","pos_sales","sync_state","sales_history_monthly",
-          "stock_reconciliation","demand_forecast","duty_roster"]
+          "stock_reconciliation","demand_forecast","duty_roster","stockout_log"]
 VIEWS = ["v_stock_on_hand","v_expiry_risk","v_velocity_90d","v_demand_baseline",
          "v_seasonality","v_stock_variance","v_grn_verification",
          "v_open_receiving_discrepancies"]

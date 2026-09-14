@@ -62,7 +62,7 @@ def test_a_bare_photo_with_no_active_flow_asks_instead_of_filing_it(staff_bot):
 def test_receive_starts_the_invoice_flow(staff_bot):
     replies, _ = staff_bot["send"]("RECEIVE")
     assert staff_bot["state"]["flow"] == "grn_collect"
-    assert staff_bot["state"]["context"] == {"pages": []}
+    assert staff_bot["state"]["context"] == {"pages": [], "text_lines": []}
     assert "invoice" in replies[-1].lower() and "DONE" in replies[-1]
 
 

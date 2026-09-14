@@ -35,7 +35,13 @@ pool = ConnectionPool(
     max_lifetime=1800,
     # Fail a request rather than hang forever when the database is unreachable.
     timeout=15,
-    kwargs={"row_factory": dict_row, "prepare_threshold": None},
+    # connect_timeout bounds each ATTEMPT to open a connection. The pool's `timeout`
+    # only bounds how long a caller waits for a pooled connection -- a worker stuck in
+    # an unbounded connect (observed against the Supabase pooler) would never return a
+    # connection to the pool at all, and every request behind it would die at 15s until
+    # restart. With this, a stalled attempt fails in 10s and the pool replaces it.
+    kwargs={"row_factory": dict_row, "prepare_threshold": None,
+            "connect_timeout": 10},
 )
 
 # Close the pool on the way out. Without this every short-lived process -- a cron job,
