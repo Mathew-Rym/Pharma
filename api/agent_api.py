@@ -27,7 +27,7 @@ import tenancy
 from tenancy import pid          # tenant comes from the request, not from .env
 
 
-def _agent(token: str | None) -> dict:
+def _agent(token: str | None, allow_suspended: bool = False) -> dict:
     """Authenticate an agent AND bind its pharmacy for the rest of the request.
 
     The binding is the fix for a total failure of Loop B. This function looked the
@@ -49,12 +49,17 @@ def _agent(token: str | None) -> dict:
     below is ever changed to a plain `def`, it will run on a REUSED threadpool worker and
     this binding will leak into the next request on that worker -- so wrap that handler in
     `with tenancy.pharmacy_scope(...)` instead of relying on this.
+
+    A suspended agent is refused everywhere except heartbeat, which still answers so the
+    agent can learn it is suspended and back off cleanly.
     """
     if not token:
         raise HTTPException(401, "missing agent token")
     a = q1("select * from agents where agent_token = %s", (token,))
     if not a:
         raise HTTPException(401, "unknown agent token")
+    if a.get("suspended") and not allow_suspended:
+        raise HTTPException(403, "agent suspended; contact the pharmacy owner")
     ex("update agents set last_seen_at = now() where id = %s", (a["id"],))
     tenancy.set_pharmacy(str(a["pharmacy_id"]))
     return a
@@ -86,7 +91,9 @@ async def enrol(request: Request):
 
 @router.post("/heartbeat")
 async def heartbeat(request: Request, x_agent_token: str | None = Header(None)):
-    a = _agent(x_agent_token)
+    # allow_suspended: heartbeat must still answer so the agent learns it is suspended
+    # and backs off, instead of retrying a 403 forever.
+    a = _agent(x_agent_token, allow_suspended=True)
     body = await request.json()
     ex("""update agents set agent_version=%s, ingest_mode=%s, db_engine=%s,
                             db_detail=%s, last_seen_at=now() where id=%s""",
@@ -100,28 +107,53 @@ async def heartbeat(request: Request, x_agent_token: str | None = Header(None)):
 # ============================================================ command queue
 @router.get("/commands")
 def take_commands(x_agent_token: str | None = Header(None)):
+    # Plain def on purpose: blocking DB work belongs on a threadpool, not the event
+    # loop. But a sync endpoint is exactly the set_pharmacy leak the _agent docstring
+    # warns about -- the binding must not survive this call on a reused worker
+    # thread. try/finally clear is the belt-and-braces form; the async endpoints rely
+    # on FastAPI giving each request its own Task context.
     a = _agent(x_agent_token)
-    rows = q("""update agent_commands set status='taken', taken_at=now()
-                 where id in (select id from agent_commands
-                               where agent_id=%s and status='queued'
-                               order by created_at limit 5)
-                 returning id, command, args""", (a["id"],))
-    return {"commands": [{"id": str(r["id"]), "command": r["command"],
-                          "args": r["args"]} for r in rows]}
+    try:
+        rows = q("""update agent_commands set status='taken', taken_at=now()
+                     where id in (select id from agent_commands
+                                   where agent_id=%s and status='queued'
+                                   order by created_at limit 5)
+                     returning id, command, args""", (a["id"],))
+        return {"commands": [{"id": str(r["id"]), "command": r["command"],
+                              "args": r["args"]} for r in rows]}
+    finally:
+        tenancy.clear_pharmacy()
 
 
 @router.post("/commands/{command_id}/result")
 async def command_result(command_id: str, request: Request,
                          x_agent_token: str | None = Header(None)):
-    _agent(x_agent_token)
+    a = _agent(x_agent_token)
     body = await request.json()
     ok = bool(body.get("ok"))
     result = body.get("result") or {}
 
+    # Ownership first: the command must belong to the AUTHENTICATED agent. Without
+    # this check an agent token could finalise any other agent's command -- mark it
+    # done, overwrite its result, and have its reply_text sent to whatever reply_to
+    # that command carried. The agent_id predicate makes cross-agent submission a 404.
+    cmd = q1("select status from agent_commands where id=%s and agent_id=%s",
+             (command_id, a["id"]))
+    if not cmd:
+        raise HTTPException(404, "no such command for this agent")
+    if cmd["status"] != "taken":
+        # Only queued -> taken -> done/error is valid. A replayed result (already
+        # done), a command nobody took, or a command still queued must produce no
+        # side effects -- acknowledge without re-sending the WhatsApp reply.
+        return {"ok": True, "reason": f"not_taken ({cmd['status']})"}
+
+    # status='taken' guard makes the finalisation itself a valid transition: two
+    # concurrent result POSTs race, exactly one updates a row still in 'taken'.
     row = ex1("""update agent_commands
                     set status=%s, result=%s, done_at=now()
-                  where id=%s returning command, reply_to""",
-              ("done" if ok else "error", json.dumps(result), command_id))
+                  where id=%s and agent_id=%s and status='taken'
+                  returning command, reply_to""",
+              ("done" if ok else "error", json.dumps(result), command_id, a["id"]))
     if row and row["reply_to"]:
         from wa import reply_text
         reply_text(row["reply_to"], _humanise(row["command"], ok, result))

@@ -68,18 +68,23 @@ def set_state(phone: str, flow: str, context: dict, ttl_min: int = DEFAULT_TTL_M
     """Save the conversation's position for (pharmacy_id, phone).
 
     `pharmacy_id` defaults to whichever tenant is bound for this message.
-    Falls back to settings.PHARMACY_ID only as a last resort, with a warning.
+
+    Fail-closed on a missing tenant: this used to fall back to settings.PHARMACY_ID
+    "as a last resort, with a warning" -- the last runtime place where the .env
+    pharmacy could own another tenant's conversation state. Every legitimate caller
+    either runs inside pharmacy_scope() (router dispatch, jobs) or passes
+    pharmacy_id explicitly (register's onboarding flows pass the platform row), so
+    reaching this without a tenant means a caller is missing its scope -- raise so
+    the bug is found, rather than filing state under a plausible wrong pharmacy.
     """
     if pharmacy_id is None:
         try:
             pharmacy_id = tenancy.pid()
         except tenancy.NoTenant:
-            from config import settings
-            pharmacy_id = settings.PHARMACY_ID
-            log.warning("set_state(%s, flow=%s) with no tenant bound; labelling the row "
-                        "with the configured pharmacy. The flow itself is keyed on "
-                        "(pharmacy_id, phone), so a caller is missing a pharmacy_scope.",
-                        phone, flow)
+            raise tenancy.NoTenant(
+                f"set_state({phone!r}, flow={flow!r}) with no tenant bound; refusing to "
+                f"label the row with a configured default pharmacy. Run the caller "
+                f"inside tenancy.pharmacy_scope() or pass pharmacy_id= explicitly.")
     expires = datetime.now(timezone.utc) + timedelta(minutes=ttl_min)
     # default=str: flow contexts carry database ids straight from RETURNING clauses,
     # which psycopg hands back as uuid.UUID. json.dumps raises on those, so the

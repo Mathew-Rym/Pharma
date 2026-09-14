@@ -151,6 +151,26 @@ def tx():
 
 
 # ------------------------------------------------------------ stock movements
+class InsufficientStock(RuntimeError):
+    """A movement would take a batch below zero.
+
+    Raised, never absorbed: a sale the pharmacy cannot physically fulfil must not be
+    recorded as fulfilled. The batch update in apply_movement is the atomic guard --
+    `where qty_pieces + delta >= 0` -- so two concurrent takers of the last units
+    serialise on the row lock and exactly one succeeds. The loser raises, its
+    transaction rolls back, and no ledger row survives.
+    """
+
+    def __init__(self, batch_id: str, delta: int, available: int):
+        self.batch_id = batch_id
+        self.delta = delta
+        self.available = available
+        super().__init__(
+            f"batch {batch_id} has {available} pcs; movement of {delta} would take it "
+            f"below zero -- refusing"
+        )
+
+
 def apply_movement(cur, batch_id: str, delta: int, reason: str,
                    actor_staff: str | None = None, ref_table: str | None = None,
                    ref_id: str | None = None, note: str | None = None) -> None:
@@ -190,11 +210,12 @@ def apply_movement(cur, batch_id: str, delta: int, reason: str,
     """
     from tenancy import NoTenant, pid
 
-    cur.execute("select pharmacy_id from batches where id = %s", (batch_id,))
+    cur.execute("select pharmacy_id, qty_pieces from batches where id = %s", (batch_id,))
     row = cur.fetchone()
     if not row:
         raise ValueError(f"no such batch {batch_id}; refusing to write a stock movement")
     owner = str(row["pharmacy_id"])
+    available = int(row["qty_pieces"] or 0)
 
     try:
         bound = pid()
@@ -215,10 +236,21 @@ def apply_movement(cur, batch_id: str, delta: int, reason: str,
            values (%s,%s,%s,%s,%s,%s,%s,%s)""",
         (owner, batch_id, delta, reason, actor_staff, ref_table, ref_id, note),
     )
+    # Atomic non-negative guard. The WHERE clause is evaluated under the row lock the
+    # UPDATE takes, so a concurrent movement on the same batch cannot interleave: one
+    # transaction's update commits first, the other re-evaluates qty_pieces against the
+    # committed value. A delta that would go below zero matches zero rows and raises,
+    # rolling back the ledger insert above with it. This is the invariant "inventory
+    # cannot become negative" enforced at the only sanctioned mutation point, so every
+    # caller (POS, dispensing, GRN corrections) inherits it without knowing about it.
     cur.execute(
-        "update batches set qty_pieces = qty_pieces + %s where id = %s",
-        (delta, batch_id),
+        """update batches set qty_pieces = qty_pieces + %s
+            where id = %s and qty_pieces + %s >= 0
+            returning qty_pieces""",
+        (delta, batch_id, delta),
     )
+    if cur.fetchone() is None:
+        raise InsufficientStock(batch_id, delta, available)
 
 
 # ------------------------------------------------------------------- storage

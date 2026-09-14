@@ -114,7 +114,24 @@ def _draft_stockout_po(product_id, name: str, pack_size: int, count: int,
     one trigger, because reorder_list() reads sales velocity and a stockout product
     with no sales history would never appear there — which is precisely the gap this
     module exists to close.
+
+    Dedup: the 07:00 low-stock job, an owner's ORDER reply and this stockout trigger
+    can all fire for the same product inside an hour, and each used to mint its own
+    PO. If an unsent PO for this product already awaits approval, say so instead of
+    stacking another on top.
     """
+    dup = q1(
+        """select po.id from purchase_orders po
+             join po_lines l on l.po_id = po.id
+            where po.pharmacy_id = %s and l.product_id = %s
+              and po.status in ('draft','awaiting_approval')
+            order by po.created_at desc limit 1""",
+        (pid(), product_id),
+    )
+    if dup:
+        return str(dup["id"]), (f"a draft PO for {name} already awaits approval "
+                                f"({str(dup['id'])[:8].upper()}) — reply *PO* to review it")
+
     p = q1(
         """select p.cost_price, s.id as supplier_id, s.name as supplier
              from products p left join suppliers s on s.id = p.preferred_supplier_id

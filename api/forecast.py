@@ -162,6 +162,20 @@ def create_draft_pos(staff_id: str | None = None,
                      supplier_filter: str | None = None) -> list[dict]:
     """Turn the suggestion list into draft purchase orders awaiting one-tap approval."""
     rows = reorder_list(60)
+    # Dedup: a product already sitting on an unsent PO must not get a second one.
+    # The 07:00 job, an owner's ORDER reply and a stockout trigger can all fire for
+    # the same product within an hour; without this each mints its own PO and the
+    # approval queue fills with near-identical orders to triage.
+    already_open = {
+        r["product_id"] for r in q(
+            """select distinct l.product_id
+                 from po_lines l join purchase_orders po on po.id = l.po_id
+                where po.pharmacy_id = %s
+                  and po.status in ('draft','awaiting_approval')""",
+            (pid(),),
+        )
+    }
+    rows = [r for r in rows if r["product_id"] not in already_open]
     if supplier_filter:
         rows = [r for r in rows
                 if r["supplier"] and supplier_filter.lower() in r["supplier"].lower()]

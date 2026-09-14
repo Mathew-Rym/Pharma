@@ -311,8 +311,9 @@ def handle_pharmacist_reply(phone: str, staff: dict, text: str) -> bool:
 
 
 def _do_approve(rx_id: str, order_id: str, staff: dict, phone: str) -> None:
-    if staff["role"] not in ("pharmacist", "owner", "manager"):
-        reply_text(phone, "Your role cannot verify prescriptions.")
+    from rx import _can_verify_prescriptions, _verification_refusal
+    if not _can_verify_prescriptions(staff):
+        reply_text(phone, _verification_refusal(staff))
         return
     already = q1("select status, verified_by from prescriptions where id=%s", (rx_id,))
     if already and already["status"] == "verified":
