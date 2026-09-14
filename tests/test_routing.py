@@ -15,11 +15,22 @@ import pytest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "api"))
 os.environ.setdefault("PHARMAOS_TESTING", "1")
 
+# Same convention as every other DB-backed test file in this suite: CI deliberately
+# sets no DATABASE_URL, and api/config.py supplies a placeholder that PARSES but
+# connects to nothing (127.0.0.1:5432 in a runner with no Postgres). Import-time
+# construction succeeds, so the failure surfaces only when a query runs -- as a
+# 15-second PoolTimeout per test. Tests that genuinely need a database skip; tests
+# of fail-closed ROUTING LOGIC mock the lookup instead of skipping, because those
+# are the security assertions this file exists to keep true in every environment.
+DB = bool(os.getenv("DATABASE_URL"))
+db = pytest.mark.skipif(not DB, reason="DATABASE_URL not set")
+
 
 # ============================================================ tenancy.resolve
 class TestResolve:
     """tenancy.resolve() must return three distinct kinds."""
 
+    @db
     def test_tenant_device_resolves(self):
         """A known tenant device returns kind='tenant' with a pharmacy_id."""
         import tenancy
@@ -33,22 +44,34 @@ class TestResolve:
         assert r.kind == "tenant"
         assert r.pharmacy_id == settings.PHARMACY_ID
 
-    def test_unknown_device_returns_unknown(self):
-        """An unrecognised device JID returns kind='unknown' and no pharmacy_id."""
+    def test_unknown_device_returns_unknown(self, monkeypatch):
+        """An unrecognised device JID returns kind='unknown' and no pharmacy_id.
+
+        Mocked rather than skipped: this is the fail-closed routing guarantee, and
+        it must hold in CI where no database exists. The mock answers the lookup
+        the way a real database answers a JID nobody owns -- no row.
+        """
         import tenancy
+        monkeypatch.setattr(tenancy, "q1", lambda sql, params=None: None)
         r = tenancy.resolve("000000000000@s.whatsapp.net")
         assert r.kind == "unknown"
         assert r.pharmacy_id is None
 
     def test_empty_jid_returns_unknown(self):
-        """A missing device JID returns unknown, not a fallback."""
+        """A missing device JID returns unknown, not a fallback. (No DB call:
+        resolve short-circuits before the lookup.)"""
         import tenancy
         assert tenancy.resolve("").kind == "unknown"
         assert tenancy.resolve("   ").kind == "unknown"
 
-    def test_resolve_does_not_fallback_to_sender(self):
-        """Even when a sender is known, the DEVICE determines the tenant."""
+    def test_resolve_does_not_fallback_to_sender(self, monkeypatch):
+        """Even when a sender is known, the DEVICE determines the tenant.
+
+        Mocked for the same reason as above -- the assertion is about resolve()'s
+        own discipline, not about what the database happens to contain.
+        """
         import tenancy
+        monkeypatch.setattr(tenancy, "q1", lambda sql, params=None: None)
         r = tenancy.resolve("000000000000@s.whatsapp.net", sender_phone="254713755274")
         assert r.kind == "unknown"
         assert r.pharmacy_id is None
@@ -71,6 +94,7 @@ class TestStateIsolation:
         if row and row["n"] < 2:
             pytest.skip("wa_state composite PK not applied (run db/schema_v16.sql)")
 
+    @db
     def test_state_is_tenant_scoped(self):
         """The same phone can have independent state at two pharmacies."""
         self._needs_v16()
@@ -95,6 +119,7 @@ class TestStateIsolation:
             st = get_state(phone, pharmacy_id=pid)
             assert st["flow"] == "idle"
 
+    @db
     def test_state_expires(self):
         """Expired state reads as idle."""
         self._needs_v16()
@@ -127,6 +152,7 @@ class TestReportsShadowing:
         assert "pid = pharmacy_id or pid()" not in source, \
             "Variable shadowing: `pid = pharmacy_id or pid()` shadows the imported function"
 
+    @db
     def test_get_stock_callable_without_pharmacy_id(self):
         """get_stock() must work when pharmacy_id is None (uses the bound tenant)."""
         import tenancy
@@ -164,6 +190,7 @@ class TestNoGlobalFallback:
 class TestHandleInboundRouting:
     """The router must use device_kind / pharmacy_id from the webhook, not a default."""
 
+    @db
     def test_unknown_device_does_not_create_state(self):
         """A message from an unknown device must not create wa_state or reply."""
         import tenancy
@@ -197,6 +224,7 @@ class TestHandleInboundRouting:
 class TestSafetyGatesTenantScope:
     """Safety gates must use the correct pharmacy_id, not a global default."""
 
+    @db
     def test_record_inbound_is_tenant_scoped(self):
         """record_inbound stores the pharmacy_id, not a global default."""
         import tenancy
@@ -208,6 +236,7 @@ class TestSafetyGatesTenantScope:
             record_inbound(phone, settings.PHARMACY_ID)
             assert has_inbound_history(phone, settings.PHARMACY_ID)
 
+    @db
     def test_relationship_check_is_tenant_scoped(self):
         """has_relationship checks against a specific pharmacy, not globally."""
         from safety import has_relationship
@@ -219,6 +248,7 @@ class TestSafetyGatesTenantScope:
 class TestWaMessagesDeviceTracking:
     """Outbound messages must record gowa_device_id and status."""
 
+    @db
     def test_wa_messages_has_device_columns(self):
         """wa_messages must have gowa_device_id and status columns."""
         from db import q1
