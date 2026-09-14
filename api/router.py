@@ -11,11 +11,12 @@ import tenancy
 import register
 from db import ex, q, q1
 from llm import chat
-from reports import TOOLS, denial_message, may_use, run_tool, tools_for
+from reports import (CUSTOMER_TOOLS as REPORTS_CUSTOMER_TOOLS, TOOLS, denial_message,
+                     may_use, run_tool, tools_for)
 from safety import record_inbound
 from state import clear_state, get_state, set_state
 from utils import norm_phone
-from wa import reply_text
+from wa import reply_text, set_paused, set_typing
 
 log = logging.getLogger(__name__)
 
@@ -25,6 +26,12 @@ You are talking to a staff member on WhatsApp.
 Use the provided tools to answer from live pharmacy data. Never invent stock figures,
 prices, expiry dates or supplier phone numbers — if a tool returns nothing, say so.
 
+The user may write in English, Kiswahili or Sheng. Understand intent across all three:
+map symptoms and local phrasing to generic drug names for tool calls (e.g. "dawa ya
+kichwa" -> paracetamol/Panadol, "dawa ya maumivu" -> pain relief like ibuprofen,
+"vantamedi" -> the catalogue by that name). Tool ARGUMENTS should use the English or
+generic name; the REPLY should be in the language the user wrote in.
+
 Reply in WhatsApp style: short, plain, no markdown headings, no tables. Use *bold* for
 emphasis and • for lists. Amounts in KES. Keep it under 8 lines unless the user asked
 for a full list.
@@ -33,18 +40,43 @@ If the user asks something outside pharmacy operations, say briefly that you onl
 pharmacy operations."""
 
 CUSTOMER_SYSTEM = """You are the WhatsApp assistant for a Kenyan retail pharmacy, talking
-to a customer.
+to a customer. You are the pharmacy's front door: helpful, honest, and you never lose
+a customer.
 
-You may: confirm whether a medicine is in stock and its price, explain how to order,
-explain delivery, and check order status.
+STOCK AND PRICE: use the check_stock tool for EVERY question about a medicine —
+availability, price, "do you have X", brand or generic, any language. Never answer
+from memory; the tool reads live stock and knows the rules for each case.
 
-You must NOT: give medical advice, suggest a dose, recommend a medicine for symptoms,
-or say a prescription-only medicine will be supplied. For anything clinical, tell them
-a pharmacist will help and offer to have one call them.
+WHEN THE TOOL SAYS OUT OF STOCK — redirect language, and these rules are the job:
+- NEVER open with "we don't have it" or "it's not available".
+- ALWAYS acknowledge first: "Let me check that for you."
+- Ask ONE clarifying question: what they're treating, or how urgent it is.
+- If the tool says an alternative is in stock, offer it: "We may have something
+  suitable — can I confirm what you need it for?"
+- If they want the exact item, offer a restock alert: "I've noted your request —
+  would you like me to alert you when it's back?" If they say yes, call
+  notify_me_when_back once.
+- If nothing fits, offer the pharmacist: "Our pharmacist can advise on alternatives —
+  shall I connect you?"
+- If they say it's urgent: "I understand this is urgent — let me check with our
+  supplier now."
+- NEVER promise a restock date or timeframe.
+- NEVER say "we have it" when the tool said otherwise.
 
-Reply warmly and briefly, 4 lines maximum. Use tools for stock and price questions."""
+WHEN THE TOOL SAYS PRESCRIPTION-ONLY: do not discuss availability and do not offer a
+restock alert. Say that item needs a pharmacist's review and offer to connect them
+with the pharmacist who can guide them properly.
 
-CUSTOMER_TOOLS = [t for t in TOOLS if t["name"] == "get_stock"]
+You must NOT: give medical advice, suggest a dose, or recommend a medicine for
+symptoms yourself. For anything clinical, a pharmacist will help and you can offer to
+have one call them.
+
+The customer may write in English, Kiswahili or Sheng. Reply in the language they
+wrote in.
+
+Keep replies warm and under 3 sentences. Use the tools; they carry the facts."""
+
+CUSTOMER_TOOLS = REPORTS_CUSTOMER_TOOLS
 
 
 # ------------------------------------------------------------------ entry point
@@ -168,6 +200,10 @@ def _dispatch(phone: str, msg: dict, resolved_pid: str) -> None:
         (phone, resolved_pid),
     ) if not staff else None
 
+    # Typing dots while we think. Keyword answers are instant, so this mostly covers
+    # the LLM path (2-5s) and the vision path (~30s): the user sees the bot is alive.
+    set_typing(phone)
+
     try:
         # Unsupported media stops here, before either branch. _handle_staff sends any image
         # to grn.add_page and _handle_customer sends any image to the prescription
@@ -183,11 +219,18 @@ def _dispatch(phone: str, msg: dict, resolved_pid: str) -> None:
             _handle_customer(phone, msg, text)
     except Exception as e:
         log.exception("handler failed for %s", phone)
-        reply_text(phone, "Something went wrong on our side. Please try again, "
-                         "or type *HELP*.")
+        # Bilingual because a Swahili speaker who just got an English-only error
+        # cannot tell whether the outage or their language caused it. It also names
+        # the keyword commands, which need no model at all and keep working.
+        reply_text(phone,
+                   "Samahani — siwezi kujibu hivi sasa. Tafadhali jaribu tena baadaye, "
+                   "au andika *HELP* kuona commands.\n"
+                   "(Sorry — I can't answer that just now. Please try again shortly, "
+                   "or type *HELP* for the command list.)")
         ex("update wa_messages set error=%s where wa_id=%s",
            (f"{type(e).__name__}: {e}"[:500], msg.get("wa_id")))
     finally:
+        set_paused(phone)     # clear the dots even if no reply went out
         ex("update wa_messages set handled=true where wa_id=%s", (msg.get("wa_id"),))
 
 
@@ -244,10 +287,16 @@ def _handle_staff(phone: str, staff: dict, msg: dict, text: str) -> None:
     # on a classifier being right, for the same reason register.py is a pure function.
     if up in ("RECEIVE", "RECEIVING"):
         clear_state(phone)
-        set_state(phone, "grn_collect", {"pages": []})
-        reply_text(phone, "Receiving a delivery. Send photos of the supplier invoice — "
-                          "all pages — then reply *DONE*.\n\n"
-                          "Reply *CANCEL* to stop.")
+        set_state(phone, "grn_collect", {"pages": [], "text_lines": []})
+        reply_text(phone,
+                   "Receiving a delivery. Two ways to give me the lines:\n\n"
+                   "📸 *PHOTO* — photograph the supplier invoice, all pages\n"
+                   "⌨️ *TYPE* — one item per line, paste as MANY as you like in one "
+                   "message:\n"
+                   "_name | batch | expiry | qty | price_\n"
+                   "e.g. *Amoxil 500mg | B123 | 08/2027 | 5W0P | 540*\n"
+                   "     *Panadol 500mg | P456 | 01/2028 | 10W | 160*\n\n"
+                   "Reply *DONE* when finished, *CANCEL* to stop.")
         return
 
     if msg.get("type") == "image" and msg.get("media_path"):
@@ -283,10 +332,18 @@ def _handle_staff(phone: str, staff: dict, msg: dict, text: str) -> None:
     # --- mid-flow handling takes priority over anything else
     if st["flow"] == "grn_collect":
         if up == "DONE":
-            grn.process_pages(phone, staff)
+            # Typed lines go the text path; photos go to vision. If both were sent,
+            # typed lines win -- they are already human-verified data, and mixing the
+            # two would double-receive the same items.
+            if st["context"].get("text_lines"):
+                grn.process_text_lines(phone, staff)
+            else:
+                grn.process_pages(phone, staff)
+        elif text.strip() and not msg.get("media_path"):
+            grn.add_text_lines(phone, text)
         else:
-            reply_text(phone, "Send the next invoice page, or reply *DONE* to process "
-                             "what you have sent, or *CANCEL*.")
+            reply_text(phone, "Send more invoice pages or item lines (paste as many "
+                             "as you like), reply *DONE* to process, or *CANCEL*.")
         return
 
     if st["flow"] == "grn_goods":
@@ -410,7 +467,7 @@ def _handle_staff(phone: str, staff: dict, msg: dict, text: str) -> None:
 # STAFF_COMMANDS exactly, so a command added to one and not the other fails the build --
 # which is the check that would have caught PO sitting ungated behind a help entry.
 _HELP_LINES: list[tuple[str, str]] = [
-    ("receive_goods",           "• *RECEIVE* — then send invoice photos, then *DONE*"),
+    ("receive_goods",           "• *RECEIVE* — then invoice photos OR typed lines, then *DONE*"),
     ("get_stock",               "• *LOW* — what is below reorder level"),
     ("get_stock",               "• *do we have amoxil* — stock check"),
     ("find_supplier",           "• *who supplies prenor* — supplier contact"),

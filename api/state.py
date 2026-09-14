@@ -81,6 +81,11 @@ def set_state(phone: str, flow: str, context: dict, ttl_min: int = DEFAULT_TTL_M
                         "(pharmacy_id, phone), so a caller is missing a pharmacy_scope.",
                         phone, flow)
     expires = datetime.now(timezone.utc) + timedelta(minutes=ttl_min)
+    # default=str: flow contexts carry database ids straight from RETURNING clauses,
+    # which psycopg hands back as uuid.UUID. json.dumps raises on those, so the
+    # receiving flow crashed at the moment of showing the review summary -- after the
+    # GRN row was written, leaving state and stock half-way through a flow. UUID->str
+    # is lossless for a context that is only ever read back as opaque ids.
     ex(
         """insert into wa_state (phone, pharmacy_id, flow, context, expires_at, updated_at)
            values (%s,%s,%s,%s,%s, now())
@@ -89,7 +94,7 @@ def set_state(phone: str, flow: str, context: dict, ttl_min: int = DEFAULT_TTL_M
                  context = excluded.context,
                  expires_at = excluded.expires_at,
                  updated_at = now()""",
-        (phone, pharmacy_id, flow, json.dumps(context), expires),
+        (phone, pharmacy_id, flow, json.dumps(context, default=str), expires),
     )
 
 

@@ -503,10 +503,25 @@ async def simulate(request: Request, background: BackgroundTasks,
     curl -X POST $API/dev/simulate -H "x-pharmaos-secret: $S" \
          -H 'content-type: application/json' \
          -d '{"from":"254700000001","text":"EXPIRY"}'
+
+    DRY-RUN: the reply is composed and logged (./run.sh say prints it) but NEVER
+    delivered. Now that a real gateway is paired, a simulate that delivered would
+    text numbers whose inbound was fabricated -- unsolicited outbound that risks
+    the account and texts people who never reached out.
     """
     _auth(x_pharmaos_secret or x_dishii_secret)
     body = await request.json()
     body.setdefault("wa_id", f"sim-{uuid.uuid4().hex[:12]}")
     body.setdefault("type", "text")
-    background.add_task(handle_inbound, body)
-    return {"ok": True, "wa_id": body["wa_id"]}
+
+    async def _run_dry():
+        from starlette.concurrency import run_in_threadpool
+        import wa
+        token = wa._dry_run.set(True)
+        try:
+            await run_in_threadpool(handle_inbound, body)
+        finally:
+            wa._dry_run.reset(token)
+
+    background.add_task(_run_dry)
+    return {"ok": True, "wa_id": body["wa_id"], "dry_run": True}

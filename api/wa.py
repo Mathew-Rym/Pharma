@@ -39,6 +39,16 @@ class UnroutableMessage(RuntimeError):
     """
 
 
+# Set by /dev/simulate around handle_inbound. When true, deliver() records the reply
+# and stops there -- nothing reaches WhatsApp. Simulate exists to exercise the whole
+# brain without a phone on the other end; once a REAL gateway is paired it must not
+# become a way to text people who never messaged in (the anti-ban gates key off an
+# inbound that simulate fabricates, so without this the gates' evidence is fake too).
+import contextvars
+
+_dry_run = contextvars.ContextVar("wa_dry_run", default=False)
+
+
 def compose(pharmacy_id, phone: str, msg_type: str, body: str,
             media_path: str | None = None) -> int:
     """Record an outbound message and the device it must leave by. Returns its id.
@@ -131,6 +141,17 @@ def deliver(row_id: int) -> bool:
                   from wa_messages where id = %s""", (row_id,))
     if not row:
         raise UnroutableMessage(f"no outbound row {row_id}")
+
+    # Dev simulation: the reply was composed and logged, which is all /dev/simulate
+    # promises. Delivering it would text a number whose "inbound" was fabricated by
+    # the test harness -- exactly the unsolicited outbound the safety gates exist to
+    # prevent. The row keeps its body, so ./run.sh say still prints what WOULD be sent.
+    if _dry_run.get():
+        ex("""update wa_messages set status='dry_run',
+                     last_error='dev/simulate: logged only, not delivered'
+               where id = %s""", (row_id,))
+        log.info("dry-run: reply to %s logged, not delivered", row["to_phone"])
+        return True
 
     slot, expected = row["gowa_device_id"], row["expected_wa_jid"]
 
@@ -237,6 +258,48 @@ def send_image(phone: str, url: str, caption: str = "") -> None:
         send_for(pid(), phone, "image", caption, url)
     except (UnroutableMessage, GateBlocked) as e:
         log.warning("send_image blocked to %s: %s", phone, e)
+
+
+# --------------------------------------------------------- presence (typing dots)
+def set_presence(phone: str, status: str) -> None:
+    """Show 'typing…' (or clear it) in the chat, GOWA backend only.
+
+    Purely cosmetic engagement: an LLM reply takes 2-5 seconds, and WhatsApp's
+    native typing dots tell the user the message was seen and work is happening --
+    the difference between "is it dead?" and waiting happily.
+
+    Failures are swallowed on purpose: presence must never break a reply. It needs
+    the tenant's device slot, so it follows the same no-fallback rule as compose()
+    -- an unroutable tenant simply gets no dots.
+    """
+    if not _GOWA:
+        return
+    if _dry_run.get():
+        return        # no typing dots for a message that was never really received
+    try:
+        from tenancy import pid as _pid
+        ph = q1("select gowa_device_id from pharmacies where id = %s", (_pid(),))
+        slot = (ph or {}).get("gowa_device_id")
+        if not slot:
+            return
+        httpx.post(
+            f"{settings.GOWA_URL.rstrip('/')}/send/presence",
+            auth=(settings.GOWA_USER, settings.GOWA_PASS) if settings.GOWA_USER else None,
+            headers={"X-Device-Id": slot},
+            json={"phone": norm_phone(phone), "status": status},
+            timeout=5,
+        )
+    except Exception:
+        pass
+
+
+def set_typing(phone: str) -> None:
+    set_presence(phone, "typing")
+
+
+def set_paused(phone: str) -> None:
+    """Clear the dots without sending anything -- the nothing-happened path."""
+    set_presence(phone, "paused")
 
 
 # --------------------------------------------------------- reply wrappers
