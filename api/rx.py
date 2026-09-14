@@ -238,6 +238,12 @@ def pharmacist_approve(rx_id: str, staff_id: str) -> None:
     if not _can_verify_prescriptions(staff):
         raise PermissionError(_verification_refusal(staff))
 
+    # Idempotent no-op on re-approval. Without this, a dashboard double-click set the
+    # order back to 'awaiting_payment' even after it was paid -- regressing a
+    # fulfilled order's state machine because someone clicked Approve twice.
+    if rx["status"] == "verified":
+        return
+
     ex("""update prescriptions set status='verified', verified_by=%s, verified_at=now()
            where id=%s""", (staff_id, rx_id))
 
@@ -325,6 +331,21 @@ def on_payment_success(order_id: str, receipt: str) -> None:
     if not order or order["status"] not in ("awaiting_payment", "quoted"):
         return
 
+    # Bind the ORDER'S OWN pharmacy for everything below. The router and the SMS
+    # path call this inside the sender's scope, but Safaricom's callback
+    # (/mpesa/callback) arrives with no tenant bound at all -- so the reply_text()
+    # and staff notifications further down raised NoTenant, the caller's except
+    # swallowed it, and the payment committed while the customer receipt and the
+    # dispatch message silently never went out. The order is the one record that
+    # cannot disagree with itself about tenancy; pharmacy_scope restores whatever
+    # was bound before, so nesting inside an existing scope is safe.
+    import tenancy
+    with tenancy.pharmacy_scope(str(order["pharmacy_id"])):
+        _on_payment_success_scoped(order, receipt)
+
+
+def _on_payment_success_scoped(order: dict, receipt: str) -> None:
+    order_id = order["id"]
     lines = q("select * from order_lines where order_id=%s", (order_id,))
     try:
         with tx() as cur:

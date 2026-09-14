@@ -158,9 +158,18 @@ def low_stock_check() -> dict:
         if not rows:
             return {"items": 0}
 
-        # group by supplier so each supplier gets one draft PO
+        # group by supplier so each supplier gets one draft PO.
+        # Dedup against open POs (forecast.open_po_product_ids): this job runs daily,
+        # so a product that sits below its reorder level for a week used to mint one
+        # duplicate PO per day until someone approved or killed each by hand. The
+        # alert text below still lists every low item; only PO creation skips the
+        # already-ordered ones.
+        from forecast import open_po_product_ids
+        already_open = open_po_product_ids()
         by_sup: dict = {}
         for r in rows:
+            if str(r["product_id"]) in already_open:
+                continue
             by_sup.setdefault(r["preferred_supplier_id"], []).append(r)
 
         created = []

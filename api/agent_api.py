@@ -345,6 +345,20 @@ def apply_pos_sales(limit: int = 2000) -> int:
 
         try:
             with tx() as cur:
+                # CLAIM THE ROW BEFORE TOUCHING STOCK. The SELECT above read
+                # applied=false outside this transaction, so two workers can hold
+                # the same row: an agent retry overlapping a fresh batch, or the
+                # dashboard's manual ingest running while the agent posts. Both
+                # would run the movements below and double-deduct the batch. The
+                # conditional UPDATE takes the row lock; the loser gets no row back
+                # and skips. It rolls back together with the movements if anything
+                # below raises, so a failed apply stays applied=false and retriable.
+                cur.execute(
+                    """update pos_sales set applied=true
+                        where id=%s and applied=false returning id""",
+                    (r["id"],))
+                if cur.fetchone() is None:
+                    continue
                 for b in batches:
                     if remaining <= 0:
                         break
@@ -353,8 +367,8 @@ def apply_pos_sales(limit: int = 2000) -> int:
                                    ref_table="pos_sales", ref_id=None,
                                    note=f"phAMACore {r['external_id']}")
                     remaining -= take
-                cur.execute("update pos_sales set applied=true, product_id=%s, "
-                            "apply_error=%s where id=%s",
+                cur.execute("update pos_sales set product_id=%s, apply_error=%s "
+                            "where id=%s",
                             (product["id"],
                              f"short by {remaining} pcs" if remaining > 0 else None,
                              r["id"]))
