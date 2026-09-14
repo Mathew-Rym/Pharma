@@ -635,6 +635,45 @@ TOOL_IMPLS = {
 }
 
 
+# ------------------------------------------------------------ customer tools
+# A SEPARATE list, deliberately not inside TOOLS: TOOLS feeds tools_for(role), and a
+# customer tool in the staff list would both widen what the model may pick for staff
+# and break the role-cap invariants test_role_tools pins (owner == TOOLS | extras).
+# The customer agent gets exactly these two, and run_tool dispatches them specially
+# because they need the sender's phone (to log demand and later notify them), which
+# the staff tool impls' signature has no room for.
+CUSTOMER_TOOLS = [
+    {
+        "name": "check_stock",
+        "description": "Check live stock and price for a medicine the customer asks "
+                       "about — brand or generic, any language. Use for EVERY "
+                       "availability or price question; never answer from memory.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "product_query": {"type": "string",
+                                  "description": "The medicine name as the customer "
+                                                 "wrote it"},
+            },
+            "required": ["product_query"],
+        },
+    },
+    {
+        "name": "notify_me_when_back",
+        "description": "The customer agreed to be alerted when an out-of-stock item is "
+                       "back. Call ONCE, only after they said yes.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "product_query": {"type": "string",
+                                  "description": "The medicine name they asked for"},
+            },
+            "required": ["product_query"],
+        },
+    },
+]
+
+
 # ------------------------------------------------------------------ who may run what
 #
 # The customer/staff boundary was enforced (CUSTOMER_TOOLS is filtered to get_stock).
@@ -748,6 +787,15 @@ def run_tool(name: str, args: dict, phone: str, pharmacy_id: str | None = None) 
         url = signed_url(settings.BUCKET_DOCS, path, 86400)
         send_document(phone, url, fname, "Your Pharma OS report")
         return "Report PDF generated and sent to the user as a WhatsApp document."
+    # Customer tools need the sender's phone (stockout demand log + restock alert),
+    # so they are dispatched here rather than through TOOL_IMPLS' phone-less
+    # signature. They are not in TOOLS, so no staff role can be handed them.
+    if name == "check_stock":
+        from restock import check_stock_customer
+        return check_stock_customer(args.get("product_query", ""), phone or "")
+    if name == "notify_me_when_back":
+        from restock import request_restock_alert
+        return request_restock_alert(args.get("product_query", ""), phone or "")
     fn = TOOL_IMPLS.get(name)
     if not fn:
         return f"Unknown tool {name}"
