@@ -240,6 +240,21 @@ if not os.getenv("PHARMACY_ID"):
     if _OWNED_PHARMACY:
         os.environ["PHARMACY_ID"] = _OWNED_PHARMACY
         _sweep_abandoned()
+    elif os.getenv("DATABASE_URL"):
+        # DATABASE_URL is configured but the throwaway could not be created (database
+        # down, or came up mid-run). This is the dangerous case, and it has happened:
+        # config.py calls load_dotenv() at import time, which re-reads .env and
+        # restores its PHARMACY_ID -- the REAL pharmacy -- after this module deleted
+        # it. Every test then ran against production: "Trigger Med" products landed in
+        # the real catalogue and stockout alerts were sent to the owner's actual
+        # WhatsApp from a test run.
+        #
+        # A sentinel that matches no row makes the suite FAIL loudly instead: reads
+        # return nothing, inserts die on the FK. Never a silent fallback to .env.
+        os.environ["PHARMACY_ID"] = "00000000-0000-0000-0000-000000000000"
+        print("conftest: could not create a throwaway pharmacy but DATABASE_URL is "
+              "set -- binding tests to a non-existent sentinel pharmacy; DB tests "
+              "will fail rather than touch whatever .env points at", file=sys.stderr)
 
 
 @pytest.fixture(scope="session", autouse=True)
