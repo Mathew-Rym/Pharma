@@ -148,6 +148,7 @@ def test_set_price_tool_is_not_in_customer_tools():
     assert "missing_prices" not in names
 
 
+@db
 def test_agent_loop_refuses_unoffered_tools(shop):
     """A model naming a tool the role was never given must be refused, not run.
     This is the enforcement the filtered list always implied but never had."""
@@ -166,10 +167,14 @@ def test_agent_loop_refuses_unoffered_tools(shop):
         content = [_TU()]
 
     import llm
-    orig = llm.chat
+    orig, orig_router = llm.chat, router.chat
     def _fake(system, messages, tools=None):
         return _Resp()
+    # Patch BOTH: router holds its own `from llm import chat` reference, so
+    # patching llm.chat alone leaves _agent_reply calling the real model --
+    # which is exactly what made CI flaky (a live LLM call inside a unit test).
     llm.chat = _fake
+    router.chat = _fake
     try:
         with tenancy.pharmacy_scope(shop["pid"]):
             attendant_tools = [t for t in _tools() if t["name"] != "set_price"]
@@ -177,6 +182,7 @@ def test_agent_loop_refuses_unoffered_tools(shop):
                          "sys", attendant_tools)
     finally:
         llm.chat = orig
+        router.chat = orig_router
     # nothing staged, nothing changed
     from state import get_state
     with tenancy.pharmacy_scope(shop["pid"]):
