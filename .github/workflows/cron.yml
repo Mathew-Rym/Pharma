@@ -6,6 +6,40 @@ name: pharmaos-cron
 #   20:00 EAT = 17:00 UTC
 # GitHub's scheduler is best-effort and can drift 5-15 minutes under load. Fine for
 # a morning digest; do not use it for anything time-critical.
+#
+# HOW TO MAKE THESE RUNS ACTUALLY DO SOMETHING
+# --------------------------------------------
+# The job POSTs to ${API_URL}/jobs/<name> with the SHARED_SECRET header. Both live
+# in GitHub repository secrets (Settings → Secrets and variables → Actions):
+#
+#   API_URL        e.g. https://api.your-domain.com   (no trailing slash)
+#   SHARED_SECRET  the same value the API's .env uses
+#
+# Without API_URL every run exits 0 with a warning -- by design, so the workflow
+# never shows red for a deployment it cannot reach. Two ways to go live:
+#
+#   1. Public endpoint: put the API behind an HTTPS reverse proxy (Caddy/nginx)
+#      on the VM, open 443, and set the API_URL secret.
+#   2. Self-hosted runner: install a runner on the VM (it reaches localhost) and
+#      change `runs-on:` below to `self-hosted`. No public exposure needed.
+#
+# The production VM (pharmaos-instance) keeps its API port firewalled, so the LIVE
+# schedules run on the VM's own crontab via scripts/run_job.sh -- identical times,
+# localhost only. This workflow remains the cloud fallback, and both schedulers
+# firing is safe: briefing jobs are idempotent per tenant per day (job_runs guard
+# in briefings._send_once).
+#
+# NOTE: GitHub disables scheduled workflows on repos with no activity for 60
+# days. Any push resets that; a failing Actions check does not.
+
+permissions:
+  contents: read
+
+# One in-flight run per schedule slot. A hung call cannot stack copies of itself;
+# the job-level timeout below bounds how long the queue can get.
+concurrency:
+  group: pharmaos-cron-${{ github.event.schedule || inputs.job || 'dispatch' }}
+  cancel-in-progress: true
 
 on:
   schedule:
@@ -39,18 +73,10 @@ on:
           - refill_reminders
           - reconcile
 
-# NOTE: this workflow only fires the API when the API_URL secret is set AND the
-# API is reachable from the internet. The production VM (pharmaos-instance) keeps
-# its API port firewalled, so the LIVE schedules run on the VM's own crontab via
-# scripts/run_job.sh -- identical times, localhost only. This workflow remains
-# the cloud fallback for a future public deployment, and exits cleanly (0) with
-# a warning when unconfigured, so it never shows red for a deployment it cannot
-# reach. The briefing jobs are idempotent per tenant per day (job_runs guard in
-# briefings._send_once), so both schedulers firing is safe.
-
 jobs:
   run:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - name: Decide which job this schedule maps to
         id: pick
@@ -66,10 +92,10 @@ jobs:
             "0 5 * * 1")    echo "job=weekly_report"      >> $GITHUB_OUTPUT ;;
             "30 5 * * *")   echo "job=refill_reminders"   >> $GITHUB_OUTPUT ;;
             "*/15 * * * *") echo "job=reconcile"          >> $GITHUB_OUTPUT ;;
-            *)              echo "job=${{ inputs.job }}" >> $GITHUB_OUTPUT ;;
+            *)              echo "job=${{ inputs.job }}"  >> $GITHUB_OUTPUT ;;
           esac
 
-      - name: Call the API
+      - name: Call the API (with one retry)
         env:
           API_URL: ${{ secrets.API_URL }}
           SHARED_SECRET: ${{ secrets.SHARED_SECRET }}
@@ -79,20 +105,32 @@ jobs:
             JOB="expiry_sweep"
           fi
           if [ -z "$API_URL" ]; then
-            echo "::warning::API_URL secret is not configured in GitHub repository secrets. Skipping cron API call."
+            echo "::warning::API_URL secret is not configured in GitHub repository secrets. Skipping cron API call. See the header comment in .github/workflows/cron.yml for how to go live."
             exit 0
           fi
+
+          call() {
+            code=$(curl -sS -o /tmp/out.json -w '%{http_code}' \
+              -X POST "${API_URL}/jobs/$JOB" \
+              -H "x-pharmaos-secret: ${SHARED_SECRET}" \
+              -H "x-dishii-secret: ${SHARED_SECRET}" \
+              --max-time 300 || echo "000")
+            echo "HTTP $code"
+            if [ -f /tmp/out.json ]; then
+              cat /tmp/out.json
+            fi
+            [ "$code" = "200" ]
+          }
+
           echo "Running $JOB at $API_URL"
-          code=$(curl -sS -o /tmp/out.json -w '%{http_code}' \
-            -X POST "${API_URL}/jobs/$JOB" \
-            -H "x-pharmaos-secret: ${SHARED_SECRET}" \
-            -H "x-dishii-secret: ${SHARED_SECRET}" \
-            --max-time 300 || echo "000")
-          echo "HTTP $code"
-          if [ -f /tmp/out.json ]; then
-            cat /tmp/out.json
-          fi
-          if [ "$code" != "200" ]; then
-            echo "::error::Cron job $JOB failed with HTTP $code"
-            exit 1
+          if ! call; then
+            # Briefings are idempotent per tenant per day and reconcile is a
+            # diff, so one retry on a transient blip is safe. A second failure
+            # is real and surfaces red.
+            echo "first attempt failed; retrying once in 30s"
+            sleep 30
+            if ! call; then
+              echo "::error::Cron job $JOB failed"
+              exit 1
+            fi
           fi

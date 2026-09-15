@@ -8,32 +8,67 @@ from datetime import date, datetime
 
 # ------------------------------------------------------------------ phone
 def norm_phone(raw: str) -> str:
-    """Normalise any Kenyan format to bare E.164 digits: 2547XXXXXXXX.
+    """Normalise ANY phone number to bare E.164 digits (no plus).
+
+    Kenyan local formats are expanded to the country code:
 
     0713755274        -> 254713755274
+    713755274         -> 254713755274
     +254 713 755 274  -> 254713755274
     254713755274@s.whatsapp.net -> 254713755274
 
-    A 10-digit string beginning 7 or 1 is returned UNCHANGED, deliberately. It is not a
-    valid Kenyan format -- mobiles are 9 significant digits, optionally with a leading 0
-    -- so there is no way to know which digit is spurious. An earlier version dropped the
-    first one ("7137552744" -> "254137552744"), which does not fail: it produces a real,
-    validating number belonging to somebody else. The message then reaches a stranger who
-    never contacted the pharmacy, which is exactly what gets a WhatsApp number reported
-    and banned. Leave it malformed and let is_valid_ke_mobile() reject it.
+    Every other country passes through unchanged, so a customer writing from
+    India, the USA or Europe is addressable exactly as WhatsApp delivered them:
+
+    +91 98765 43210   -> 919876543210
+    +1 415 555 2671   -> 14155552671
+    +44 7700 900123   -> 447700900123
+    0091 98765 43210  -> 919876543210      (00 international prefix)
+
+    This is the "Kenya is home, everywhere else is a guest" rule: a number with
+    an explicit foreign country code is never rewritten, because guessing a
+    country code for it would invent a number belonging to somebody else. A
+    10-digit string beginning 7 or 1 is returned UNCHANGED, deliberately. It is
+    not a valid Kenyan format -- mobiles are 9 significant digits, optionally
+    with a leading 0 -- so there is no way to know which digit is spurious. An
+    earlier version dropped the first one ("7137552744" -> "254137552744"),
+    which does not fail: it produces a real, validating number belonging to
+    somebody else. The message then reaches a stranger who never contacted the
+    pharmacy, which is exactly what gets a WhatsApp number reported and banned.
+    Leave it malformed and let the caller's validity check reject it.
     """
     if not raw:
         return ""
     s = raw.split("@")[0]                      # strip WhatsApp JID suffix
     s = re.sub(r"\D", "", s)                   # digits only
+    if s.startswith("00"):
+        # 00 is the international dialling prefix (0091… == +91…). Strip it
+        # BEFORE the Kenyan leading-zero rule, or "0044…" would become
+        # "254044…" -- a Kenyan number that reaches a stranger in Britain.
+        s = s[2:]
     if s.startswith("0"):
+        # A single leading 0 with no country code is the LOCAL convention, and
+        # local here is Kenyan. Foreign senders always arrive with their
+        # country code (WhatsApp normalises to E.164), so this branch is only
+        # ever taken for numbers typed the Kenyan way.
         s = "254" + s[1:]
     elif (s.startswith("7") or s.startswith("1")) and len(s) == 9:
         s = "254" + s                          # 713755274
     elif s.startswith("254254"):
-        s = s[3:]
-    # Already 12 digits starting with 254 → keep as-is
+        s = s[3:]                              # double country code from "+254 2547…"
+    # Anything else is already E.164-shaped with a foreign country code → keep as-is
     return s
+
+
+def is_valid_phone(phone: str) -> bool:
+    """Check if a normalised phone looks like a valid E.164 number, any country.
+
+    E.164 allows 7-15 significant digits after the country code and never a
+    leading zero. Used for numbers whose country we do not control (customers
+    writing from anywhere). Kenyan-specific rules stay in is_valid_ke_mobile.
+    """
+    p = norm_phone(phone)
+    return bool(p) and 7 <= len(p) <= 15 and not p.startswith("0")
 
 
 def is_valid_ke_mobile(phone: str) -> bool:
@@ -47,7 +82,9 @@ def is_valid_ke_mobile(phone: str) -> bool:
 
 def pretty_phone(p: str) -> str:
     p = norm_phone(p)
-    return f"+{p[:3]} {p[3:6]} {p[6:9]} {p[9:]}" if len(p) == 12 else p
+    if len(p) == 12 and p.startswith("254"):
+        return f"+{p[:3]} {p[3:6]} {p[6:9]} {p[9:]}"
+    return f"+{p}" if p else p
 
 
 # ------------------------------------------------------------------ units

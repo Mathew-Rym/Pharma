@@ -251,8 +251,13 @@ class TestRestockNotification:
         ph = "254701000280"
         self._setup(name, ph)
         with tenancy.pharmacy_scope(settings.PHARMACY_ID):
+            # pharmacy_id scope: this database also holds real pharmacies whose
+            # stockout_log rows can carry the same phone number, and an unscoped
+            # read counts theirs.
             row = q1("""select wants_notify, notified_at from stockout_log
-                         where phone = %s order by created_at desc limit 1""", (ph,))
+                         where pharmacy_id = %s and phone = %s
+                         order by created_at desc limit 1""",
+                     (settings.PHARMACY_ID, ph))
             assert row["wants_notify"] is True
             assert row["notified_at"] is None
 
@@ -273,7 +278,9 @@ class TestRestockNotification:
                (g["id"], name, prod))
             notify_restocked(str(g["id"]))
             row = q1("""select wants_notify, notified_at from stockout_log
-                         where phone = %s order by created_at desc limit 1""", (ph,))
+                         where pharmacy_id = %s and phone = %s
+                         order by created_at desc limit 1""",
+                     (settings.PHARMACY_ID, ph))
             assert row["notified_at"] is not None
             # Second delivery of the same product must NOT re-notify
             g2 = ex1("""insert into grns (pharmacy_id, status) values (%s,'approved')
@@ -282,8 +289,13 @@ class TestRestockNotification:
                " qty_invoiced_pieces) values (%s,1,%s,%s,30)",
                (g2["id"], name, prod))
             notify_restocked(str(g2["id"]))
+            # Same pharmacy scope on the count: without it the count includes other
+            # pharmacies' rows for the same phone (real data lives in this
+            # database), which once made this test fail with 2 == 1.
             row2 = q1("""select count(*) as n from stockout_log
-                         where phone = %s and notified_at is not null""", (ph,))
+                         where pharmacy_id = %s and phone = %s
+                           and notified_at is not null""",
+                      (settings.PHARMACY_ID, ph))
             assert row2["n"] == 1
 
 
