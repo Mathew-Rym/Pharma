@@ -17,6 +17,23 @@ import register
 import tenancy
 from tenancy import pid          # tenant comes from the request, not from .env
 
+# Briefings import lazily to avoid a circular import (briefings imports
+# jobs._staff inside the function; jobs imports briefings at call time).
+def morning_briefing() -> dict:
+    from briefings import morning_briefing as _go
+    return _run("morning_briefing", _go)
+
+
+def afternoon_briefing() -> dict:
+    from briefings import afternoon_briefing as _go
+    return _run("afternoon_briefing", _go)
+
+
+def evening_briefing() -> dict:
+    from briefings import evening_briefing as _go
+    return _run("evening_briefing", _go)
+
+
 log = logging.getLogger(__name__)
 
 
@@ -219,47 +236,14 @@ def _suggest_qty(row: dict) -> int:
 
 # ------------------------------------------------------------ 20:00 daily digest
 def daily_digest() -> dict:
-    def _go():
-        today = date.today()
-        fin = q1(
-            """select count(distinct o.id) as orders, coalesce(sum(o.total),0) as revenue
-                 from orders o
-                where o.pharmacy_id=%s
-                  and o.status in ('paid','packed','dispatched','delivered')
-                  and o.created_at::date = %s""",
-            (pid(), today),
-        )
-        recv = q1(
-            """select count(*) as n, coalesce(sum(net_total),0) as v
-                 from grns where pharmacy_id=%s and status='approved'
-                  and approved_at::date = %s""",
-            (pid(), today),
-        )
-        top = q(
-            """select p.name, -sum(m.delta_pieces) as pieces
-                 from stock_movements m
-                 join batches b on b.id=m.batch_id join products p on p.id=b.product_id
-                where m.pharmacy_id=%s and m.reason='sale' and m.created_at::date=%s
-                group by p.name order by pieces desc limit 5""",
-            (pid(), today),
-        )
-        pending = q1(
-            """select count(*) as n from prescriptions
-                where pharmacy_id=%s and status='pending_verification'""",
-            (pid(),),
-        )
-        msg = (f"🌙 *{today:%A %d %b} summary*\n\n"
-               f"• Revenue: {kes(fin['revenue'])} from {fin['orders']} order(s)\n"
-               f"• Stock received: {recv['n']} delivery(ies), {kes(recv['v'])}\n"
-               + (f"• Top sellers: " + ", ".join(f"{t['name'][:22]} ({t['pieces']})"
-                                                 for t in top) + "\n" if top else "")
-               + (f"\n⚠️ {pending['n']} prescription(s) still awaiting verification"
-                  if pending["n"] else ""))
-        for s in _staff(("owner", "manager")):
-            send_text(s["phone"], msg)
-        return {"revenue": float(fin["revenue"]), "orders": fin["orders"]}
+    """The 20:00 digest, now the evening briefing.
 
-    return _run("daily_digest", _go)
+    The body moved to briefings.evening_briefing (richer: tomorrow's shape,
+    open POs, expiry, priorities) and this name remains because the VM crontab
+    and .github/workflows/cron.yml both schedule daily_digest. It maps to the
+    same job_runs bookkeeping via _run, so the send-once guard sees one job.
+    """
+    return evening_briefing()
 
 
 # ------------------------------------------------------------ Monday weekly PDF
@@ -386,6 +370,9 @@ JOBS = {
     "variance_report": variance_report,
     "low_stock_check": low_stock_check,
     "daily_digest": daily_digest,
+    "morning_briefing": morning_briefing,
+    "afternoon_briefing": afternoon_briefing,
+    "evening_briefing": evening_briefing,
     "weekly_report": weekly_report,
     "refill_reminders": refill_reminders,
     "reconcile": reconcile,

@@ -107,6 +107,42 @@ TOOLS = [
             },
         },
     },
+    {
+        "name": "get_price",
+        "description": "A medicine's selling price, cost and margin. Use for 'what is "
+                       "the price of X', 'how much margin on panadol'.",
+        "input_schema": {
+            "type": "object",
+            "properties": {"product_query": {"type": "string"}},
+            "required": ["product_query"],
+        },
+    },
+    {
+        "name": "missing_prices",
+        "description": "Medicines that have stock on the shelf but no selling price set. "
+                       "Use for 'which medicines have no price', 'unpriced stock'.",
+        "input_schema": {
+            "type": "object",
+            "properties": {"limit": {"type": "integer", "default": 20}},
+        },
+    },
+    {
+        "name": "set_price",
+        "description": "BEGIN a price change for a medicine. Does NOT change anything: "
+                       "it shows current/new price and margins and asks the user to "
+                       "reply CONFIRM. The user's CONFIRM message applies it, never the "
+                       "model. Use when the user says 'set price X to 250', "
+                       "'change X price to 280'.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "product_query": {"type": "string",
+                                  "description": "Exact or near-exact medicine name"},
+                "price": {"type": "number", "description": "New selling price in KES"},
+            },
+            "required": ["product_query", "price"],
+        },
+    },
 ]
 
 
@@ -241,6 +277,46 @@ def get_top_products(days: int = 30, limit: int = 10, by: str = "value",
         f"{i}. {r['name']} — {r['pieces']} pcs — {kes(r['value'])}"
         for i, r in enumerate(rows, 1)
     )
+
+
+def get_price(product_query: str, pharmacy_id: str | None = None) -> str:
+    """Staff-facing price+cost+margin. The customer stock check (restock.py) is the
+    customer-facing one and deliberately has no cost in it."""
+    tenant_id = pharmacy_id or pid()
+    import prices as _p
+    # Borrow the strict resolver via a scope-preserving call: prices' module-level
+    # pid() is the same tenant because this runs inside the same request scope.
+    from tenancy import pharmacy_scope
+    with pharmacy_scope(tenant_id):
+        product, candidates = _p.resolve_product(product_query)
+        if candidates:
+            return ("Ambiguous name — these are close matches:\n"
+                    + "\n".join(f"• {c['name']}" for c in candidates)
+                    + "\nAsk again with the full name.")
+        if not product:
+            return f"No product matching '{product_query}'."
+    cur, cost = product["sell_price"], product["cost_price"]
+    if cur is None or float(cur) <= 0:
+        sug, margin = _p.suggest_price(product)
+        if sug:
+            return (f"{product['name']} has no selling price yet. Cost "
+                    f"{kes(cost)}. Suggested: {kes(sug)} "
+                    f"(margin {kes(margin[0])}, {margin[1]:.0f}%). Tell the user to "
+                    f"reply: price {product['name']} {sug}")
+        return f"{product['name']} has no selling price and no cost on file."
+    m = float(cur) - float(cost or 0)
+    pct = (m / float(cost) * 100) if cost and float(cost) > 0 else 0
+    return (f"{product['name']}: sells at {kes(cur)}, cost {kes(cost)}, "
+            f"margin {kes(m)} ({pct:.0f}%)")
+
+
+def missing_prices(limit: int = 20, pharmacy_id: str | None = None) -> str:
+    """Stocked medicines with no selling price: un-sellable inventory. Staff-only."""
+    tenant_id = pharmacy_id or pid()
+    from tenancy import pharmacy_scope
+    with pharmacy_scope(tenant_id):
+        from prices import missing_prices_message
+        return missing_prices_message()
 
 
 def find_supplier(supplier_name: str | None = None,
@@ -632,6 +708,8 @@ TOOL_IMPLS = {
     "get_top_products": get_top_products,
     "find_supplier": find_supplier,
     "get_reorder_suggestions": get_reorder_suggestions,
+    "get_price": get_price,
+    "missing_prices": missing_prices,
 }
 
 
@@ -706,6 +784,7 @@ _EXTRA_CAPS = {
     "pc_status",     # PC      — is the shop PC online; status only
     "pc_probe",      # PROBE   — scans the shop PC for its database; infrastructure
     "receive_goods", # RECEIVE — start an invoice intake; an attendant's core job
+    "manage_prices", # PRICE/PRICES — read cost+margin AND stage price changes; money action
 }
 
 # find_supplier is at ATTENDANT deliberately, and was moved down from manager. The problem
@@ -718,7 +797,9 @@ _ATTENDANT = {"get_stock", "find_supplier", "pc_sync", "pc_status", "receive_goo
 _PHARMACIST = _ATTENDANT | {"get_expiry_risk"}
 _MANAGER = _PHARMACIST | {"get_sales_summary", "get_top_products",
                           "get_reorder_suggestions", "generate_report_pdf",
-                          "draft_po", "variance", "forecast_why", "pc_probe"}
+                          "draft_po", "variance", "forecast_why", "pc_probe",
+                          "manage_prices", "get_price", "missing_prices",
+                          "set_price"}
 
 ROLE_CAPS: dict[str, set[str]] = {
     "attendant": _ATTENDANT,
@@ -743,6 +824,8 @@ STAFF_COMMANDS: dict[str, str] = {
     "PC": "pc_status",
     "PROBE": "pc_probe",
     "RECEIVE": "receive_goods",
+    "PRICES": "manage_prices",
+    "PRICE": "manage_prices",
 }
 
 
@@ -796,6 +879,15 @@ def run_tool(name: str, args: dict, phone: str, pharmacy_id: str | None = None) 
     if name == "notify_me_when_back":
         from restock import request_restock_alert
         return request_restock_alert(args.get("product_query", ""), phone or "")
+    if name == "set_price":
+        # Begins a CONFIRMATION, never a change. The mutation happens only on the
+        # keyword CONFIRM path in the router, behind may_use. A model calling this
+        # can stage a proposal for the human; it cannot move a price.
+        from prices import begin_price_change
+        begin_price_change(phone or "", None,
+                           args.get("product_query", ""), args.get("price"))
+        return ("Shown to the user: current price, new price and both margins, with a "
+                "CONFIRM prompt. Nothing has changed yet — the user must reply CONFIRM.")
     fn = TOOL_IMPLS.get(name)
     if not fn:
         return f"Unknown tool {name}"

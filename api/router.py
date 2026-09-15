@@ -329,6 +329,13 @@ def _handle_staff(phone: str, staff: dict, msg: dict, text: str) -> None:
         reply_text(phone, "Cancelled.")
         return
 
+    # --- staged price change: CONFIRM applies, CANCEL discards, a new PRICE
+    # command re-stages. Consumed before the keyword shortcuts so CONFIRM can
+    # never be read as anything else while a change is pending.
+    import prices
+    if prices.handle_confirm(phone, staff, text):
+        return
+
     # --- mid-flow handling takes priority over anything else
     if st["flow"] == "grn_collect":
         if up == "DONE":
@@ -457,6 +464,33 @@ def _handle_staff(phone: str, staff: dict, msg: dict, text: str) -> None:
         reply_text(phone, forecast_explain(text[4:].strip()))
         return
 
+    # --- price management (owner/manager; customers never reach this branch)
+    if up == "PRICES" or up == "MISSING PRICES" or up == "MISSING PRICING":
+        if not may_use(staff["role"], "manage_prices"):
+            _deny(phone, staff, "manage_prices"); return
+        reply_text(phone, prices.missing_prices_message())
+        return
+    if up in ("PRICES CHANGED", "PRICE CHANGES", "PRICES TODAY",
+              "PRICE CHANGES TODAY"):
+        if not may_use(staff["role"], "manage_prices"):
+            _deny(phone, staff, "manage_prices"); return
+        reply_text(phone, prices.prices_changed_today())
+        return
+    # "PRICE ..." and "SET/CHANGE/UPDATE ... price ..." — a trailing amount makes
+    # it a staged change; no amount makes it a query. Both authorize the same:
+    # a price QUERY shows cost+margin, which is procurement data.
+    _pq, _pa = prices.parse_price_command(text)
+    if _pq is not None and (up.startswith("PRICE") or up.startswith("SET ")
+                            or up.startswith("CHANGE ") or up.startswith("UPDATE ")
+                            or up.startswith("WHAT")):
+        if not may_use(staff["role"], "manage_prices"):
+            _deny(phone, staff, "manage_prices"); return
+        if _pa is not None:
+            prices.begin_price_change(phone, staff, _pq, _pa)
+        else:
+            prices.show_price(phone, staff, _pq)
+        return
+
     # --- everything else: let the model pick a tool
     # Role-scoped. The model cannot call what it was never shown, and _guard
     # re-checks at execution in case the list and the policy ever drift.
@@ -479,8 +513,11 @@ _HELP_LINES: list[tuple[str, str]] = [
     ("generate_report_pdf",     "• *REPORT* — full PDF report"),
     ("draft_po",                "• *PO* — draft purchase orders from the forecast"),
     ("forecast_why",            "• *WHY prenor* — why the system suggests ordering it"),
-    ("variance",                "• *VARIANCE* — where the till and our stock disagree"),
-    ("pc_probe",                "• *PROBE* — scan the pharmacy PC for its database"),
+    ("variance",                 "• *VARIANCE* — where the till and our stock disagree"),
+    ("pc_probe",                 "• *PROBE* — scan the pharmacy PC for its database"),
+    ("manage_prices",            "• *PRICES* — medicines with no selling price"),
+    ("manage_prices",            "• *price panadol 250* — set or change a price (asks CONFIRM)"),
+    ("manage_prices",            "• *price panadol* — check a price and margin"),
 ]
 
 
@@ -621,8 +658,23 @@ def _agent_reply(phone: str, text: str, system: str, tools: list[dict],
             return
 
         messages.append({"role": "assistant", "content": resp.content})
+        # ENFORCE the filtered list at execution, not just at prompt time. The model
+        # is only *shown* tools_for(role), but nothing stopped it from naming a tool
+        # it was never given -- a hallucinated or prompt-injected tool_use for
+        # get_price from a customer, or set_price from an attendant, executed
+        # happily because run_tool is policy-free. The list IS the policy here;
+        # this loop is where it is enforced.
+        allowed = {t["name"] for t in tools}
         results = []
         for tu in tool_uses:
+            if tu.name not in allowed:
+                log.warning("model called un-offered tool %s; refused", tu.name)
+                results.append({
+                    "type": "tool_result",
+                    "tool_use_id": tu.id,
+                    "content": f"Tool {tu.name} is not available to you.",
+                })
+                continue
             out = run_tool(tu.name, dict(tu.input or {}), phone)
             results.append({
                 "type": "tool_result",

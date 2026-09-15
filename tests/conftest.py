@@ -179,6 +179,26 @@ def _teardown(pid: str) -> None:
     stmts = [
         # break references INTO suppliers before deleting suppliers
         "update products set preferred_supplier_id = null where pharmacy_id = %s",
+        # These tables reference products/batches/staff/suppliers with NO ON
+        # DELETE CASCADE, so they must be emptied before the rows they point at.
+        # Every one found blocked a real leaked pharmacy during a sweep.
+        "delete from price_history where pharmacy_id = %s",
+        "delete from po_lines where po_id in "
+        "  (select id from purchase_orders where pharmacy_id = %s)",
+        "delete from order_lines where order_id in "
+        "  (select id from orders where pharmacy_id = %s)",
+        "delete from orders where pharmacy_id = %s",
+        "delete from prescriptions where pharmacy_id = %s",
+        "delete from pos_sales where pharmacy_id = %s",
+        "delete from payments where pharmacy_id = %s",
+        "delete from stock_reconciliation where pharmacy_id = %s",
+        "delete from agent_commands where agent_id in "
+        "  (select id from agents where pharmacy_id = %s)",
+        "delete from agents where pharmacy_id = %s",
+        "delete from alerts where pharmacy_id = %s",
+        "delete from purchase_orders where pharmacy_id = %s",
+        "delete from job_runs where pharmacy_id = %s",
+        "delete from pharmacy_settings where pharmacy_id = %s",
         "delete from grn_lines where grn_id in (select id from grns where pharmacy_id = %s)",
         "delete from grns where pharmacy_id = %s",
         "delete from stock_movements where pharmacy_id = %s",

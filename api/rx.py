@@ -147,6 +147,15 @@ def _build_quote(customer_id: str, rx_id: str, drugs: list[dict]):
             missing.append(name or (d.get("drug") or "unknown item"))
             continue
 
+        # Never quote an unpriced item. A NULL sell_price used to become
+        # price=0 here: order lines at zero, a KES 0.00 total, and a customer
+        # honestly believing the medicine was free -- a claim the counter then
+        # has to argue with. It goes on the missing list as price-TBC instead;
+        # the pharmacist sets the price (PRICE command) before re-quoting.
+        if prod["sell_price"] is None or float(prod["sell_price"]) <= 0:
+            missing.append(f"{name} (price to be confirmed)")
+            continue
+
         batches = q(
             """select id, batch_no, expiry_date, qty_pieces from batches
                 where pharmacy_id=%s and product_id=%s and qty_pieces > 0
