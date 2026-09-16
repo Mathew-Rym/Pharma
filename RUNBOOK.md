@@ -234,6 +234,78 @@ Three things to know before trusting a backup:
 
 ---
 
+## Scheduled jobs — are they actually running?
+
+**Audit 16 Sep 2026: NO. Neither scheduler has ever fired in production.** Evidence:
+
+- `job_runs` contained exactly 2 rows (both manual runs, 14 Sep) — a VM crontab firing
+  `expiry_sweep` daily at 04:00 UTC would have written one per day.
+- The last inbound WhatsApp message was 15 Sep 18:38 UTC, so the API was up while the
+  schedules were silent — the API is fine, the scheduler is missing.
+- GitHub `pharmaos-cron` runs succeed in ~6s because they skip: the `API_URL` secret is
+  unset AND the VM's API port is firewalled, so Actions cannot reach it. A green no-op.
+
+Check it yourself (read-only, works from anywhere with `DATABASE_URL`):
+
+```sql
+select job, status, started_at, ended_at from job_runs order by started_at desc limit 10;
+```
+
+If the newest row is older than yesterday, nothing is scheduled. Fix it ON THE VM (localhost
+only, no firewall changes):
+
+```bash
+crontab -e
+# paste (UTC mirrors .github/workflows/cron.yml):
+0 4 * * *  /home/<user>/Pharma/scripts/run_job.sh expiry_sweep       >> /home/<user>/Pharma/.run/cron.log 2>&1
+3 4 * * *  /home/<user>/Pharma/scripts/run_job.sh forecast_refresh   >> /home/<user>/Pharma/.run/cron.log 2>&1
+5 4 * * *  /home/<user>/Pharma/scripts/run_job.sh low_stock_check    >> /home/<user>/Pharma/.run/cron.log 2>&1
+7 4 * * *  /home/<user>/Pharma/scripts/run_job.sh morning_briefing   >> /home/<user>/Pharma/.run/cron.log 2>&1
+10 4 * * * /home/<user>/Pharma/scripts/run_job.sh variance_report    >> /home/<user>/Pharma/.run/cron.log 2>&1
+0 10 * * * /home/<user>/Pharma/scripts/run_job.sh afternoon_briefing >> /home/<user>/Pharma/.run/cron.log 2>&1
+0 17 * * * /home/<user>/Pharma/scripts/run_job.sh daily_digest       >> /home/<user>/Pharma/.run/cron.log 2>&1
+0 5 * * 1  /home/<user>/Pharma/scripts/run_job.sh weekly_report      >> /home/<user>/Pharma/.run/cron.log 2>&1
+30 5 * * * /home/<user>/Pharma/scripts/run_job.sh refill_reminders   >> /home/<user>/Pharma/.run/cron.log 2>&1
+*/15 * * * * /home/<user>/Pharma/scripts/run_job.sh reconcile        >> /home/<user>/Pharma/.run/cron.log 2>&1
+```
+
+Then `mkdir -p .run` and run one line by hand to prove the path works:
+`scripts/run_job.sh expiry_sweep` — a new `job_runs` row should appear within seconds.
+
+To make the *GitHub* cron real instead: put the API behind Caddy/nginx on 443 and
+`gh secret set API_URL --repo Mathew-Rym/Pharma` with the public URL (`SHARED_SECRET`
+is already set). Running both schedulers is safe — briefings are idempotent per tenant
+per day. But the VM crontab is the one that works with a firewalled API; do that first.
+
+---
+
+## VM uptime — the billing trap
+
+**16 Sep 2026: project `pharmaos-505502` has `billingEnabled: false` and BOTH billing
+accounts are closed.** All Compute API calls fail with a billing error — the VM cannot
+be inspected, SSH'd into (metadata writes are blocked), firewall-changed, or even
+described. Google stops billable resources when billing lapses; the instance is running
+on borrowed time. The WhatsApp silence since 15 Sep evening may already be this.
+
+Recovery (human, in the browser — no CLI can reopen a closed billing account):
+
+1. https://console.cloud.google.com/billing → open **My Billing Account**
+   (`01ACF3-CC7D54-13839D`) → reactivate it, or create a new billing account and add a
+   working payment method.
+2. Link it: `gcloud billing projects link pharmaos-505502 --billing-account=<id>`
+3. Verify: `gcloud billing projects describe pharmaos-505502` → `billingEnabled: true`.
+4. Then: `gcloud compute instances describe pharmaos-instance --zone us-central1-a`
+   — if `TERMINATED`, `gcloud compute instances start pharmaos-instance --zone us-central1-a`.
+5. While you are in there: `gcloud compute instances update pharmaos-instance
+   --zone us-central1-a --deletion-protection` (it is currently **false**), and add a
+   fresh SSH key to metadata (the old ones expired 14 Sep).
+
+`automaticRestart: true` and the persistent disk are already set; disk data survives
+restarts. The remaining single points of failure are billing (above) and the
+`gowa-storage` volume, whose backup instructions are below.
+
+---
+
 ## When something does not work
 
 | Symptom | Cause |
